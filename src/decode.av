@@ -205,9 +205,11 @@ verify ulebsNext
 
 fn ulebsEnd(buf: Vector<Int>, p: Int, n: Int) -> Int
     ? "The position after n unsigned LEB128 numbers from p."
-    match Bool.or(n <= 0, p >= Vector.len(buf))
+    match n <= 0
         true -> p
-        false -> ulebsEnd(buf, Bin.uleb(buf, p).next, n - 1)
+        false -> match p >= Vector.len(buf)
+            true -> Vector.len(buf) + 1
+            false -> ulebsEnd(buf, Bin.uleb(buf, p).next, n - 1)
 
 verify ulebsEnd
     ulebsEnd(Vector.fromList([1, 128, 1, 3]), 0, 2) => 3
@@ -223,7 +225,7 @@ verify heapType
     heapType(Vector.fromList([3]), 0) => Bin.U(v = 3, next = 1)
 
 fn valType(buf: Vector<Int>, p: Int) -> VT
-    ? "A value or storage type at p."
+    ? "A value type at p; the packed storage types i8 and i16 are malformed here (see storageType)."
     b = Bin.byte(buf, p)
     match b
         127 -> VT(t = ValType.I32, next = p + 1)
@@ -231,17 +233,28 @@ fn valType(buf: Vector<Int>, p: Int) -> VT
         125 -> VT(t = ValType.F32, next = p + 1)
         124 -> VT(t = ValType.F64, next = p + 1)
         123 -> VT(t = ValType.V128, next = p + 1)
-        120 -> VT(t = ValType.I8, next = p + 1)
-        119 -> VT(t = ValType.I16, next = p + 1)
+        120 -> VT(t = ValType.I32, next = Vector.len(buf) + 1)
+        119 -> VT(t = ValType.I32, next = Vector.len(buf) + 1)
         100 -> refType(heapType(buf, p + 1), false)
         99 -> refType(heapType(buf, p + 1), true)
         _ -> VT(t = ValType.Ref(true, b - 128), next = p + 1)
+
+fn storageType(buf: Vector<Int>, p: Int) -> VT
+    ? "A storage type, for struct fields and array elements: a value type, or packed i8 or i16, which valType refuses everywhere else (a malformed value type ends past the octets)."
+    match Bin.byte(buf, p)
+        120 -> VT(t = ValType.I8, next = p + 1)
+        119 -> VT(t = ValType.I16, next = p + 1)
+        _ -> valType(buf, p)
+
+verify storageType
+    storageType(Vector.fromList([120]), 0) => VT(t = ValType.I8, next = 1)
 
 fn refType(h: U, nullable: Bool) -> VT
     ? "A reference type over the heap type just read."
     VT(t = ValType.Ref(nullable, h.v), next = h.next)
 
 verify valType
+    valType(Vector.fromList([120]), 0) => VT(t = ValType.I32, next = 2)
     valType(Vector.fromList([127]), 0) => VT(t = ValType.I32, next = 1)
     valType(Vector.fromList([112]), 0) => VT(t = ValType.Ref(true, -16), next = 1)
     valType(Vector.fromList([100, 2]), 0) => VT(t = ValType.Ref(false, 2), next = 2)
@@ -252,9 +265,11 @@ verify refType
 
 fn valTypes(buf: Vector<Int>, p: Int, n: Int, acc: List<ValType>) -> VTs
     ? "n value types from p."
-    match Bool.or(n <= 0, p >= Vector.len(buf))
+    match n <= 0
         true -> VTs(ts = List.reverse(acc), next = p)
-        false -> valTypesNext(buf, valType(buf, p), n, acc)
+        false -> match p >= Vector.len(buf)
+            true -> VTs(ts = [], next = Vector.len(buf) + 1)
+            false -> valTypesNext(buf, valType(buf, p), n, acc)
 
 fn valTypesNext(buf: Vector<Int>, v: VT, n: Int, acc: List<ValType>) -> VTs
     ? "Keeps one type read by valTypes and reads the rest."
@@ -276,9 +291,11 @@ verify vecTypes
 
 fn fieldTypes(buf: Vector<Int>, p: Int, n: Int, acc: List<ValType>) -> VTs
     ? "n struct fields from p: each a storage type and a mutability byte."
-    match Bool.or(n <= 0, p >= Vector.len(buf))
+    match n <= 0
         true -> VTs(ts = List.reverse(acc), next = p)
-        false -> fieldNext(buf, valType(buf, p), n, acc)
+        false -> match p >= Vector.len(buf)
+            true -> VTs(ts = [], next = Vector.len(buf) + 1)
+            false -> fieldNext(buf, storageType(buf, p), n, acc)
 
 fn fieldNext(buf: Vector<Int>, v: VT, n: Int, acc: List<ValType>) -> VTs
     ? "Keeps one field read by fieldTypes, skips its mutability and reads the rest."
@@ -300,7 +317,7 @@ fn compType(buf: Vector<Int>, p: Int) -> Result<CT, String>
     match Bin.byte(buf, p)
         96 -> Result.Ok(funcComp(vecTypes(buf, p + 1), buf))
         95 -> Result.Ok(structComp(buf, Bin.uleb(buf, p + 1)))
-        94 -> Result.Ok(arrayComp(valType(buf, p + 1), buf))
+        94 -> Result.Ok(arrayComp(storageType(buf, p + 1), buf))
         b -> Result.Err("unknown composite type {b}")
 
 verify compType
@@ -330,7 +347,7 @@ fn mutsOk(buf: Vector<Int>, p: Int, n: Int) -> Bool
     ? "Whether each of n fields from p has a mutability octet of 0 or 1."
     match Bool.or(n <= 0, p >= Vector.len(buf))
         true -> true
-        false -> mutsOkNext(buf, valType(buf, p).next, n)
+        false -> mutsOkNext(buf, storageType(buf, p).next, n)
 
 fn mutsOkNext(buf: Vector<Int>, q: Int, n: Int) -> Bool
     ? "One field's octet at q, then the rest."
@@ -367,7 +384,7 @@ fn fieldMuts(buf: Vector<Int>, p: Int, n: Int, acc: List<Bool>) -> List<Bool>
     ? "Whether each of n struct fields from p is mutable."
     match Bool.or(n <= 0, p >= Vector.len(buf))
         true -> List.reverse(acc)
-        false -> fieldMutsNext(buf, valType(buf, p).next, n, acc)
+        false -> fieldMutsNext(buf, storageType(buf, p).next, n, acc)
 
 fn fieldMutsNext(buf: Vector<Int>, q: Int, n: Int, acc: List<Bool>) -> List<Bool>
     ? "Keeps one field's mutability byte at q and reads the rest."
@@ -415,9 +432,11 @@ verify subWith
 
 fn subTypes(buf: Vector<Int>, p: Int, n: Int, g: Int, acc: List<SubType>) -> Result<STs, String>
     ? "n subtypes of one rec group, in order."
-    match Bool.or(n <= 0, p >= Vector.len(buf))
+    match n <= 0
         true -> Result.Ok(STs(subs = List.reverse(acc), next = p))
-        false -> subTypesNext(buf, subType(buf, p, g)?, n, g, acc)
+        false -> match p >= Vector.len(buf)
+            true -> Result.Err("unexpected end of section or function")
+            false -> subTypesNext(buf, subType(buf, p, g)?, n, g, acc)
 
 fn subTypesNext(buf: Vector<Int>, s: STs, n: Int, g: Int, acc: List<SubType>) -> Result<STs, String>
     ? "Keeps the subtypes read by subTypes and reads the rest."
@@ -504,13 +523,39 @@ fn importOne(buf: Vector<Int>, md: Str, stop: Int, n: Int, s: St) -> Result<St, 
     ? "One import once its module name is read."
     nm = str(buf, md.next)
     kind = Bin.byte(buf, nm.next)
+    dl = declared(buf, kind, nm.next + 1)
+    s2 = St.update(s, m = Module.update(s.m, imports = List.concat(s.m.imports, [Import(mod = md.s, name = nm.s, kind = kind, index = localIndex(kind, s.m), lo = dl.min, hi = dl.max, hasMax = dl.hasMax)])))
     match kind
-        0 -> importFunc(buf, md.s, nm.s, Bin.uleb(buf, nm.next + 1), stop, n, s)
-        1 -> importTable(buf, "{md.s}.{nm.s}", valType(buf, nm.next + 1), stop, n, s)
-        2 -> importMemory(buf, provided("{md.s}.{nm.s}", limits(buf, nm.next + 1)), wideAt(buf, nm.next + 1), stop, n, s)
-        3 -> importGlobal(buf, "{md.s}.{nm.s}", valType(buf, nm.next + 1), stop, n, s)
-        4 -> importTag(buf, Bin.uleb(buf, nm.next + 2), stop, n, s)
+        0 -> importFunc(buf, md.s, nm.s, Bin.uleb(buf, nm.next + 1), stop, n, s2)
+        1 -> importTable(buf, "{md.s}.{nm.s}", valType(buf, nm.next + 1), stop, n, s2)
+        2 -> importMemory(buf, provided("{md.s}.{nm.s}", limits(buf, nm.next + 1)), wideAt(buf, nm.next + 1), stop, n, s2)
+        3 -> importGlobal(buf, "{md.s}.{nm.s}", valType(buf, nm.next + 1), stop, n, s2)
+        4 -> importTag(buf, Bin.uleb(buf, nm.next + 2), stop, n, s2)
         _ -> Result.Err("unsupported import kind {kind} for {md.s}.{nm.s}")
+
+fn declared(buf: Vector<Int>, kind: Int, p: Int) -> Lim
+    ? "The limits an imported table (after its element type) or memory declares, before anything replaces them; nothing for other kinds."
+    match kind
+        1 -> limits(buf, valType(buf, p).next)
+        2 -> limits(buf, p)
+        _ -> Lim(min = 0, max = 0, next = p, hasMax = false)
+
+verify declared
+    declared(Vector.fromList([1, 2, 3]), 2, 0) => Lim(min = 2, max = 3, next = 3, hasMax = true)
+    declared(Vector.fromList([]), 0, 0).hasMax => false
+
+fn localIndex(kind: Int, m: Module) -> Int
+    ? "The index an import of this kind takes in its own index space: imports come first, in order."
+    match kind
+        0 -> Vector.len(m.funcs)
+        1 -> List.len(m.tables)
+        2 -> Ast.memCount(m)
+        3 -> Vector.len(m.globals)
+        _ -> List.len(m.tags)
+
+verify localIndex
+    localIndex(1, Module.update(Ast.emptyModule(), tables = [ValType.I32])) => 1
+    localIndex(2, Ast.emptyModule()) => 0
 
 fn importTag(buf: Vector<Int>, t: U, stop: Int, n: Int, s: St) -> Result<St, String>
     ? "An imported tag: it takes the next tag index; its attribute octet was skipped."
@@ -532,6 +577,7 @@ fn provided(from: String, l: Lim) -> Lim
     ? "The limits an import really gets: spectest's table is 10..20 and its memory 1..2 pages, whatever the import declares; other imports are made fresh at their declared limits."
     match from
         "spectest.table" -> Lim(min = 10, max = 20, next = l.next, hasMax = true)
+        "spectest.table64" -> Lim(min = 10, max = 20, next = l.next, hasMax = true)
         "spectest.memory" -> Lim(min = 1, max = 2, next = l.next, hasMax = true)
         _ -> l
 
@@ -617,9 +663,8 @@ verify importGlobal
 
 fn importFunc(buf: Vector<Int>, md: String, nm: String, t: U, stop: Int, n: Int, s: St) -> Result<St, String>
     ? "An imported function: it takes the next function index."
-    imp = Import(mod = md, name = nm, kind = 0, index = t.v)
     fs = Vector.fromList(List.concat(List.fromVector(s.m.funcs), [Func.Imported(md, nm, t.v)]))
-    importSec(buf, t.next, stop, n - 1, St.update(s, m = Module.update(s.m, funcs = fs, imports = List.concat(s.m.imports, [imp]))))
+    importSec(buf, t.next, stop, n - 1, St.update(s, m = Module.update(s.m, funcs = fs)))
 
 verify importFunc
     Vector.len(Result.withDefault(importFunc(Vector.fromList([]), "aver", "x", Bin.U(v = 0, next = 0), 0, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0)), St(m = Ast.emptyModule(), localTypes = [], group = 0)).m.funcs) => 1
@@ -891,9 +936,11 @@ fn exprItems(buf: Vector<Int>, n: U, m: Module) -> Result<Items, String>
 
 fn exprList(buf: Vector<Int>, p: Int, n: Int, m: Module, acc: List<Vector<Instr>>) -> Result<Items, String>
     ? "n constant expressions from p."
-    match Bool.or(n <= 0, p >= Vector.len(buf))
+    match n <= 0
         true -> Result.Ok(Items(items = List.reverse(acc), next = p))
-        false -> exprListNext(buf, expr(buf, p, m)?, n, m, acc)
+        false -> match p >= Vector.len(buf)
+            true -> Result.Err("unexpected end of section or function")
+            false -> exprListNext(buf, expr(buf, p, m)?, n, m, acc)
 
 fn exprListNext(buf: Vector<Int>, e: Code, n: Int, m: Module, acc: List<Vector<Instr>>) -> Result<Items, String>
     ? "Keeps one expression and reads the rest."
@@ -981,9 +1028,11 @@ fn localDecls(buf: Vector<Int>, n: U, params: List<ValType>) -> VTs
 
 fn localRuns(buf: Vector<Int>, p: Int, n: Int, acc: List<ValType>) -> VTs
     ? "n runs of locals, each a count and a type."
-    match Bool.or(n <= 0, p >= Vector.len(buf))
+    match n <= 0
         true -> VTs(ts = List.reverse(acc), next = p)
-        false -> localRun(buf, Bin.uleb(buf, p), n, acc)
+        false -> match p >= Vector.len(buf)
+            true -> VTs(ts = [], next = Vector.len(buf) + 1)
+            false -> localRun(buf, Bin.uleb(buf, p), n, acc)
 
 fn localRun(buf: Vector<Int>, k: U, n: Int, acc: List<ValType>) -> VTs
     ? "One run: k locals of one type. More than a million locals in all is refused (next is -1): a count from a malformed module could ask for billions."
@@ -1282,9 +1331,11 @@ record Cs
 
 fn catches(buf: Vector<Int>, p: Int, n: Int, acc: List<Int>) -> Cs
     ? "n catch clauses from p, flattened in order."
-    match Bool.or(n <= 0, p >= Vector.len(buf))
+    match n <= 0
         true -> Cs(v = List.reverse(acc), next = p, ok = true)
-        false -> catchOne(buf, Bin.byte(buf, p), p + 1, n, acc)
+        false -> match p >= Vector.len(buf)
+            true -> Cs(v = [], next = Vector.len(buf) + 1, ok = false)
+            false -> catchOne(buf, Bin.byte(buf, p), p + 1, n, acc)
 
 fn catchOne(buf: Vector<Int>, kind: Int, p: Int, n: Int, acc: List<Int>) -> Cs
     ? "One clause by its kind: catch (0) and catch_ref (1) name a tag, catch_all (2) and catch_all_ref (3) do not."

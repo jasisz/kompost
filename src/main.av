@@ -4,14 +4,15 @@ module Main
         "ARGS as the program's arguments; kompost --invoke NAME FILE.wasm [INTS...]"
         "runs one export with integer arguments and prints its results;"
         "kompost --validate FILE.wasm only checks the module; kompost --script"
-        "FILE.wasm SCRIPT runs the invocations listed in SCRIPT one after another on"
-        "one instance (for spec tests, see bin/wast) and prints each one's results"
-        "as typed bit patterns. Decodes and"
+        "SCRIPT runs a spec-test script (see bin/wast): it instantiates modules,"
+        "registers them under names so later modules can import from them, and"
+        "invokes exports, printing each line's outcome, results as typed bit"
+        "patterns. Decodes and"
         "validates the module, instantiates it, runs its start function and answers the"
         "module's calls to the host, the one Aver's wasm-gc output imports:"
         "strings leave as references to arrays of octets on Kompost's heap, and"
         "come in through the module's own __rt_string_from_lm."
-    depends [Ast, Value, Num, Decode, Valid, Exec, Kompost, Arr, Mem, Bytes]
+    depends [Ast, Value, Num, Decode, Valid, Exec, Kompost, Arr, Mem, Bytes, Link]
     effects [Args.get, Console.print, Console.error, Disk.readBytes, Disk.readBytesAt, Disk.readText]
 
 fn main() -> Int
@@ -19,7 +20,7 @@ fn main() -> Int
     ! [Args.get, Console.print, Console.error, Disk.readBytes, Disk.readBytesAt, Disk.readText]
     match Args.get()
         ["--validate", path] -> report(checkFile(path))
-        ["--script", path, script] -> report(runScript(path, script))
+        ["--script", script] -> report(runScript(script))
         ["--stats", path, ..rest] -> report(statsOf(runFileStore(path, "_start", [], rest)))
         ["--invoke", entry, path, ..rest] -> report(runFile(path, entry, rest, []))
         [path, ..rest] -> report(runFile(path, "_start", [], rest))
@@ -88,51 +89,81 @@ fn runFile(path: String, entry: String, args: List<String>, pargs: List<String>)
     out = drive(ready.x, Exec.invoke(ready.x, s, fi, intArgs(ready.x, fi, args, 0, [])), pargs)?
     Result.Ok(out.vs)
 
-fn runScript(path: String, script: String) -> Result<List<Val>, String>
-    ? "Instantiates the module once and runs each line of the script on it: invoke, a tab, the export's name, then its arguments, each after a tab. Every line prints ok and the results, or trap and the message; a trap keeps the store as it was before the call."
-    ! [Console.print, Disk.readBytes, Disk.readBytesAt, Disk.readText]
+fn runScript(script: String) -> Result<List<Val>, String>
+    ? "Runs a script, one command per line, fields split by tabs: module ID FILE instantiates a module as instance ID; register NAME ID lets later modules import from instance ID under NAME; invoke ID NAME ARGS calls an export. Each line prints ok (with results) or trap or error and a message; a trap leaves the instance as it was."
+    ! [Console.print, Disk.readBytes, Disk.readText]
+    text = Disk.readText(script)?
+    done = scriptLines(Link.empty(), String.split(text, "\n"))
+    Result.Ok([])
+
+fn scriptLines(w: Link.World, lines: List<String>) -> Link.World
+    ? "Runs the script's lines in order."
+    ! [Console.print, Disk.readBytes]
+    match lines
+        [] -> w
+        [l, ..rest] -> scriptLines(scriptLine(w, String.split(l, "\t")), rest)
+
+fn scriptLine(w: Link.World, ws: List<String>) -> Link.World
+    ? "One line of the script; an empty or unknown line does nothing."
+    ! [Console.print, Disk.readBytes]
+    match ws
+        ["module", id, path] -> moduleLine(w, bitsOf(id), loadModule(path))
+        ["register", name, id] -> scriptSays("ok", Link.register(w, name, bitsOf(id)))
+        ["invoke", id, name, ..args] -> invokeLine(w, bitsOf(id), name, scriptArgs(args, []))
+        _ -> w
+
+record Loaded
+    m: Module
+    shapes: Vector<Shape>
+
+fn loadModule(path: String) -> Result<Loaded, String>
+    ? "A module read, decoded and validated."
+    ! [Disk.readBytes]
     b = Disk.readBytes(path)?
     m = Decode.decode(Vector.fromList(Bytes.octets(b)))?
     shapes = invalid(Valid.validate(m))?
-    ready = Exec.instantiate(m, spectestGlobals(), shapes)?
-    s = runStart(ready, m.start, [])?
-    text = Disk.readText(script)?
-    done = scriptLines(ready.x, s, String.split(text, "\n"))
-    Result.Ok([])
+    Result.Ok(Loaded(m = m, shapes = shapes))
 
-fn scriptLines(x: Inst, s: Store, lines: List<String>) -> Store
-    ? "Runs the script's lines in order, each on the store the one before left."
-    ! [Console.print, Disk.readBytes, Disk.readBytesAt]
-    match lines
-        [] -> s
-        [l, ..rest] -> scriptLines(x, scriptLine(x, s, String.split(l, "\t")), rest)
-
-fn scriptLine(x: Inst, s: Store, ws: List<String>) -> Store
-    ? "One line: an invocation, or anything else, which is skipped."
-    ! [Console.print, Disk.readBytes, Disk.readBytesAt]
-    match ws
-        ["invoke", name, ..args] -> invokeLine(x, s, Exec.exportFunc(x.m, name), args)
-        _ -> s
-
-fn invokeLine(x: Inst, s: Store, fo: Option<Int>, args: List<String>) -> Store
-    ? "Calls the export with the arguments read by their type prefixes."
-    ! [Console.print, Disk.readBytes, Disk.readBytesAt]
-    match fo
-        Option.None -> scriptSays("error\tno such export", s)
-        Option.Some(fi) -> answer(s, drive(x, Exec.invoke(x, s, fi, scriptArgs(args, [])), []))
-
-fn answer(s: Store, r: Result<Ran, String>) -> Store
-    ? "Prints a call's results as typed bits and goes on with its store, or prints the trap and keeps s."
+fn moduleLine(w: Link.World, id: Int, l: Result<Loaded, String>) -> Link.World
+    ? "Instantiates a loaded module, or says why it could not be loaded."
     ! [Console.print]
-    match r
-        Result.Ok(ran) -> scriptSays(String.join(List.prepend("ok", bitsAll(ran.vs, [])), "\t"), ran.s)
-        Result.Err(e) -> scriptSays("trap\t{e}", s)
+    match l
+        Result.Err(e) -> scriptSays("error\t{e}", w)
+        Result.Ok(ld) -> said(Link.add(w, id, ld.m, ld.shapes, spectestGlobals()))
 
-fn scriptSays(line: String, s: Store) -> Store
-    ? "Prints a line and hands the store on."
+fn invokeLine(w: Link.World, id: Int, name: String, args: List<Val>) -> Link.World
+    ? "Calls an export of instance id."
+    ! [Console.print]
+    match Link.moduleOf(w, id)
+        Option.None -> scriptSays("error\tno instance {id}", w)
+        Option.Some(m) -> match Exec.exportFunc(m, name)
+            Option.None -> scriptSays("error\tno such export", w)
+            Option.Some(fi) -> said(Link.call(w, id, fi, args))
+
+fn said(c: Link.Called) -> Link.World
+    ? "Prints a call's outcome and goes on with the world it left: an exception nobody caught prints as exception."
+    ! [Console.print]
+    match c.exn
+        Option.Some(_) -> scriptSays("exception\tuncaught exception", c.w)
+        Option.None -> match c.r
+            Result.Ok(vs) -> scriptSays(String.join(List.prepend("ok", bitsAll(vs, [])), "\t"), c.w)
+            Result.Err(e) -> scriptSays(failure(e), c.w)
+
+fn failure(e: String) -> String
+    ? "A failed line: a trap, or any other error."
+    match String.startsWith(e, "trap")
+        true -> "trap\t{e}"
+        false -> "error\t{e}"
+
+fn scriptSays(line: String, w: Link.World) -> Link.World
+    ? "Prints a line and hands the world on."
     ! [Console.print]
     Console.print(line)
-    s
+    w
+
+verify failure
+    failure("trap: x") => "trap\ttrap: x"
+    failure("unknown import a.b") => "error\tunknown import a.b"
 
 fn scriptArgs(args: List<String>, acc: List<Val>) -> List<Val>
     ? "Script arguments as values."
@@ -267,7 +298,8 @@ fn drive(x: Inst, out: Outcome, pargs: List<String>) -> Result<Ran, String>
     ! [Console.print, Disk.readBytesAt]
     match out
         Outcome.Done(vs, s) -> Result.Ok(Ran(vs = vs, s = s))
-        Outcome.Trap(e) -> Result.Err("trap: {e}")
+        Outcome.Trap(e, _) -> Result.Err("trap: {e}")
+        Outcome.Thrown(_, _, _) -> Result.Err("trap: uncaught exception")
         Outcome.Host(fi, args, tail, mach) -> answered(x, mach, tail, host(x, fi, args, pin(mach, args), pargs)?, pargs)
 
 fn answered(x: Inst, mach: Machine, tail: Bool, a: Ran, pargs: List<String>) -> Result<Ran, String>

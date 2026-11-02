@@ -2,13 +2,14 @@
 """Runs spec .wast files against Kompost and checks every value exactly.
 
 wasm-tools json-from-wast turns each file into binary modules and a list of
-commands. Every module gets one Kompost run (kompost --script FILE.wasm SCRIPT)
-that performs its invocations in order on one instance, so state carries over;
+commands. The whole file becomes one script for one Kompost run (kompost --script
+SCRIPT): modules are instantiated, registered under names and invoked in
+order, so state carries over and later modules import from earlier ones;
 results come back as typed bit patterns and are compared with the expected
 values, NaN classes and v128 lanes included. assert_invalid and
-assert_malformed modules must fail kompost --validate. A module that cannot be
-instantiated (it imports from another registered module, which Kompost does
-not link) is reported with its error and its commands are skipped.
+assert_malformed modules must fail kompost --validate; assert_unlinkable and
+assert_uninstantiable modules must fail to instantiate. A module that fails
+to instantiate unexpectedly is reported and its commands are skipped.
 
 usage: bin/wast [-v] FILE.wast|NAME...   (NAME is looked up in SPEC_DIR,
 default ../miscast/spec/wast)
@@ -113,21 +114,52 @@ def check_file(path, verbose):
     js = os.path.join(work, name + ".json")
     rc, _, err = run(["wasm-tools", "json-from-wast", path, "-o", js, "--wasm-dir", work], timeout=600)
     if rc != 0:
-        return {"error": 1}, [f"{name}: wasm-tools: {err.strip()[:200]}"]
+        return {"pass": 0, "fail": 0, "skip": 0, "error": 1}, [f"{name}: wasm-tools: {err.strip()[:200]}"]
     cmds = json.load(open(js))["commands"]
-    tally = {"pass": 0, "fail": 0, "skip": 0}
+    tally = {"pass": 0, "fail": 0, "skip": 0, "error": 0}
     notes = []
-    modules, named, cur = [], {}, None
+    lines, steps = [], []          # script lines; steps[i] says how to judge the output of line i
+    named, cur, nmod, defs = {}, None, 0, {}
     for c in cmds:
         t = c["type"]
-        if t == "module":
-            cur = {"file": c["filename"], "line": c["line"], "steps": []}
-            modules.append(cur)
-            if "name" in c:
-                named[c["name"]] = cur
-        elif t in ("assert_return", "assert_trap", "assert_exhaustion", "action"):
+        if t == "module_definition":
+            if c.get("module_type") == "binary":
+                defs[c.get("name")] = c["filename"]
+            continue
+        if t == "module_instance":
+            fn = defs.get(c.get("module"))
+            if fn is None:
+                tally["skip"] += 1
+                cur = None
+                continue
+            c = dict(c, type="module", filename=fn, name=c.get("instance"))
+            t = "module"
+        if t in ("module", "assert_unlinkable", "assert_uninstantiable"):
+            if c.get("module_type", "binary") != "binary":
+                tally["skip"] += 1
+                if t == "module":            # later commands would reach the wrong instance
+                    cur = None
+                    if "name" in c:
+                        named[c["name"]] = None
+                continue
+            idx = nmod
+            nmod += 1
+            lines.append(f"module\t{idx}\t{os.path.join(work, c['filename'])}")
+            steps.append((c, idx))
+            if t == "module":
+                cur = idx
+                if c.get("name"):
+                    named[c["name"]] = idx
+        elif t == "register":
+            target = named.get(c.get("name")) if c.get("name") else cur
+            if target is None:
+                tally["skip"] += 1
+                continue
+            lines.append(f"register\t{c['as']}\t{target}")
+            steps.append((c, target))
+        elif t in ("assert_return", "assert_trap", "assert_exhaustion", "assert_exception", "action"):
             act = c["action"]
-            target = named.get(act.get("module"), cur) if act.get("module") else cur
+            target = named.get(act.get("module")) if act.get("module") else cur
             if act["type"] != "invoke" or target is None:
                 tally["skip"] += 1
                 continue
@@ -135,36 +167,57 @@ def check_file(path, verbose):
             if None in args or any(ch in act["field"] for ch in "\t\n"):
                 tally["skip"] += 1
                 continue
-            target["steps"].append((c, "\t".join(["invoke", act["field"]] + args)))
+            lines.append("\t".join(["invoke", str(target), act["field"]] + args))
+            steps.append((c, target))
         elif t in ("assert_invalid", "assert_malformed"):
             if c.get("module_type") != "binary":
                 tally["skip"] += 1
                 continue
             rc, out, err = run([KOMPOST, "--validate", os.path.join(work, c["filename"])])
-            if rc != 0:
+            if rc == 1:                      # Kompost's own refusal; a crash or a kill is not one
                 tally["pass"] += 1
-            else:
+            elif rc == 0:
                 tally["fail"] += 1
                 notes.append(f"{name}:{c['line']}: {t} accepted (expected: {c['text']})")
+            else:
+                tally["error"] += 1
+                notes.append(f"{name}:{c['line']}: {t}: kompost failed ({rc}): {err.strip()[:120]}")
         else:
             tally["skip"] += 1
-    for m in modules:
-        script = os.path.join(work, m["file"] + ".script")
-        with open(script, "w") as o:
-            o.write("\n".join(s for _, s in m["steps"]) + "\n")
-        rc, out, err = run([KOMPOST, "--script", os.path.join(work, m["file"]), script], timeout=900)
-        lines = out.split("\n")
-        if rc != 0 and not out.strip():
-            tally["skip"] += len(m["steps"])
-            notes.append(f"{name}:{m['line']}: module not run: {err.strip()[:160]}")
+    script = os.path.join(work, name + ".script")
+    with open(script, "w") as o:
+        o.write("\n".join(lines) + "\n")
+    rc, out, err = run([KOMPOST, "--script", script], timeout=1800)
+    outs = out.split("\n")
+    done = len(outs) - 1
+    if done < len(lines):
+        tally["error"] += 1
+        notes.append(f"{name}: script stopped after {done} of {len(lines)} lines ({rc}): {err.strip()[:160]}")
+        outs = outs[:done] + ["noresult\tscript stopped"] * (len(lines) - done)
+    broken = set()
+    for (c, target), line, got in zip(steps, lines, outs + [""] * len(lines)):
+        t = c["type"]
+        parts = got.split("\t")
+        if t == "module":
+            if parts[0] == "noresult":
+                tally["fail"] += 1
+            elif parts[0] != "ok":
+                broken.add(target)
+                notes.append(f"{name}:{c['line']}: module not run: {got[:160]}")
             continue
-        for (c, line), got in zip(m["steps"], lines + [""] * len(m["steps"])):
-            parts = got.split("\t")
+        if t == "register":
+            continue
+        if t in ("assert_unlinkable", "assert_uninstantiable"):
+            ok = parts[0] in ("error", "trap")
+        elif target in broken:
+            tally["skip"] += 1
+            continue
+        else:
             ok = check(c, parts)
-            tally["pass" if ok else "fail"] += 1
-            if not ok:
-                notes.append(f"{name}:{c['line']}: {line.replace(chr(9), ' ')} -> {got.replace(chr(9), ' ')}"
-                             + (f" (expected {json.dumps(c.get('expected', c.get('text')))})"))
+        tally["pass" if ok else "fail"] += 1
+        if not ok:
+            notes.append(f"{name}:{c['line']}: {line.replace(chr(9), ' ')[:120]} -> {got.replace(chr(9), ' ')}"
+                         + f" (expected {json.dumps(c.get('expected', c.get('text')))})")
     return tally, notes
 
 
@@ -172,6 +225,8 @@ def check(c, parts):
     t = c["type"]
     if t in ("assert_trap", "assert_exhaustion"):
         return parts[0] == "trap"
+    if t == "assert_exception":
+        return parts[0] == "exception"
     if t == "action":
         return parts[0] in ("ok", "trap")
     if parts[0] != "ok":
@@ -186,17 +241,18 @@ def main():
     argv = sys.argv[1:]
     verbose = "-v" in argv
     files = [a for a in argv if a != "-v"]
-    total = {"pass": 0, "fail": 0, "skip": 0}
+    total = {"pass": 0, "fail": 0, "skip": 0, "error": 0}
     for f in files:
         path = f if f.endswith(".wast") else os.path.join(SPEC_DIR, f + ".wast")
         tally, notes = check_file(path, verbose)
         for k in total:
             total[k] += tally.get(k, 0)
-        print(f"{os.path.basename(path):34s} pass={tally.get('pass', 0)} fail={tally.get('fail', 0)} skip={tally.get('skip', 0)}")
+        print(f"{os.path.basename(path):34s} pass={tally.get('pass', 0)} fail={tally.get('fail', 0)} skip={tally.get('skip', 0)}"
+              + (f" error={tally['error']}" if tally.get("error") else ""))
         for n in notes[: (1000 if verbose else 5)]:
             print("   ", n)
-    print(f"TOTAL pass={total['pass']} fail={total['fail']} skip={total['skip']}")
-    sys.exit(1 if total["fail"] else 0)
+    print(f"TOTAL pass={total['pass']} fail={total['fail']} skip={total['skip']} error={total['error']}")
+    sys.exit(1 if total["fail"] or total["error"] else 0)
 
 
 if __name__ == "__main__":

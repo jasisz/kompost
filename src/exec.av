@@ -12,7 +12,7 @@ module Exec
         "return_call simply replaces the frame. Running is pure: a call to an"
         "imported function stops the machine with an Outcome.Host that holds"
         "everything needed to resume once the host has answered."
-    exposes [Inst, Store, Frame, Machine, Outcome, Obj, Heap, Placed, Fn, instantiate, invoke, resume, exportFunc, Ready, writeMem, machineRoots]
+    exposes [Inst, Store, Frame, Machine, Outcome, Obj, Heap, Placed, Fn, MemState, Settled, instantiate, prepare, settle, settlePart, invoke, resume, resumeThrow, tagId, exportFunc, Ready, writeMem, machineRoots, memState, putMemState, table, setTable]
     depends [Ast, Value, Num, Mem, Bin, Kompost, Arr, Simd]
     effects []
 
@@ -29,6 +29,7 @@ record Frame
     sp: Int
     targets: Vector<Label>
     arity: Int
+    depth: Int
 
 record Store
     globals: Vector<Val>
@@ -64,6 +65,8 @@ record Fn
 record Inst
     m: Module
     fns: Vector<Fn>
+    base: Int
+    tags: Vector<Int>
 
 record Machine
     frame: Frame
@@ -72,8 +75,9 @@ record Machine
 
 type Outcome
     Done(List<Val>, Store)
-    Trap(String)
+    Trap(String, Store)
     Host(Int, List<Val>, Bool, Machine)
+    Thrown(Int, List<Val>, Store)
 
 type Next
     Go(Frame, List<Frame>, Store)
@@ -139,7 +143,7 @@ fn newStack(cap: Int) -> Vector<Val>
 
 fn frame(code: Vector<Instr>, targets: Vector<Label>, locals: Vector<Val>, cap: Int, arity: Int) -> Frame
     ? "A fresh frame at the start of its code."
-    Frame(code = code, pc = 0, locals = locals, stack = newStack(cap), sp = 0, targets = targets, arity = arity)
+    Frame(code = code, pc = 0, locals = locals, stack = newStack(cap), sp = 0, targets = targets, arity = arity, depth = 0)
 
 fn bare(locals: Vector<Val>, cap: Int, arity: Int) -> Frame
     ? "A frame with no code of its own."
@@ -182,11 +186,11 @@ fn trapOr(r: Result<Frame, String>, x: Inst, calls: List<Frame>, s: Store) -> Ne
     ? "Runs on with the frame, or traps."
     match r
         Result.Ok(f) -> go(x, f, calls, s)
-        Result.Err(e) -> trap(e)
+        Result.Err(e) -> trap(e, s)
 
-fn underflow() -> Next
+fn underflow(s: Store) -> Next
     ? "The trap for an operand stack too short, which validation rules out."
-    trap("operand stack underflow")
+    trap("operand stack underflow", s)
 
 fn isTrue(v: Val) -> Bool
     ? "Whether an i32 condition holds."
@@ -239,7 +243,7 @@ fn loop(x: Inst, f: Frame, calls: List<Frame>, s: Store, n: Int) -> Outcome
             Instr.RefTest(nl, h) -> loop(x, put1(f, 1, boolVal(matches(x, s, at(f, 0), nl, h))), calls, s, n + 1)
             Instr.RefCast(nl, h) -> match matches(x, s, at(f, 0), nl, h)
                 true -> loop(x, adv(f), calls, s, n + 1)
-                false -> stamp(Outcome.Trap("cast failure"), n + 1)
+                false -> stamp(Outcome.Trap("cast failure", s), n + 1)
             Instr.I32Const(c) -> loop(x, push(f, Val.I32(c)), calls, s, n + 1)
             Instr.I64Const(c) -> loop(x, push(f, Val.I64(c)), calls, s, n + 1)
             Instr.LocalSet(k) -> loop(x, Frame.update(f, pc = f.pc + 1, sp = f.sp - 1, locals = vset(f.locals, k, at(f, 0))), calls, s, n + 1)
@@ -253,7 +257,7 @@ fn loop(x: Inst, f: Frame, calls: List<Frame>, s: Store, n: Int) -> Outcome
                     Next.Go(f2, c2, s2) -> loop(x, f2, c2, s2, n + 1)
                     Next.Out(o) -> stamp(o, n + 1)
             Instr.ReturnCall(fi) -> match calleeFrame(x, fi, f)
-                Option.Some(g) -> loop(x, g, calls, s, n + 1)
+                Option.Some(g) -> loop(x, Frame.update(g, depth = g.depth - 1), calls, s, n + 1)
                 Option.None -> match exec(x, i, f, calls, s)
                     Next.Go(f2, c2, s2) -> loop(x, f2, c2, s2, n + 1)
                     Next.Out(o) -> stamp(o, n + 1)
@@ -331,10 +335,17 @@ fn calleeFrame(x: Inst, fi: Int, f: Frame) -> Option<Frame>
         Option.None -> Option.None
 
 fn calleeOf(g: Fn, f: Frame) -> Option<Frame>
-    ? "The callee frame for a local function."
-    match g.imported
+    ? "The callee frame for a local function, one deeper than f; None for an import, and when the stack is as deep as it may get (the slow path then traps)."
+    match Bool.or(g.imported, f.depth >= maxDepth())
         true -> Option.None
-        false -> Option.Some(frame(g.code, g.targets, setArgs(g.defaults, f, g.params), g.cap, g.results))
+        false -> Option.Some(Frame.update(frame(g.code, g.targets, setArgs(g.defaults, f, g.params), g.cap, g.results), depth = f.depth + 1))
+
+fn maxDepth() -> Int
+    ? "How many calls deep the machine may go before it traps with call stack exhausted."
+    200000
+
+verify maxDepth
+    maxDepth() => 200000
 
 fn afterCall(x: Inst, fi: Int, f: Frame) -> Frame
     ? "The caller as it waits: moved past the call, its arguments gone."
@@ -351,18 +362,19 @@ fn stamp(o: Outcome, n: Int) -> Outcome
     match o
         Outcome.Done(vs, s) -> Outcome.Done(vs, Store.update(s, steps = s.steps + n))
         Outcome.Host(fi, args, tail, mach) -> Outcome.Host(fi, args, tail, Machine.update(mach, store = Store.update(mach.store, steps = mach.store.steps + n)))
-        Outcome.Trap(e) -> Outcome.Trap(e)
+        Outcome.Trap(e, st) -> Outcome.Trap(e, Store.update(st, steps = st.steps + n))
+        Outcome.Thrown(t, vs, s) -> Outcome.Thrown(t, vs, Store.update(s, steps = s.steps + n))
 
 fn go(x: Inst, f: Frame, calls: List<Frame>, s: Store) -> Next
     ? "Go on running with this frame, these callers and this store."
     Next.Go(f, calls, s)
 
-fn trap(e: String) -> Next
-    ? "Stop with a trap."
-    Next.Out(Outcome.Trap(e))
+fn trap(e: String, s: Store) -> Next
+    ? "Stop with a trap. The store goes with it: a trap stops the program but does not undo what it wrote before."
+    Next.Out(Outcome.Trap(e, s))
 
 verify trap
-    trap("x") => Next.Out(Outcome.Trap("x"))
+    trap("x", emptyStore(Ast.emptyModule())) => Next.Out(Outcome.Trap("x", emptyStore(Ast.emptyModule())))
 
 fn getGet(f: Frame, a: Int, b: Int) -> Frame
     ? "local.get a then local.get b, as one step; both locals are read before the frame is handed on, so its stack stays unshared."
@@ -549,16 +561,16 @@ verify copyLocal
     vget(copyLocal(bare(Vector.fromList([Val.I32(4), Val.Null]), 1, 0), 0, 1).locals, 1) => Val.I32(4)
 
 verify castFieldVal
-    castFieldVal(Inst(m = Ast.emptyModule(), fns = Vector.fromList([])), emptyStore(Ast.emptyModule()), Val.Null, 0, 0, 0, 0) => Option.None
+    castFieldVal(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), emptyStore(Ast.emptyModule()), Val.Null, 0, 0, 0, 0) => Option.None
 
 verify fieldIfMatches
-    fieldIfMatches(Inst(m = Ast.emptyModule(), fns = Vector.fromList([])), Obj.Free, 0, 0, 0, 0) => Option.None
+    fieldIfMatches(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), Obj.Free, 0, 0, 0, 0) => Option.None
 
 verify castField
-    castField(Inst(m = Ast.emptyModule(), fns = Vector.fromList([])), emptyStore(Ast.emptyModule()), bare(Vector.fromList([Val.Null]), 1, 0), 0, true, 0, 0, 0, 0).pc => 1
+    castField(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), emptyStore(Ast.emptyModule()), bare(Vector.fromList([Val.Null]), 1, 0), 0, true, 0, 0, 0, 0).pc => 1
 
 verify testIfNot
-    testIfNot(Inst(m = Ast.emptyModule(), fns = Vector.fromList([])), emptyStore(Ast.emptyModule()), pushOnly(bare(Vector.fromList([]), 1, 0), Val.Null), true, 0, 9).pc => 2
+    testIfNot(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), emptyStore(Ast.emptyModule()), pushOnly(bare(Vector.fromList([]), 1, 0), Val.Null), true, 0, 9).pc => 2
 
 fn jumpIf(f: Frame, t: Int) -> Frame
     ? "A br_if that moves no values: pops the condition, then to t when it holds."
@@ -846,13 +858,13 @@ fn execRest(x: Inst, i: Instr, f: Frame, calls: List<Frame>, s: Store) -> Next
     ? "The less frequent instructions."
     match i
         Instr.Nop -> go(x, adv(f), calls, s)
-        Instr.Unreachable -> trap("unreachable")
+        Instr.Unreachable -> trap("unreachable", s)
         Instr.Throw(t) -> throwTag(x, f, t, calls, s)
         Instr.ThrowRef -> throwRef(x, f, calls, s)
         Instr.Simd(op, imm, k, off, _) -> simdOp(x, f, op, imm, k, off, calls, s)
         Instr.BrTable(ls, d) -> brTable(x, f, ls, d, calls, s)
-        Instr.CallRef(_) -> callRef(x, f, calls, s, false)
-        Instr.ReturnCallRef(_) -> callRef(x, f, calls, s, true)
+        Instr.CallRef(t) -> callRef(x, t, f, calls, s, false)
+        Instr.ReturnCallRef(t) -> callRef(x, t, f, calls, s, true)
         Instr.CallIndirect(t, tb) -> callIndirect(x, t, tb, f, calls, s, false)
         Instr.ReturnCallIndirect(t, tb) -> callIndirect(x, t, tb, f, calls, s, true)
         Instr.Select -> select(x, f, calls, s)
@@ -860,7 +872,7 @@ fn execRest(x: Inst, i: Instr, f: Frame, calls: List<Frame>, s: Store) -> Next
         Instr.GlobalSet(k) -> globalSet(x, f, k, calls, s)
         Instr.F64Const(b) -> go(x, push(f, Num.f64Val(b)), calls, s)
         Instr.F32Const(b) -> go(x, push(f, Num.f32Val(b)), calls, s)
-        Instr.RefFunc(k) -> go(x, push(f, Val.Func(k)), calls, s)
+        Instr.RefFunc(k) -> go(x, push(f, Val.Func(x.base + k)), calls, s)
         Instr.RefEq -> refEq(x, f, calls, s)
         Instr.RefAsNonNull -> refAsNonNull(x, f, calls, s)
         Instr.BrOnNull(d) -> brOnNull(x, f, d, calls, s)
@@ -909,8 +921,8 @@ fn execHeap(x: Inst, i: Instr, f: Frame, calls: List<Frame>, s: Store) -> Next
         Instr.TableFill(t) -> tableFill(x, f, t, calls, s)
         Instr.TableCopy(d, sr) -> tableCopy(x, f, d, sr, calls, s)
         Instr.TableInit(e, t) -> tableInit(x, f, e, t, calls, s)
-        Instr.Bad(op) -> trap("unknown opcode {op}")
-        _ -> trap("unsupported instruction")
+        Instr.Bad(op) -> trap("unknown opcode {op}", s)
+        _ -> trap("unsupported instruction", s)
 
 // ---- control ----
 
@@ -969,31 +981,31 @@ fn simdLoadPlain(x: Inst, f: Frame, op: Int, imm: Int, off: Int, calls: List<Fra
     ? "A load from an address."
     match top(f, 1)
         [a, .._] -> simdLoadAt(x, f, op, imm, idx(a) + off, Val.Null, 1, calls, s)
-        [] -> underflow()
+        [] -> underflow(s)
 
 fn simdLoadLane(x: Inst, f: Frame, op: Int, imm: Int, off: Int, calls: List<Frame>, s: Store) -> Next
     ? "load_lane: an address and a vector."
     match top(f, 2)
         [vec, a, .._] -> simdLoadAt(x, f, op, imm, idx(a) + off, vec, 2, calls, s)
-        _ -> underflow()
+        _ -> underflow(s)
 
 fn simdLoadAt(x: Inst, f: Frame, op: Int, imm: Int, ea: Int, old: Val, popped: Int, calls: List<Frame>, s: Store) -> Next
     ? "Reads after the bounds check."
     n = Simd.accessSize(op)
     match ea + n > memBytes(s)
-        true -> trap("out of bounds memory access")
+        true -> trap("out of bounds memory access", s)
         false -> go(x, put1(f, popped, Simd.loaded(op, imm, Mem.read(s.mem, ea, n), old)), calls, s)
 
 fn simdStore(x: Inst, f: Frame, op: Int, imm: Int, off: Int, calls: List<Frame>, s: Store) -> Next
     ? "v128.store and store_lane: an address and a vector."
     match top(f, 2)
         [vec, a, .._] -> simdStoreAt(x, f, idx(a) + off, Simd.stored(op, imm, vec), calls, s)
-        _ -> underflow()
+        _ -> underflow(s)
 
 fn simdStoreAt(x: Inst, f: Frame, ea: Int, bs: List<Int>, calls: List<Frame>, s: Store) -> Next
     ? "Writes the octets after the bounds check."
     match ea + List.len(bs) > memBytes(s)
-        true -> trap("out of bounds memory access")
+        true -> trap("out of bounds memory access", s)
         false -> go(x, putN(f, 2), calls, Store.update(s, mem = Mem.writeList(s.mem, ea, bs)))
 
 // ---- exceptions ----
@@ -1002,7 +1014,21 @@ fn throwTag(x: Inst, f: Frame, t: Int, calls: List<Frame>, s: Store) -> Next
     ? "throw: the tag's values become an exception on the heap (a struct whose type is -100 less the tag), which unwinds to the nearest handler."
     n = List.len(Ast.funcParams(x.m, Ast.tagType(x.m, t)))
     vs = List.reverse(top(f, n))
-    thrown(x, t, vs, alloc(x, f, n, Kompost.mkStruct(-100 - t, vs), Option.None, calls, s))
+    g = tagId(x, t)
+    thrown(x, g, vs, alloc(x, f, n, Kompost.mkStruct(-100 - g, vs), Option.None, calls, s))
+
+fn tagId(x: Inst, t: Int) -> Int
+    ? "The identity of tag t across linked instances: the one Link gave it, else the instance's base plus t (just t for a lone module)."
+    Option.withDefault(Vector.get(x.tags, t), x.base + t)
+
+verify tagId
+    tagId(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), 2) => 2
+    tagId(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([9])), 0) => 9
+
+fn resumeThrow(x: Inst, mach: Machine, t: Int, vs: List<Val>) -> Outcome
+    ? "Continues a machine that called into another instance, which threw tag t (an identity, see tagId) with values vs: the exception is made in this store and unwinds from the call."
+    f = Frame.update(mach.frame, pc = mach.frame.pc - 1)
+    proceed(x, thrown(x, t, vs, alloc(x, f, 0, Kompost.mkStruct(-100 - t, vs), Option.None, mach.calls, mach.store)))
 
 fn thrown(x: Inst, t: Int, vs: List<Val>, r: Next) -> Next
     ? "Takes the new exception's reference off the stack and unwinds."
@@ -1014,13 +1040,13 @@ fn thrownAt(x: Inst, t: Int, vs: List<Val>, r: Val, f: Frame, calls: List<Frame>
     ? "Unwinds with the exception at its address."
     match r
         Val.Ref(a) -> unwind(x, f, calls, s, a, t, vs)
-        _ -> trap("exception not allocated")
+        _ -> trap("exception not allocated", s)
 
 fn throwRef(x: Inst, f: Frame, calls: List<Frame>, s: Store) -> Next
     ? "throw_ref: throws an exception again."
     match at(f, 0)
         Val.Ref(a) -> rethrow(x, putN(f, 1), a, Kompost.get(s.heap, a), calls, s)
-        _ -> trap("null exception reference")
+        _ -> trap("null exception reference", s)
 
 fn rethrow(x: Inst, f: Frame, a: Int, o: Obj, calls: List<Frame>, s: Store) -> Next
     ? "Unwinds with an exception read back from the heap."
@@ -1032,7 +1058,7 @@ record Hit
 
 fn unwind(x: Inst, f: Frame, calls: List<Frame>, s: Store, a: Int, t: Int, vs: List<Val>) -> Next
     ? "Looks for a handler of tag t around the instruction before f's program counter (the throw, or the call a caller waits on), then in the callers; none is a trap."
-    match handlerAt(f.code, Vector.len(f.code) - 1, f.pc - 1, t)
+    match handlerAt(x, f.code, Vector.len(f.code) - 1, f.pc - 1, t)
         Option.Some(h) -> caught(x, f, h, a, vs, calls, s)
         Option.None -> unwindOut(x, calls, s, a, t, vs)
 
@@ -1040,19 +1066,19 @@ fn unwindOut(x: Inst, calls: List<Frame>, s: Store, a: Int, t: Int, vs: List<Val
     ? "Leaves a frame without a handler."
     match calls
         [c, ..rest] -> unwind(x, c, rest, s, a, t, vs)
-        [] -> trap("uncaught exception")
+        [] -> Next.Out(Outcome.Thrown(t, vs, s))
 
-fn handlerAt(code: Vector<Instr>, k: Int, p: Int, t: Int) -> Option<Hit>
-    ? "The first handler, scanning back from the end of the code (innermost first), whose range holds p and whose clause takes tag t."
+fn handlerAt(x: Inst, code: Vector<Instr>, k: Int, p: Int, t: Int) -> Option<Hit>
+    ? "The first handler, scanning back from the end of the code (innermost first), whose range holds p and whose clause takes tag t (an identity, see tagId)."
     match Vector.get(code, k)
-        Option.Some(Instr.Handler(from, to, kind, tg, ti)) -> handlerIf(code, k, p, t, Bool.and(Bool.and(from <= p, p < to), Bool.or(kind >= 2, tg == t)), Hit(kind = kind, target = ti))
+        Option.Some(Instr.Handler(from, to, kind, tg, ti)) -> handlerIf(x, code, k, p, t, Bool.and(Bool.and(from <= p, p < to), Bool.or(kind >= 2, tagId(x, tg) == t)), Hit(kind = kind, target = ti))
         _ -> Option.None
 
-fn handlerIf(code: Vector<Instr>, k: Int, p: Int, t: Int, takes: Bool, h: Hit) -> Option<Hit>
+fn handlerIf(x: Inst, code: Vector<Instr>, k: Int, p: Int, t: Int, takes: Bool, h: Hit) -> Option<Hit>
     ? "h when it takes the exception, else the search goes on."
     match takes
         true -> Option.Some(h)
-        false -> handlerAt(code, k - 1, p, t)
+        false -> handlerAt(x, code, k - 1, p, t)
 
 fn caught(x: Inst, f: Frame, h: Hit, a: Int, vs: List<Val>, calls: List<Frame>, s: Store) -> Next
     ? "Hands the clause's values to its label: the stack is cut to the label's base first."
@@ -1072,20 +1098,20 @@ verify payload
     payload(2, 3, [Val.I32(1)]) => []
 
 verify handlerAt
-    handlerAt(Vector.fromList([Instr.End, Instr.Handler(0, 5, 0, 1, 7), Instr.Handler(2, 4, 0, 2, 6)]), 2, 3, 1) => Option.Some(Hit(kind = 0, target = 7))
-    handlerAt(Vector.fromList([Instr.End, Instr.Handler(0, 5, 0, 1, 7)]), 1, 6, 1) => Option.None
+    handlerAt(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), Vector.fromList([Instr.End, Instr.Handler(0, 5, 0, 1, 7), Instr.Handler(2, 4, 0, 2, 6)]), 2, 3, 1) => Option.Some(Hit(kind = 0, target = 7))
+    handlerAt(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), Vector.fromList([Instr.End, Instr.Handler(0, 5, 0, 1, 7)]), 1, 6, 1) => Option.None
 
 verify handlerIf
-    handlerIf(Vector.fromList([]), 0, 0, 0, true, Hit(kind = 2, target = 1)) => Option.Some(Hit(kind = 2, target = 1))
+    handlerIf(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), Vector.fromList([]), 0, 0, 0, true, Hit(kind = 2, target = 1)) => Option.Some(Hit(kind = 2, target = 1))
 
 verify unwindOut
-    unwindOut(Inst(m = Ast.emptyModule(), fns = Vector.fromList([])), [], emptyStore(Ast.emptyModule()), 0, 0, []) => Next.Out(Outcome.Trap("uncaught exception"))
+    unwindOut(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), [], emptyStore(Ast.emptyModule()), 0, 0, []) => Next.Out(Outcome.Thrown(0, [], emptyStore(Ast.emptyModule())))
 
 fn call(x: Inst, fi: Int, f: Frame, calls: List<Frame>, s: Store, tail: Bool) -> Next
     ? "call or return_call of function fi."
     match Vector.get(x.fns, fi)
         Option.Some(g) -> callFn(x, g, fi, f, calls, s, tail)
-        Option.None -> trap("call to undefined function {fi}")
+        Option.None -> trap("call to undefined function {fi}", s)
 
 fn callFn(x: Inst, g: Fn, fi: Int, f: Frame, calls: List<Frame>, s: Store, tail: Bool) -> Next
     ? "Pops the arguments and enters the function, or stops for the host when it is imported."
@@ -1096,10 +1122,13 @@ fn callFn(x: Inst, g: Fn, fi: Int, f: Frame, calls: List<Frame>, s: Store, tail:
 
 fn enter(x: Inst, g: Fn, f: Frame, caller: Frame, calls: List<Frame>, s: Store, tail: Bool) -> Next
     ? "Runs a local function with its arguments, taken from f's stack, as its first locals."
+    d = f.depth
     callee = frame(g.code, g.targets, setArgs(g.defaults, f, g.params), g.cap, g.results)
     match tail
-        true -> go(x, callee, calls, s)
-        false -> go(x, callee, List.prepend(caller, calls), s)
+        true -> go(x, Frame.update(callee, depth = d), calls, s)
+        false -> match d >= maxDepth()
+            true -> trap("call stack exhausted", s)
+            false -> go(x, Frame.update(callee, depth = d + 1), List.prepend(caller, calls), s)
 
 fn setArgs(v: Vector<Val>, f: Frame, n: Int) -> Vector<Val>
     ? "The locals with the top n values of f's stack as the first n, in order."
@@ -1111,11 +1140,29 @@ fn setArgsFrom(v: Vector<Val>, f: Frame, n: Int, k: Int) -> Vector<Val>
         true -> v
         false -> setArgsFrom(vset(v, k, at(f, n - 1 - k)), f, n, k + 1)
 
-fn callRef(x: Inst, f: Frame, calls: List<Frame>, s: Store, tail: Bool) -> Next
-    ? "call_ref: calls the function reference on top of the stack."
+fn callRef(x: Inst, t: Int, f: Frame, calls: List<Frame>, s: Store, tail: Bool) -> Next
+    ? "call_ref: calls the function reference on top of the stack, of type t."
     match at(f, 0)
-        Val.Func(fi) -> call(x, fi, below(f, 1), calls, s, tail)
-        _ -> trap("null function reference")
+        Val.Func(a) -> callAt(x, t, a, below(f, 1), calls, s, tail)
+        _ -> trap("null function reference", s)
+
+fn callAt(x: Inst, t: Int, a: Int, f: Frame, calls: List<Frame>, s: Store, tail: Bool) -> Next
+    ? "Calls the function at address a: one of this instance's (its address less the instance's base), or another instance's, which the host is asked to run, with the arguments type t says."
+    fi = a - x.base
+    match Bool.and(fi >= 0, fi < Vector.len(x.fns))
+        true -> call(x, fi, f, calls, s, tail)
+        false -> foreignCall(a, List.len(Ast.funcParams(x.m, t)), f, calls, s, tail)
+
+fn foreignCall(a: Int, n: Int, f: Frame, calls: List<Frame>, s: Store, tail: Bool) -> Next
+    ? "Stops for the host to call another instance's function: the import number is -1 less the address, so it is never one of this instance's imports."
+    Next.Out(Outcome.Host(-1 - a, List.reverse(top(f, n)), tail, Machine(frame = putN(f, n), calls = calls, store = s)))
+
+fn isLocal(x: Inst, a: Int) -> Bool
+    ? "Whether function address a is this instance's."
+    Bool.and(a >= x.base, a - x.base < Vector.len(x.fns))
+
+verify isLocal
+    isLocal(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), 0) => false
 
 fn callIndirect(x: Inst, t: Int, tb: Int, f: Frame, calls: List<Frame>, s: Store, tail: Bool) -> Next
     ? "call_indirect: the table entry at the popped index, checked against type t."
@@ -1124,15 +1171,17 @@ fn callIndirect(x: Inst, t: Int, tb: Int, f: Frame, calls: List<Frame>, s: Store
 fn callEntry(x: Inst, t: Int, e: Option<Val>, f: Frame, calls: List<Frame>, s: Store, tail: Bool) -> Next
     ? "Calls a table entry when it is a function of the right type."
     match e
-        Option.Some(Val.Func(fi)) -> callChecked(x, t, fi, f, calls, s, tail)
-        Option.Some(_) -> trap("uninitialized element")
-        Option.None -> trap("undefined element")
+        Option.Some(Val.Func(a)) -> callChecked(x, t, a, f, calls, s, tail)
+        Option.Some(_) -> trap("uninitialized element", s)
+        Option.None -> trap("undefined element", s)
 
-fn callChecked(x: Inst, t: Int, fi: Int, f: Frame, calls: List<Frame>, s: Store, tail: Bool) -> Next
-    ? "Calls fi when its type is t or a subtype of it."
-    match isSub(x.m, fnType(x, fi), t, 64)
-        true -> call(x, fi, f, calls, s, tail)
-        false -> trap("indirect call type mismatch")
+fn callChecked(x: Inst, t: Int, a: Int, f: Frame, calls: List<Frame>, s: Store, tail: Bool) -> Next
+    ? "Calls the function at address a when its type is t or a subtype of it; another instance's function is not checked (its types belong to its own module)."
+    match isLocal(x, a)
+        false -> callAt(x, t, a, f, calls, s, tail)
+        true -> match isSub(x.m, fnType(x, a - x.base), t, 64)
+            true -> call(x, a - x.base, f, calls, s, tail)
+            false -> trap("indirect call type mismatch", s)
 
 fn fnType(x: Inst, fi: Int) -> Int
     ? "The type index of function fi."
@@ -1144,7 +1193,7 @@ fn select(x: Inst, f: Frame, calls: List<Frame>, s: Store) -> Next
     ? "select: the first operand when the condition holds, else the second."
     match top(f, 3)
         [c, b, a, .._] -> go(x, put1(f, 3, pick(isTrue(c), a, b)), calls, s)
-        _ -> underflow()
+        _ -> underflow(s)
 
 fn pick(c: Bool, a: Val, b: Val) -> Val
     ? "a when c holds, else b."
@@ -1170,13 +1219,13 @@ fn globalSet(x: Inst, f: Frame, k: Int, calls: List<Frame>, s: Store) -> Next
     ? "global.set."
     match top(f, 1)
         [v, .._] -> go(x, putN(f, 1), calls, Store.update(s, globals = vset(s.globals, k, v)))
-        [] -> underflow()
+        [] -> underflow(s)
 
 fn unOp(x: Inst, op: Int, f: Frame, calls: List<Frame>, s: Store) -> Next
     ? "A unary numeric instruction."
     match top(f, 1)
         [a, .._] -> numResult(x, Num.unary(op, a), 1, f, calls, s)
-        [] -> underflow()
+        [] -> underflow(s)
 
 fn binOp(x: Inst, op: Int, f: Frame, calls: List<Frame>, s: Store) -> Next
     ? "A binary numeric instruction; the common i32 and i64 ones are computed here, without going through Num's dispatch."
@@ -1184,7 +1233,7 @@ fn binOp(x: Inst, op: Int, f: Frame, calls: List<Frame>, s: Store) -> Next
         [Val.I32(b), Val.I32(a), .._] -> i32Fast(x, op, a, b, 2, f, calls, s)
         [Val.I64(b), Val.I64(a), .._] -> i64Fast(x, op, a, b, 2, f, calls, s)
         [b, a, .._] -> numResult(x, Num.binary(op, a, b), 2, f, calls, s)
-        _ -> underflow()
+        _ -> underflow(s)
 
 fn i32Fast(x: Inst, op: Int, a: Int, b: Int, popped: Int, f: Frame, calls: List<Frame>, s: Store) -> Next
     ? "add, sub, the bitwise operations and the comparisons on i32."
@@ -1222,7 +1271,7 @@ fn numResult(x: Inst, r: Result<Val, String>, popped: Int, f: Frame, calls: List
     ? "Pushes a numeric result, or traps."
     match r
         Result.Ok(v) -> go(x, put1(f, popped, v), calls, s)
-        Result.Err(e) -> trap(e)
+        Result.Err(e) -> trap(e, s)
 
 // ---- references ----
 
@@ -1230,7 +1279,7 @@ fn refIsNull(x: Inst, f: Frame, calls: List<Frame>, s: Store) -> Next
     ? "ref.is_null."
     match top(f, 1)
         [r, .._] -> go(x, put1(f, 1, boolVal(Value.isNull(r))), calls, s)
-        [] -> underflow()
+        [] -> underflow(s)
 
 fn boolVal(b: Bool) -> Val
     ? "A Bool as an i32."
@@ -1246,12 +1295,12 @@ fn refEq(x: Inst, f: Frame, calls: List<Frame>, s: Store) -> Next
     ? "ref.eq: same reference, or both null, or equal i31 values."
     match top(f, 2)
         [b, a, .._] -> go(x, put1(f, 2, boolVal(a == b)), calls, s)
-        _ -> underflow()
+        _ -> underflow(s)
 
 fn refAsNonNull(x: Inst, f: Frame, calls: List<Frame>, s: Store) -> Next
     ? "ref.as_non_null."
     match top(f, 1)
-        [Val.Null, .._] -> trap("null reference")
+        [Val.Null, .._] -> trap("null reference", s)
         _ -> go(x, adv(f), calls, s)
 
 fn brOnNull(x: Inst, f: Frame, d: Int, calls: List<Frame>, s: Store) -> Next
@@ -1270,25 +1319,25 @@ fn refTest(x: Inst, f: Frame, n: Bool, h: Int, calls: List<Frame>, s: Store) -> 
     ? "ref.test."
     match top(f, 1)
         [r, .._] -> go(x, put1(f, 1, boolVal(matches(x, s, r, n, h))), calls, s)
-        [] -> underflow()
+        [] -> underflow(s)
 
 fn refCast(x: Inst, f: Frame, n: Bool, h: Int, calls: List<Frame>, s: Store) -> Next
     ? "ref.cast: traps when the reference is not of the type."
     match top(f, 1)
         [r, .._] -> castOn(x, f, matches(x, s, r, n, h), calls, s)
-        [] -> underflow()
+        [] -> underflow(s)
 
 fn castOn(x: Inst, f: Frame, ok: Bool, calls: List<Frame>, s: Store) -> Next
     ? "Moves on after a cast that held, traps after one that did not."
     match ok
         true -> go(x, adv(f), calls, s)
-        false -> trap("cast failure")
+        false -> trap("cast failure", s)
 
 fn brOnCast(x: Inst, f: Frame, d: Int, n: Bool, h: Int, onMatch: Bool, calls: List<Frame>, s: Store) -> Next
     ? "br_on_cast (onMatch) and br_on_cast_fail: branches with the reference when the test comes out as asked."
     match top(f, 1)
         [r, .._] -> brIfOn(x, f, matches(x, s, r, n, h) == onMatch, d, calls, s)
-        [] -> underflow()
+        [] -> underflow(s)
 
 fn matches(x: Inst, s: Store, r: Val, nullable: Bool, h: Int) -> Bool
     ? "Whether reference r is of the reference type (nullable, h). externref and anyref share one representation: anything non-null is an extern (-17), and a host value made internal by any.convert_extern is an any (-18) but nothing below it."
@@ -1296,7 +1345,7 @@ fn matches(x: Inst, s: Store, r: Val, nullable: Bool, h: Int) -> Bool
         Val.Null -> nullable
         Val.I31(_) -> Bool.or(Bool.or(h == -20, h == -17), Bool.or(h == -19, h == -18))
         Val.Ref(a) -> Bool.or(h == -17, objMatches(x, Kompost.get(s.heap, a), h))
-        Val.Func(fi) -> Bool.or(h == -16, Bool.and(h >= 0, isSub(x.m, fnType(x, fi), h, 64)))
+        Val.Func(a) -> Bool.or(h == -16, Bool.and(Bool.and(h >= 0, isLocal(x, a)), isSub(x.m, fnType(x, a - x.base), h, 64)))
         Val.Host(_) -> Bool.or(h == -17, h == -18)
         _ -> false
 
@@ -1348,13 +1397,13 @@ fn refI31(x: Inst, f: Frame, calls: List<Frame>, s: Store) -> Next
     ? "ref.i31: the low 31 bits of an i32."
     match top(f, 1)
         [v, .._] -> go(x, put1(f, 1, Val.I31(Bits.low(Value.i32(v), 31))), calls, s)
-        [] -> underflow()
+        [] -> underflow(s)
 
 fn i31Get(x: Inst, f: Frame, sg: Bool, calls: List<Frame>, s: Store) -> Next
     ? "i31.get_s and i31.get_u."
     match top(f, 1)
         [Val.I31(v), .._] -> go(x, put1(f, 1, Val.I32(i31Value(v, sg))), calls, s)
-        _ -> trap("null i31 reference")
+        _ -> trap("null i31 reference", s)
 
 fn i31Value(v: Int, sg: Bool) -> Int
     ? "An i31 read signed or unsigned."
@@ -1501,13 +1550,13 @@ fn structGet(x: Inst, f: Frame, t: Int, k: Int, e: Int, calls: List<Frame>, s: S
     ? "struct.get, struct.get_s and struct.get_u."
     match top(f, 1)
         [Val.Ref(a), .._] -> structField(x, f, Kompost.get(s.heap, a), t, k, e, 1, calls, s)
-        _ -> trap("null structure reference")
+        _ -> trap("null structure reference", s)
 
 fn structField(x: Inst, f: Frame, o: Obj, t: Int, k: Int, e: Int, popped: Int, calls: List<Frame>, s: Store) -> Next
     ? "Pushes field k of a struct."
     match o
-        Obj.Free -> trap("not a struct")
-        Obj.Array(_, _) -> trap("not a struct")
+        Obj.Free -> trap("not a struct", s)
+        Obj.Array(_, _) -> trap("not a struct", s)
         _ -> go(x, put1(f, popped, fieldOf(x, o, t, k, e)), calls, s)
 
 fn fieldType(x: Inst, t: Int, k: Int) -> ValType
@@ -1518,14 +1567,14 @@ fn structSet(x: Inst, f: Frame, t: Int, k: Int, calls: List<Frame>, s: Store) ->
     ? "struct.set."
     match top(f, 2)
         [v, Val.Ref(a), .._] -> structWrite(x, f, a, k, pack(fieldType(x, t, k), v), 2, calls, s)
-        _ -> trap("null structure reference")
+        _ -> trap("null structure reference", s)
 
 fn structWrite(x: Inst, f: Frame, a: Int, k: Int, v: Val, popped: Int, calls: List<Frame>, s: Store) -> Next
     ? "Writes field k of the struct at a: a new node with the field replaced goes into the slot. The store comes here once, so its heap is moved into the write."
     o = Kompost.get(s.heap, a)
     match o
-        Obj.Free -> trap("not a struct")
-        Obj.Array(_, _) -> trap("not a struct")
+        Obj.Free -> trap("not a struct", s)
+        Obj.Array(_, _) -> trap("not a struct", s)
         _ -> go(x, putN(f, popped), calls, Store.update(s, heap = Kompost.put(s.heap, a, Kompost.withField(o, k, v))))
 
 fn elemType(x: Inst, t: Int) -> ValType
@@ -1535,20 +1584,31 @@ fn elemType(x: Inst, t: Int) -> ValType
 fn arrayNew(x: Inst, f: Frame, t: Int, calls: List<Frame>, s: Store) -> Next
     ? "array.new: n copies of a value."
     match top(f, 2)
-        [n, v, .._] -> arrayOf(x, f, t, Arr.make(idx(n), pack(elemType(x, t), v), bitsOf(elemType(x, t))), 2, calls, s)
-        _ -> underflow()
+        [n, v, .._] -> match idx(n) > maxArray()
+            true -> trap("allocation too large", s)
+            false -> arrayOf(x, f, t, Arr.make(idx(n), pack(elemType(x, t), v), bitsOf(elemType(x, t))), 2, calls, s)
+        _ -> underflow(s)
 
 fn arrayNewDefault(x: Inst, f: Frame, t: Int, calls: List<Frame>, s: Store) -> Next
     ? "array.new_default."
     match top(f, 1)
-        [n, .._] -> arrayOf(x, f, t, Arr.make(idx(n), Value.defaultOf(elemType(x, t)), bitsOf(elemType(x, t))), 1, calls, s)
-        [] -> underflow()
+        [n, .._] -> match idx(n) > maxArray()
+            true -> trap("allocation too large", s)
+            false -> arrayOf(x, f, t, Arr.make(idx(n), Value.defaultOf(elemType(x, t)), bitsOf(elemType(x, t))), 1, calls, s)
+        [] -> underflow(s)
+
+fn maxArray() -> Int
+    ? "The longest array Kompost makes (an implementation limit): 2^28 elements."
+    268435456
+
+verify maxArray
+    maxArray() => 268435456
 
 fn arrayOf(x: Inst, f: Frame, t: Int, r: Result<Arr, String>, popped: Int, calls: List<Frame>, s: Store) -> Next
     ? "Allocates an array once its elements are made."
     match r
         Result.Ok(vs) -> allocArr(x, f, popped, t, vs, calls, s)
-        Result.Err(e) -> trap("array too large: {e}")
+        Result.Err(e) -> trap("array too large: {e}", s)
 
 fn arrayNewFixed(x: Inst, f: Frame, t: Int, n: Int, calls: List<Frame>, s: Store) -> Next
     ? "array.new_fixed: the top n values, in push order."
@@ -1625,13 +1685,13 @@ fn arrayNewData(x: Inst, f: Frame, t: Int, d: Int, calls: List<Frame>, s: Store)
     ? "array.new_data: n elements from data segment d at an offset."
     match top(f, 2)
         [n, off, .._] -> arrayFromData(x, f, t, dataSeg(s, d), idx(off), idx(n), 2, calls, s)
-        _ -> underflow()
+        _ -> underflow(s)
 
 fn arrayFromData(x: Inst, f: Frame, t: Int, bytes: Vector<Int>, off: Int, n: Int, popped: Int, calls: List<Frame>, s: Store) -> Next
     ? "Allocates an array read from octets, after the bounds check."
     et = elemType(x, t)
     match off + n * elemSize(et) > Vector.len(bytes)
-        true -> trap("out of bounds memory access")
+        true -> trap("out of bounds memory access", s)
         false -> allocArr(x, f, popped, t, Arr.fromList(dataVals(et, bytes, off, n, []), bitsOf(et)), calls, s)
 
 fn elemSeg(s: Store, e: Int) -> Vector<Val>
@@ -1653,51 +1713,51 @@ fn arrayNewElem(x: Inst, f: Frame, t: Int, e: Int, calls: List<Frame>, s: Store)
     ? "array.new_elem: n references from element segment e."
     match top(f, 2)
         [n, off, .._] -> arrayFromElem(x, f, t, elemSeg(s, e), idx(off), idx(n), 2, calls, s)
-        _ -> underflow()
+        _ -> underflow(s)
 
 fn arrayFromElem(x: Inst, f: Frame, t: Int, seg: Vector<Val>, off: Int, n: Int, popped: Int, calls: List<Frame>, s: Store) -> Next
     ? "Allocates an array from an element segment, after the bounds check."
     match off + n > Vector.len(seg)
-        true -> trap("out of bounds table access")
+        true -> trap("out of bounds table access", s)
         false -> allocArr(x, f, popped, t, Arr.fromList(slice(seg, off, n), 0), calls, s)
 
 fn arrayGet(x: Inst, f: Frame, t: Int, e: Int, calls: List<Frame>, s: Store) -> Next
     ? "array.get, array.get_s and array.get_u."
     match top(f, 2)
         [k, Val.Ref(a), .._] -> arrayElemAt(x, f, Kompost.arr(s.heap, a), idx(k), elemType(x, t), e, 2, calls, s)
-        [_, Val.Null, .._] -> trap("null array reference")
-        _ -> underflow()
+        [_, Val.Null, .._] -> trap("null array reference", s)
+        _ -> underflow(s)
 
 fn arrayElemAt(x: Inst, f: Frame, o: Option<Arr>, k: Int, et: ValType, e: Int, popped: Int, calls: List<Frame>, s: Store) -> Next
     ? "Pushes element k of an array."
     match o
         Option.Some(arr) -> arrayPushAt(x, f, Arr.get(arr, k), et, e, popped, calls, s)
-        Option.None -> trap("not an array")
+        Option.None -> trap("not an array", s)
 
 fn arrayPushAt(x: Inst, f: Frame, v: Option<Val>, et: ValType, e: Int, popped: Int, calls: List<Frame>, s: Store) -> Next
     ? "Pushes an element read in bounds, or traps."
     match v
         Option.Some(a) -> go(x, put1(f, popped, unpack(et, a, e)), calls, s)
-        Option.None -> trap("out of bounds array access")
+        Option.None -> trap("out of bounds array access", s)
 
 fn arraySet(x: Inst, f: Frame, t: Int, calls: List<Frame>, s: Store) -> Next
     ? "array.set."
     match top(f, 3)
         [v, k, Val.Ref(a), .._] -> arrayWrite(x, f, a, idx(k), pack(elemType(x, t), v), 3, calls, s)
-        [_, _, Val.Null, .._] -> trap("null array reference")
-        _ -> underflow()
+        [_, _, Val.Null, .._] -> trap("null array reference", s)
+        _ -> underflow(s)
 
 fn arrayWrite(x: Inst, f: Frame, a: Int, k: Int, v: Val, popped: Int, calls: List<Frame>, s: Store) -> Next
     ? "Writes element k of the array at a, in place."
     match k < arrLen(s, a)
         true -> go(x, putN(f, popped), calls, Store.update(s, heap = Kompost.setElem(s.heap, a, k, v)))
-        false -> trap("out of bounds array access")
+        false -> trap("out of bounds array access", s)
 
 fn arrayLen(x: Inst, f: Frame, calls: List<Frame>, s: Store) -> Next
     ? "array.len."
     match top(f, 1)
         [Val.Ref(a), .._] -> go(x, put1(f, 1, Val.I32(arrLen(s, a))), calls, s)
-        _ -> trap("null array reference")
+        _ -> trap("null array reference", s)
 
 fn arrayLength(o: Obj) -> Int
     ? "The length of an array object."
@@ -1737,60 +1797,60 @@ fn arrayFill(x: Inst, f: Frame, t: Int, calls: List<Frame>, s: Store) -> Next
     ? "array.fill."
     match top(f, 4)
         [n, v, k, Val.Ref(a), .._] -> arrayPut(x, f, a, idx(k), repeatVal(pack(elemType(x, t), v), idx(n), []), 4, calls, s)
-        [_, _, _, Val.Null, .._] -> trap("null array reference")
-        _ -> underflow()
+        [_, _, _, Val.Null, .._] -> trap("null array reference", s)
+        _ -> underflow(s)
 
 fn arrayPut(x: Inst, f: Frame, a: Int, k: Int, vs: List<Val>, popped: Int, calls: List<Frame>, s: Store) -> Next
     ? "Writes vs into the array at a from slot k, after the bounds check, in place."
     match k + List.len(vs) > arrLen(s, a)
-        true -> trap("out of bounds array access")
+        true -> trap("out of bounds array access", s)
         false -> go(x, putN(f, popped), calls, Store.update(s, heap = Kompost.setElems(s.heap, a, k, vs)))
 
 fn arrayCopy(x: Inst, f: Frame, calls: List<Frame>, s: Store) -> Next
     ? "array.copy: n elements from one array to another, which may be the same one."
     match top(f, 5)
         [n, si, Val.Ref(src), di, Val.Ref(dst), .._] -> arrayCopyIn(x, f, src, idx(si), dst, idx(di), idx(n), 5, calls, s)
-        [_, _, _, _, _, .._] -> trap("null array reference")
-        _ -> underflow()
+        [_, _, _, _, _, .._] -> trap("null array reference", s)
+        _ -> underflow(s)
 
 fn arrayCopyIn(x: Inst, f: Frame, src: Int, si: Int, dst: Int, di: Int, n: Int, popped: Int, calls: List<Frame>, s: Store) -> Next
     ? "Copies after checking the source's bounds; arrayPut checks the destination's. The elements are read out first, so a copy within one array is right."
     match si + n > arrLen(s, src)
-        true -> trap("out of bounds array access")
+        true -> trap("out of bounds array access", s)
         false -> arrayPut(x, f, dst, di, Arr.slice(arrVals(s, src), si, n), popped, calls, s)
 
 fn arrayInitData(x: Inst, f: Frame, t: Int, d: Int, calls: List<Frame>, s: Store) -> Next
     ? "array.init_data."
     match top(f, 4)
         [n, so, k, Val.Ref(a), .._] -> arrayInitDataIn(x, f, a, t, dataSeg(s, d), idx(so), idx(k), idx(n), 4, calls, s)
-        [_, _, _, Val.Null, .._] -> trap("null array reference")
-        _ -> underflow()
+        [_, _, _, Val.Null, .._] -> trap("null array reference", s)
+        _ -> underflow(s)
 
 fn arrayInitDataIn(x: Inst, f: Frame, a: Int, t: Int, bytes: Vector<Int>, so: Int, k: Int, n: Int, popped: Int, calls: List<Frame>, s: Store) -> Next
     ? "Writes octets into an array after checking both bounds."
     et = elemType(x, t)
     len = arrayLength(Kompost.get(s.heap, a))
     match k + n > len
-        true -> trap("out of bounds array access")
+        true -> trap("out of bounds array access", s)
         false -> arrayInitDataRead(x, f, a, et, bytes, so, k, n, popped, calls, s)
 
 fn arrayInitDataRead(x: Inst, f: Frame, a: Int, et: ValType, bytes: Vector<Int>, so: Int, k: Int, n: Int, popped: Int, calls: List<Frame>, s: Store) -> Next
     ? "Reads the octets once the data segment's bounds hold."
     match so + n * elemSize(et) > Vector.len(bytes)
-        true -> trap("out of bounds memory access")
+        true -> trap("out of bounds memory access", s)
         false -> arrayPut(x, f, a, k, dataVals(et, bytes, so, n, []), popped, calls, s)
 
 fn arrayInitElem(x: Inst, f: Frame, e: Int, calls: List<Frame>, s: Store) -> Next
     ? "array.init_elem."
     match top(f, 4)
         [n, so, k, Val.Ref(a), .._] -> arrayInitElemIn(x, f, a, elemSeg(s, e), idx(so), idx(k), idx(n), 4, calls, s)
-        [_, _, _, Val.Null, .._] -> trap("null array reference")
-        _ -> underflow()
+        [_, _, _, Val.Null, .._] -> trap("null array reference", s)
+        _ -> underflow(s)
 
 fn arrayInitElemIn(x: Inst, f: Frame, a: Int, seg: Vector<Val>, so: Int, k: Int, n: Int, popped: Int, calls: List<Frame>, s: Store) -> Next
     ? "Writes references into an array after checking the segment's bounds."
     match so + n > Vector.len(seg)
-        true -> trap("out of bounds table access")
+        true -> trap("out of bounds table access", s)
         false -> arrayPut(x, f, a, k, slice(seg, so, n), popped, calls, s)
 
 // ---- linear memory ----
@@ -1824,13 +1884,23 @@ fn backMem(k: Int, n: Next) -> Next
     ? "Swaps memory k back in the store a step goes on with."
     match n
         Next.Go(f, calls, s) -> Next.Go(f, calls, swapMem(s, k))
-        Next.Out(o) -> Next.Out(o)
+        Next.Out(o) -> Next.Out(outBack(k, o))
+
+fn outBack(k: Int, o: Outcome) -> Outcome
+    ? "A trap or an exception carries its store: memory k goes back to its place in it too."
+    match o
+        Outcome.Trap(e, s) -> Outcome.Trap(e, swapMem(s, k))
+        Outcome.Thrown(t, vs, s) -> Outcome.Thrown(t, vs, swapMem(s, k))
+        _ -> o
+
+verify outBack
+    outBack(1, Outcome.Trap("x", emptyStore(Ast.emptyModule()))) => Outcome.Trap("x", emptyStore(Ast.emptyModule()))
 
 verify onMem
-    onMem(0, Next.Out(Outcome.Trap("x"))) => Next.Out(Outcome.Trap("x"))
+    onMem(0, Next.Out(Outcome.Trap("x", emptyStore(Ast.emptyModule())))) => Next.Out(Outcome.Trap("x", emptyStore(Ast.emptyModule())))
 
 verify backMem
-    backMem(1, Next.Out(Outcome.Trap("x"))) => Next.Out(Outcome.Trap("x"))
+    backMem(1, Next.Out(Outcome.Trap("x", emptyStore(Ast.emptyModule())))) => Next.Out(Outcome.Trap("x", emptyStore(Ast.emptyModule())))
 
 fn memorySize(x: Inst, f: Frame, wide: Bool, calls: List<Frame>, s: Store) -> Next
     ? "memory.size."
@@ -1846,12 +1916,12 @@ fn memoryCopyAcross(x: Inst, f: Frame, dm: Int, sm: Int, calls: List<Frame>, s: 
     ? "memory.copy between two memories."
     match top(f, 3)
         [n, src, d, .._] -> copyAcross(x, f, dm, sm, idx(src), idx(d), idx(n), calls, withMem(s, sm))
-        _ -> underflow()
+        _ -> underflow(s)
 
 fn copyAcross(x: Inst, f: Frame, dm: Int, sm: Int, src: Int, d: Int, n: Int, calls: List<Frame>, ss: Store) -> Next
     ? "Reads from memory sm (in the place of memory 0 in ss) after its bounds check, then writes into memory dm."
     match src + n > memBytes(ss)
-        true -> trap("out of bounds memory access")
+        true -> trap("out of bounds memory access", withMem(ss, sm))
         false -> copyInto(x, f, dm, d, Mem.readList(ss.mem, src, n), n, calls, withMem(ss, sm))
 
 fn copyInto(x: Inst, f: Frame, dm: Int, d: Int, bs: List<Int>, n: Int, calls: List<Frame>, s: Store) -> Next
@@ -1928,13 +1998,13 @@ fn load(x: Inst, f: Frame, op: Int, off: Int, calls: List<Frame>, s: Store) -> N
     ? "A load from linear memory."
     match top(f, 1)
         [a, .._] -> loadAt(x, f, op, idx(a) + off, 1, calls, s)
-        [] -> underflow()
+        [] -> underflow(s)
 
 fn loadAt(x: Inst, f: Frame, op: Int, ea: Int, popped: Int, calls: List<Frame>, s: Store) -> Next
     ? "A load from an effective address, after the bounds check."
     n = loadSize(op)
     match ea + n > memBytes(s)
-        true -> trap("out of bounds memory access")
+        true -> trap("out of bounds memory access", s)
         false -> go(x, put1(f, popped, loadVal(op, Mem.read(s.mem, ea, n))), calls, s)
 
 fn storeSize(op: Int) -> Int
@@ -1971,20 +2041,20 @@ fn store(x: Inst, f: Frame, op: Int, off: Int, calls: List<Frame>, s: Store) -> 
     ? "A store to linear memory."
     match top(f, 2)
         [v, a, .._] -> storeAt(x, f, op, idx(a) + off, v, 2, calls, s)
-        _ -> underflow()
+        _ -> underflow(s)
 
 fn storeAt(x: Inst, f: Frame, op: Int, ea: Int, v: Val, popped: Int, calls: List<Frame>, s: Store) -> Next
     ? "A store to an effective address, after the bounds check."
     n = storeSize(op)
     match ea + n > memBytes(s)
-        true -> trap("out of bounds memory access")
+        true -> trap("out of bounds memory access", s)
         false -> go(x, putN(f, popped), calls, Store.update(s, mem = Mem.write(s.mem, ea, n, storeBits(v))))
 
 fn memoryGrow(x: Inst, f: Frame, wide: Bool, calls: List<Frame>, s: Store) -> Next
     ? "memory.grow: the old size in pages, or -1 when the maximum would be passed."
     match top(f, 1)
         [d, .._] -> growBy(x, f, wide, idx(d), 1, calls, s)
-        [] -> underflow()
+        [] -> underflow(s)
 
 fn growBy(x: Inst, f: Frame, wide: Bool, d: Int, popped: Int, calls: List<Frame>, s: Store) -> Next
     ? "Grows memory by d pages when it may."
@@ -2004,37 +2074,43 @@ verify fillList
 fn memoryFill(x: Inst, f: Frame, calls: List<Frame>, s: Store) -> Next
     ? "memory.fill."
     match top(f, 3)
-        [n, v, d, .._] -> memWrite(x, f, idx(d), fillList(Bits.low(Value.i32(v), 8), idx(n), []), idx(n), 3, calls, s)
-        _ -> underflow()
+        [n, v, d, .._] -> memFill(x, f, idx(d), Bits.low(Value.i32(v), 8), idx(n), calls, s)
+        _ -> underflow(s)
+
+fn memFill(x: Inst, f: Frame, d: Int, b: Int, n: Int, calls: List<Frame>, s: Store) -> Next
+    ? "Checks the bounds before the octets are made: a fill far out of bounds must trap, not build gigabytes first."
+    match d + n > memBytes(s)
+        true -> trap("out of bounds memory access", s)
+        false -> memWrite(x, f, d, fillList(b, n, []), n, 3, calls, s)
 
 fn memWrite(x: Inst, f: Frame, d: Int, bs: List<Int>, n: Int, popped: Int, calls: List<Frame>, s: Store) -> Next
     ? "Writes n octets at d after the bounds check."
     match d + n > memBytes(s)
-        true -> trap("out of bounds memory access")
+        true -> trap("out of bounds memory access", s)
         false -> go(x, putN(f, popped), calls, Store.update(s, mem = Mem.writeList(s.mem, d, bs)))
 
 fn memoryCopy(x: Inst, f: Frame, calls: List<Frame>, s: Store) -> Next
     ? "memory.copy, which may overlap."
     match top(f, 3)
         [n, src, d, .._] -> memCopyFrom(x, f, idx(src), idx(d), idx(n), 3, calls, s)
-        _ -> underflow()
+        _ -> underflow(s)
 
 fn memCopyFrom(x: Inst, f: Frame, src: Int, d: Int, n: Int, popped: Int, calls: List<Frame>, s: Store) -> Next
     ? "Reads the source after its bounds check, then writes."
     match src + n > memBytes(s)
-        true -> trap("out of bounds memory access")
+        true -> trap("out of bounds memory access", s)
         false -> memWrite(x, f, d, Mem.readList(s.mem, src, n), n, popped, calls, s)
 
 fn memoryInit(x: Inst, f: Frame, dI: Int, calls: List<Frame>, s: Store) -> Next
     ? "memory.init from a data segment."
     match top(f, 3)
         [n, src, d, .._] -> memInitFrom(x, f, dataSeg(s, dI), idx(src), idx(d), idx(n), 3, calls, s)
-        _ -> underflow()
+        _ -> underflow(s)
 
 fn memInitFrom(x: Inst, f: Frame, bytes: Vector<Int>, src: Int, d: Int, n: Int, popped: Int, calls: List<Frame>, s: Store) -> Next
     ? "Reads the segment after its bounds check, then writes."
     match src + n > Vector.len(bytes)
-        true -> trap("out of bounds memory access")
+        true -> trap("out of bounds memory access", s)
         false -> memWrite(x, f, d, Bin.octetsAt(bytes, src, n), n, popped, calls, s)
 
 // ---- tables ----
@@ -2051,32 +2127,32 @@ fn tableGet(x: Inst, f: Frame, t: Int, calls: List<Frame>, s: Store) -> Next
     ? "table.get."
     match top(f, 1)
         [k, .._] -> tablePush(x, f, Vector.get(table(s, t), idx(k)), 1, calls, s)
-        [] -> underflow()
+        [] -> underflow(s)
 
 fn tablePush(x: Inst, f: Frame, v: Option<Val>, popped: Int, calls: List<Frame>, s: Store) -> Next
     ? "Pushes a table entry read in bounds."
     match v
         Option.Some(a) -> go(x, put1(f, popped, a), calls, s)
-        Option.None -> trap("out of bounds table access")
+        Option.None -> trap("out of bounds table access", s)
 
 fn tableSet(x: Inst, f: Frame, t: Int, calls: List<Frame>, s: Store) -> Next
     ? "table.set."
     match top(f, 2)
         [v, k, .._] -> tableWrite(x, f, t, idx(k), [v], 2, calls, s)
-        _ -> underflow()
+        _ -> underflow(s)
 
 fn tableWrite(x: Inst, f: Frame, t: Int, k: Int, vs: List<Val>, popped: Int, calls: List<Frame>, s: Store) -> Next
     ? "Writes vs into table t from k, after the bounds check."
     tb = table(s, t)
     match k + List.len(vs) > Vector.len(tb)
-        true -> trap("out of bounds table access")
+        true -> trap("out of bounds table access", s)
         false -> go(x, putN(f, popped), calls, setTable(s, t, writeVals(tb, k, vs)))
 
 fn tableGrow(x: Inst, f: Frame, t: Int, calls: List<Frame>, s: Store) -> Next
     ? "table.grow: the old size, or -1 past ten million entries."
     match top(f, 2)
         [n, v, .._] -> tableGrowBy(x, f, t, idx(n), v, 2, calls, s)
-        _ -> underflow()
+        _ -> underflow(s)
 
 fn tableGrowBy(x: Inst, f: Frame, t: Int, n: Int, v: Val, popped: Int, calls: List<Frame>, s: Store) -> Next
     ? "Grows table t by n copies of v when it may."
@@ -2088,26 +2164,28 @@ fn tableGrowBy(x: Inst, f: Frame, t: Int, n: Int, v: Val, popped: Int, calls: Li
 fn tableFill(x: Inst, f: Frame, t: Int, calls: List<Frame>, s: Store) -> Next
     ? "table.fill."
     match top(f, 3)
-        [n, v, k, .._] -> tableWrite(x, f, t, idx(k), repeatVal(v, idx(n), []), 3, calls, s)
-        _ -> underflow()
+        [n, v, k, .._] -> match idx(k) + idx(n) > Vector.len(table(s, t))
+            true -> trap("out of bounds table access", s)
+            false -> tableWrite(x, f, t, idx(k), repeatVal(v, idx(n), []), 3, calls, s)
+        _ -> underflow(s)
 
 fn tableCopy(x: Inst, f: Frame, d: Int, sr: Int, calls: List<Frame>, s: Store) -> Next
     ? "table.copy."
     match top(f, 3)
         [n, so, k, .._] -> tableCopyFrom(x, f, d, table(s, sr), idx(so), idx(k), idx(n), 3, calls, s)
-        _ -> underflow()
+        _ -> underflow(s)
 
 fn tableCopyFrom(x: Inst, f: Frame, d: Int, src: Vector<Val>, so: Int, k: Int, n: Int, popped: Int, calls: List<Frame>, s: Store) -> Next
     ? "Copies after the source's bounds check."
     match so + n > Vector.len(src)
-        true -> trap("out of bounds table access")
+        true -> trap("out of bounds table access", s)
         false -> tableWrite(x, f, d, k, slice(src, so, n), popped, calls, s)
 
 fn tableInit(x: Inst, f: Frame, e: Int, t: Int, calls: List<Frame>, s: Store) -> Next
     ? "table.init from an element segment."
     match top(f, 3)
         [n, so, k, .._] -> tableCopyFrom(x, f, t, elemSeg(s, e), idx(so), idx(k), idx(n), 3, calls, s)
-        _ -> underflow()
+        _ -> underflow(s)
 
 // ---- instantiation and invocation ----
 
@@ -2765,18 +2843,88 @@ fn evalConst(x: Inst, code: Vector<Instr>, s: Store) -> Result<VS, String>
     r = run(x, frame(code, Vector.fromList([]), Vector.fromList([]), Vector.len(code) + 1, 1), [], s)
     match r
         Outcome.Done([v], s2) -> Result.Ok(VS(v = v, s = s2))
-        Outcome.Trap(e) -> Result.Err(e)
+        Outcome.Trap(e, _) -> Result.Err(e)
+        Outcome.Thrown(_, _, _) -> Result.Err("uncaught exception")
         _ -> Result.Err("constant expression did not produce one value")
 
 fn instantiate(m: Module, hostGlobals: Map<String, Val>, shapes: Vector<Shape>) -> Result<Ready, String>
     ? "The module ready to run: imported globals taken from hostGlobals (keyed module.name), the rest evaluated, segments placed, the start function not yet run. shapes holds what validation learnt of each body: its highest operand stack and the height before each instruction."
-    x = Inst(m = m, fns = Vector.fromList(buildFns(m, List.fromVector(m.funcs), List.fromVector(shapes), [])))
+    r = prepare(m, hostGlobals, shapes, 0)?
+    s = settle(r.x, r.s)?
+    Result.Ok(Ready(x = r.x, s = s))
+
+fn prepare(m: Module, hostGlobals: Map<String, Val>, shapes: Vector<Shape>, base: Int) -> Result<Ready, String>
+    ? "The first half of instantiation: functions built, globals and tables initialized, segments evaluated but not yet placed. A linker puts imported memories and tables into the store before settle places the segments in them."
+    x = Inst(m = m, fns = Vector.fromList(buildFns(m, List.fromVector(m.funcs), List.fromVector(shapes), [])), base = base, tags = Vector.fromList([]))
     s1 = initGlobals(x, List.fromVector(m.globals), emptyStore(m), hostGlobals)?
     s1b = initTables(x, m.tableInits, 0, s1)?
     s2 = initElems(x, List.fromVector(m.elems), s1b, [])?
-    s3 = placeElems(x, List.fromVector(m.elems), 0, s2)?
-    s4 = placeDatas(x, List.fromVector(m.datas), 0, s3)?
-    Result.Ok(Ready(x = x, s = s4))
+    Result.Ok(Ready(x = x, s = s2))
+
+fn settle(x: Inst, s: Store) -> Result<Store, String>
+    ? "The second half: active element and data segments copied into their tables and memories."
+    r = settlePart(x, s)
+    match r.err == ""
+        true -> Result.Ok(r.s)
+        false -> Result.Err(r.err)
+
+record Settled
+    s: Store
+    err: String
+
+fn settlePart(x: Inst, s: Store) -> Settled
+    ? "settle, keeping what was written before a segment failed: segments are placed in order, so a linker can hand the earlier writes to the memories and tables the module imports. err is empty when every segment fit."
+    r = elemsPart(x, List.fromVector(x.m.elems), 0, s)
+    match r.err == ""
+        false -> r
+        true -> datasPart(x, List.fromVector(x.m.datas), 0, r.s)
+
+fn elemsPart(x: Inst, es: List<Elem>, k: Int, s: Store) -> Settled
+    ? "placeElems, one segment at a time."
+    match es
+        [] -> Settled(s = s, err = "")
+        [e, ..rest] -> match placeElem(x, e, k, s)
+            Result.Ok(s2) -> elemsPart(x, rest, k + 1, s2)
+            Result.Err(msg) -> Settled(s = s, err = msg)
+
+fn datasPart(x: Inst, ds: List<Data>, k: Int, s: Store) -> Settled
+    ? "placeDatas, one segment at a time."
+    match ds
+        [] -> Settled(s = s, err = "")
+        [d, ..rest] -> match placeData(x, d, k, s)
+            Result.Ok(s2) -> datasPart(x, rest, k + 1, s2)
+            Result.Err(msg) -> Settled(s = s, err = msg)
+
+verify settlePart
+    settlePart(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), emptyStore(Ast.emptyModule())).err => ""
+
+verify elemsPart
+    elemsPart(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), [], 0, emptyStore(Ast.emptyModule())).err => ""
+
+verify datasPart
+    datasPart(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), [], 0, emptyStore(Ast.emptyModule())).err => ""
+
+fn memState(s: Store, k: Int) -> MemState
+    ? "Memory k as it stands."
+    w = withMem(s, k)
+    MemState(mem = w.mem, pages = w.pages, maxPages = w.maxPages)
+
+fn putMemState(s: Store, k: Int, ms: MemState) -> Store
+    ? "The store with memory k replaced by ms."
+    w = withMem(s, k)
+    withMem(Store.update(w, mem = ms.mem, pages = ms.pages, maxPages = ms.maxPages), k)
+
+verify prepare
+    Result.withDefault(prepare(Ast.emptyModule(), {}, Vector.fromList([]), 0), Ready(x = Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), s = emptyStore(Ast.emptyModule()))).s.pages => 0
+
+verify settle
+    settle(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), emptyStore(Ast.emptyModule())) => Result.Ok(emptyStore(Ast.emptyModule()))
+
+verify memState
+    memState(emptyStore(Module.update(Ast.emptyModule(), memMin = 2, hasMemory = true)), 0).pages => 2
+
+verify putMemState
+    putMemState(emptyStore(Ast.emptyModule()), 0, MemState(mem = {}, pages = 3, maxPages = 5)).pages => 3
 
 fn initTables(x: Inst, inits: List<Vector<Instr>>, t: Int, s: Store) -> Result<Store, String>
     ? "Fills each table that has an initializer expression with its value."
@@ -2795,10 +2943,10 @@ fn filledTable(t: Int, r: VS) -> Result<Store, String>
     Result.Ok(setTable(r.s, t, Vector.fromList(repeatVal(r.v, Vector.len(table(r.s, t)), []))))
 
 verify initTables
-    initTables(Inst(m = Ast.emptyModule(), fns = Vector.fromList([])), [], 0, emptyStore(Ast.emptyModule())) => Result.Ok(emptyStore(Ast.emptyModule()))
+    initTables(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), [], 0, emptyStore(Ast.emptyModule())) => Result.Ok(emptyStore(Ast.emptyModule()))
 
 verify initTable
-    initTable(Inst(m = Ast.emptyModule(), fns = Vector.fromList([])), Vector.fromList([]), 0, emptyStore(Ast.emptyModule())) => Result.Ok(emptyStore(Ast.emptyModule()))
+    initTable(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), Vector.fromList([]), 0, emptyStore(Ast.emptyModule())) => Result.Ok(emptyStore(Ast.emptyModule()))
 
 fn initGlobals(x: Inst, gs: List<Global>, s: Store, hg: Map<String, Val>) -> Result<Store, String>
     ? "Evaluates each global's initializer in order; each may read the globals before it. An imported one takes the host's value."

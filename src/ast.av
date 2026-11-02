@@ -169,6 +169,9 @@ record Import
     name: String
     kind: Int
     index: Int
+    lo: Int
+    hi: Int
+    hasMax: Bool
 
 record Export
     name: String

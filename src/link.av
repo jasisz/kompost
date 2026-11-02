@@ -1,0 +1,811 @@
+module Link
+    intent =
+        "Several instances linked together, as the spec testsuite's scripts"
+        "make them. Each instance keeps its own store, so the interpreter runs"
+        "one instance at a time exactly as it runs a lone module. A call to a"
+        "function imported from another instance stops the machine like a call"
+        "to the host; the world runs the exporter's function on the exporter's"
+        "store and resumes the caller with the results. An imported memory,"
+        "table or global is one object owned by the instance that defines it:"
+        "the owner's copy is the real one, every instance that imports it takes"
+        "the owner's copy before it runs and gives its copy back when it stops"
+        "or calls out. References to functions and heap objects do not cross"
+        "instances: each has its own function index space and heap."
+    exposes [World, Called, Exn, empty, add, register, call, moduleOf]
+    depends [Ast, Value, Exec, Kompost, Valid]
+    effects []
+
+record Share
+    kind: Int
+    local: Int
+    owner: Int
+    index: Int
+
+record Instance
+    x: Inst
+    s: Store
+    shares: List<Share>
+
+record World
+    insts: Map<Int, Instance>
+    named: Map<String, Int>
+
+record Called
+    w: World
+    r: Result<List<Val>, String>
+    exn: Option<Exn>
+
+record Exn
+    tag: Int
+    vals: List<Val>
+
+fn empty() -> World
+    ? "No instances yet."
+    World(insts = {}, named = {})
+
+verify empty
+    Map.len(empty().insts) => 0
+
+fn register(w: World, name: String, id: Int) -> World
+    ? "Instance id becomes importable under the module name name."
+    World.update(w, named = Map.set(w.named, name, id))
+
+verify register
+    Map.get(register(empty(), "M", 3).named, "M") => Option.Some(3)
+
+fn moduleOf(w: World, id: Int) -> Option<Module>
+    ? "The module of instance id."
+    match Map.get(w.insts, id)
+        Option.Some(i) -> Option.Some(i.x.m)
+        Option.None -> Option.None
+
+verify moduleOf
+    moduleOf(empty(), 0) => Option.None
+    moduleOf(add(empty(), 0, Ast.emptyModule(), Vector.fromList([]), {}).w, 0) => Option.Some(Ast.emptyModule())
+
+// ---- instantiation ----
+
+fn add(w: World, id: Int, m: Module, shapes: Vector<Shape>, hostGlobals: Map<String, Val>) -> Called
+    ? "Instantiates m as instance id: imports checked against what provides them and resolved (functions when called, memories, tables and globals now), segments placed into whatever it imports, then its start function run. A segment that does not fit fails the instantiation, but what earlier segments wrote into imported memories and tables stays."
+    match addInst(w, id, m, shapes, hostGlobals)
+        Result.Ok(w2) -> started(w2, id, m.start)
+        Result.Err(e) -> Called(w = failedWrites(w, id, m, shapes, hostGlobals, e), r = Result.Err(e), exn = Option.None)
+
+fn failedWrites(w: World, id: Int, m: Module, shapes: Vector<Shape>, hostGlobals: Map<String, Val>, e: String) -> World
+    ? "The world after a failed instantiation: when it failed placing segments, the writes before the failure reached the owners of what it imports."
+    match Bool.or(String.startsWith(e, "unknown import"), String.startsWith(e, "incompatible import"))
+        true -> w
+        false -> partialWrites(w, id, m, shapes, hostGlobals)
+
+fn partialWrites(w: World, id: Int, m: Module, shapes: Vector<Shape>, hostGlobals: Map<String, Val>) -> World
+    ? "Runs the instantiation again up to its failing segment and hands the imported objects back."
+    shares = Result.withDefault(sharesOf(w, m.imports, []), [])
+    hg = Result.withDefault(linkedGlobals(w, m.imports, hostGlobals), hostGlobals)
+    match Exec.prepare(m, hg, shapes, id * 4294967296)
+        Result.Err(_) -> w
+        Result.Ok(ready) -> keptFailed(w, id, ready, Exec.settlePart(ready.x, pullAll(w, shares, ready.s)).s, shares)
+
+fn keptFailed(w: World, id: Int, ready: Ready, s: Store, shares: List<Share>) -> World
+    ? "The writes handed back, and the instance kept, unnamed: functions it wrote into an imported table can still be called."
+    pushShares(putInst(w, id, Instance(x = ready.x, s = s, shares = shares)), s, shares)
+
+verify keptFailed
+    Map.len(keptFailed(empty(), 0, Ready(x = Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), s = blankStore()), blankStore(), []).insts) => 1
+
+verify failedWrites
+    Map.len(failedWrites(empty(), 0, Ast.emptyModule(), Vector.fromList([]), {}, "unknown import a.b").insts) => 0
+
+verify partialWrites
+    Map.len(partialWrites(empty(), 0, Ast.emptyModule(), Vector.fromList([]), {}).insts) => 1
+
+fn addInst(w: World, id: Int, m: Module, shapes: Vector<Shape>, hostGlobals: Map<String, Val>) -> Result<World, String>
+    ? "The world with instance id in it, before its start function."
+    ok = importsOk(w, m, m.imports)?
+    shares = sharesOf(w, m.imports, [])?
+    hg = linkedGlobals(w, m.imports, hostGlobals)?
+    ready = Exec.prepare(m, hg, shapes, id * 4294967296)?
+    x = Inst.update(ready.x, tags = Vector.fromList(tagIds(w, m, id * 4294967296, 0, [])))
+    r = Exec.settlePart(x, pullAll(w, shares, ready.s))
+    w2 = pushShares(w, r.s, shares)
+    match r.err == ""
+        true -> Result.Ok(putInst(w2, id, Instance(x = x, s = r.s, shares = shares)))
+        false -> Result.Err(r.err)
+
+fn tagIds(w: World, m: Module, base: Int, j: Int, acc: List<Int>) -> List<Int>
+    ? "The identity of each of m's tags: an imported one's is its exporter's, a defined one's is base plus its index."
+    match j >= List.len(m.tags)
+        true -> List.reverse(acc)
+        false -> tagIds(w, m, base, j + 1, List.prepend(tagIdOf(w, importOfTag(m.imports, j), base + j), acc))
+
+fn importOfTag(is: List<Import>, j: Int) -> Option<Import>
+    ? "The import that brings tag j in, if it is imported."
+    match is
+        [] -> Option.None
+        [i, ..rest] -> match Bool.and(i.kind == 4, i.index == j)
+            true -> Option.Some(i)
+            false -> importOfTag(rest, j)
+
+fn tagIdOf(w: World, imp: Option<Import>, own: Int) -> Int
+    ? "An imported tag's identity at its exporter, or own."
+    match imp
+        Option.None -> own
+        Option.Some(i) -> match Map.get(w.named, i.mod)
+            Option.None -> own
+            Option.Some(e) -> match Map.get(w.insts, e)
+                Option.None -> own
+                Option.Some(ins) -> match exportOf(ins.x.m, i.name, 4)
+                    Option.None -> own
+                    Option.Some(k) -> Exec.tagId(ins.x, k)
+
+verify tagIds
+    tagIds(empty(), Module.update(Ast.emptyModule(), tags = [0, 0]), 10, 0, []) => [10, 11]
+
+verify importOfTag
+    importOfTag([], 0) => Option.None
+
+verify tagIdOf
+    tagIdOf(empty(), Option.None, 5) => 5
+
+fn started(w: World, id: Int, start: Int) -> Called
+    ? "Runs the start function when there is one."
+    match start < 0
+        true -> Called(w = w, r = Result.Ok([]), exn = Option.None)
+        false -> call(w, id, start, [])
+
+fn putInst(w: World, id: Int, i: Instance) -> World
+    ? "The world with instance id set to i."
+    World.update(w, insts = Map.set(w.insts, id, i))
+
+verify add
+    add(empty(), 0, Ast.emptyModule(), Vector.fromList([]), {}).r => Result.Ok([])
+
+verify addInst
+    Map.len(Result.withDefault(addInst(empty(), 0, Ast.emptyModule(), Vector.fromList([]), {}), empty()).insts) => 1
+
+verify started
+    started(empty(), 0, -1).r => Result.Ok([])
+
+verify putInst
+    Map.len(putInst(empty(), 1, Instance(x = Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), s = blankStore(), shares = [])).insts) => 1
+
+// ---- imports ----
+
+fn importsOk(w: World, m: Module, is: List<Import>) -> Result<Unit, String>
+    ? "Every import names something its provider exports, of the same kind and a matching type: spectest's own objects, or a registered instance's exports."
+    match is
+        [] -> Result.Ok(Unit)
+        [i, ..rest] -> importsNext(w, m, importOk(w, m, i), rest)
+
+fn importsNext(w: World, m: Module, r: Result<Unit, String>, rest: List<Import>) -> Result<Unit, String>
+    ? "Goes on after one import."
+    ok = r?
+    importsOk(w, m, rest)
+
+fn importOk(w: World, m: Module, i: Import) -> Result<Unit, String>
+    ? "One import checked against its provider."
+    match i.mod == "spectest"
+        true -> spectestOk(m, i)
+        false -> match Map.get(w.named, i.mod)
+            Option.None -> Result.Err("unknown import {i.mod}.{i.name}")
+            Option.Some(e) -> fromInstance(w, m, i, Map.get(w.insts, e))
+
+fn fromInstance(w: World, m: Module, i: Import, inst: Option<Instance>) -> Result<Unit, String>
+    ? "An import from a registered instance: the export must exist and be of the import's kind and type."
+    match inst
+        Option.None -> Result.Err("unknown import {i.mod}.{i.name}")
+        Option.Some(ins) -> match anyExport(ins.x.m.exports, i.name)
+            Option.None -> Result.Err("unknown import {i.mod}.{i.name}")
+            Option.Some(ex) -> match ex.kind == i.kind
+                false -> Result.Err("incompatible import type")
+                true -> compatible(kindMatches(m, i, ins, ex.index))
+
+fn compatible(ok: Bool) -> Result<Unit, String>
+    ? "The import's type check."
+    match ok
+        true -> Result.Ok(Unit)
+        false -> Result.Err("incompatible import type")
+
+fn anyExport(es: List<Export>, name: String) -> Option<Export>
+    ? "The export named name, of any kind."
+    match es
+        [] -> Option.None
+        [e, ..rest] -> match e.name == name
+            true -> Option.Some(e)
+            false -> anyExport(rest, name)
+
+fn kindMatches(m: Module, i: Import, ins: Instance, k: Int) -> Bool
+    ? "Whether export k of the instance fits the import: equal function and tag types, a table or memory at least as large and growing no further than the import allows, a global of the same type and mutability."
+    em = ins.x.m
+    match i.kind
+        0 -> subX(em, funcTypeOf(em, k), m, funcTypeOf(m, i.index), 8)
+        1 -> Bool.and(Bool.and(valEq(m, tableType(m, i.index), em, tableType(em, k), 8), Ast.tableIs64(m, i.index) == Ast.tableIs64(em, k)), limitsFit(i, Vector.len(Exec.table(ins.s, k)), Ast.tableMax(em, k), tableHasMax(em, k)))
+        2 -> Bool.and(Ast.memIs64(m, i.index) == Ast.memIs64(em, k), limitsFit(i, Exec.memState(ins.s, k).pages, memMaxOf(em, k), memHasMax(em, k)))
+        3 -> globalsMatch(m, globalOf(m, i.index), em, globalOf(em, k))
+        _ -> compEq(m, Ast.tagType(m, i.index), em, Ast.tagType(em, k), 8)
+
+fn limitsFit(i: Import, size: Int, max: Int, hasMax: Bool) -> Bool
+    ? "A provided table or memory of this size and maximum fits the import's declared limits."
+    Bool.and(i.lo <= size, Bool.or(Bool.not(i.hasMax), Bool.and(hasMax, max <= i.hi)))
+
+fn funcTypeOf(m: Module, f: Int) -> Int
+    ? "The type index of function f."
+    match Vector.get(m.funcs, f)
+        Option.Some(Func.Imported(_, _, t)) -> t
+        Option.Some(Func.Local(t, _, _)) -> t
+        Option.None -> -1
+
+fn tableType(m: Module, t: Int) -> ValType
+    ? "The element type of table t."
+    match List.drop(m.tables, t)
+        [v, .._] -> v
+        [] -> ValType.I32
+
+fn tableHasMax(m: Module, t: Int) -> Bool
+    ? "Whether table t declares a maximum."
+    Ast.tableMax(m, t) < 4294967296
+
+fn memMaxOf(m: Module, k: Int) -> Int
+    ? "The maximum of memory k in pages."
+    match k == 0
+        true -> m.memMax
+        false -> match List.drop(m.moreMems, k - 1)
+            [t, .._] -> t.max
+            [] -> 0
+
+fn memHasMax(m: Module, k: Int) -> Bool
+    ? "Whether memory k declares a maximum; one at the largest size there is counts as none."
+    match Ast.memIs64(m, k)
+        true -> memMaxOf(m, k) < 281474976710656
+        false -> memMaxOf(m, k) < 65536
+
+fn globalOf(m: Module, g: Int) -> Global
+    ? "Global g."
+    Option.withDefault(Vector.get(m.globals, g), Global(ty = ValType.I32, init = Vector.fromList([]), from = "", mut = false))
+
+fn globalsMatch(m: Module, a: Global, em: Module, b: Global) -> Bool
+    ? "Same mutability; a mutable global of the same type, an immutable one of a subtype of the import's."
+    match a.mut == b.mut
+        false -> false
+        true -> match a.mut
+            true -> valEq(m, a.ty, em, b.ty, 8)
+            false -> valSubX(em, b.ty, m, a.ty)
+
+fn valSubX(ma: Module, a: ValType, mb: Module, b: ValType) -> Bool
+    ? "Whether type a of module ma is a subtype of type b of module mb: concrete types across modules count as equal when their structure is; abstract ones follow the hierarchy."
+    match a
+        ValType.Ref(na, ha) -> match b
+            ValType.Ref(nb, hb) -> Bool.and(Bool.or(nb, Bool.not(na)), heapSubX(ma, ha, mb, hb))
+            _ -> false
+        _ -> a == b
+
+fn heapSubX(ma: Module, a: Int, mb: Module, b: Int) -> Bool
+    ? "Heap subtyping across two modules."
+    match Bool.and(a >= 0, b >= 0)
+        true -> compEq(ma, a, mb, b, 8)
+        false -> match b < 0
+            true -> Valid.heapSub(ma, a, b)
+            false -> Valid.heapSub(mb, a, b)
+
+verify valSubX
+    valSubX(Ast.emptyModule(), ValType.Ref(false, -16), Ast.emptyModule(), ValType.Ref(true, -16)) => true
+    valSubX(Ast.emptyModule(), ValType.Ref(true, -16), Ast.emptyModule(), ValType.Ref(false, -16)) => false
+
+verify heapSubX
+    heapSubX(Ast.emptyModule(), -13, Ast.emptyModule(), -16) => true
+
+fn valEq(ma: Module, a: ValType, mb: Module, b: ValType, fuel: Int) -> Bool
+    ? "valEq outside any rec group."
+    valIn(ma, [], a, mb, [], b, fuel)
+
+fn valIn(ma: Module, ga: List<Int>, a: ValType, mb: Module, gb: List<Int>, b: ValType, fuel: Int) -> Bool
+    ? "Whether two value types from two modules are the same, comparing concrete types by their structure (fuel bounds recursive types)."
+    match a
+        ValType.Ref(na, ha) -> match b
+            ValType.Ref(nb, hb) -> Bool.and(na == nb, heapIn(ma, ga, ha, mb, gb, hb, fuel))
+            _ -> false
+        _ -> a == b
+
+fn heapEq(ma: Module, a: Int, mb: Module, b: Int, fuel: Int) -> Bool
+    ? "Abstract heap types by code, concrete ones by structure."
+    heapIn(ma, [], a, mb, [], b, fuel)
+
+fn heapIn(ma: Module, ga: List<Int>, a: Int, mb: Module, gb: List<Int>, b: Int, fuel: Int) -> Bool
+    ? "Heap types inside rec groups ga and gb being compared: a reference into its own group must be one into the other at the same place; one outside is compared as a type of its own."
+    match Bool.and(a >= 0, b >= 0)
+        false -> a == b
+        true -> match Bool.or(List.contains(ga, a), List.contains(gb, b))
+            true -> placeIn(ga, a, 0) == placeIn(gb, b, 0)
+            false -> compEq(ma, a, mb, b, fuel)
+
+fn compEq(ma: Module, a: Int, mb: Module, b: Int, fuel: Int) -> Bool
+    ? "Two concrete types are the same when they sit at the same place in rec groups of the same size whose members have equal structure (types are iso-recursive); fuel bounds the recursion."
+    match fuel <= 0
+        true -> true
+        false -> groupsEq(ma, groupOf(ma, a), a, mb, groupOf(mb, b), b, fuel - 1)
+
+fn groupOf(m: Module, t: Int) -> List<Int>
+    ? "The indices of the types in t's rec group, in order."
+    match Vector.get(m.types, t)
+        Option.None -> [t]
+        Option.Some(st) -> sameGroup(m, st.group, 0, [])
+
+fn sameGroup(m: Module, g: Int, k: Int, acc: List<Int>) -> List<Int>
+    ? "Every type index from k on whose group is g."
+    match Vector.get(m.types, k)
+        Option.None -> List.reverse(acc)
+        Option.Some(st) -> match st.group == g
+            true -> sameGroup(m, g, k + 1, List.prepend(k, acc))
+            false -> sameGroup(m, g, k + 1, acc)
+
+fn groupsEq(ma: Module, ga: List<Int>, a: Int, mb: Module, gb: List<Int>, b: Int, fuel: Int) -> Bool
+    ? "Groups of the same size, a and b at the same place, members equal one by one."
+    Bool.and(Bool.and(List.len(ga) == List.len(gb), placeIn(ga, a, 0) == placeIn(gb, b, 0)), membersEq(ma, ga, ga, mb, gb, gb, fuel))
+
+fn placeIn(g: List<Int>, t: Int, k: Int) -> Int
+    ? "Where t sits in its group."
+    match g
+        [] -> -1
+        [x, ..rest] -> match x == t
+            true -> k
+            false -> placeIn(rest, t, k + 1)
+
+fn membersEq(ma: Module, ga: List<Int>, rest: List<Int>, mb: Module, gb: List<Int>, restB: List<Int>, fuel: Int) -> Bool
+    ? "The members of two groups (ga and gb whole, rest and restB still to compare), pairwise: same finality, supertypes and structure."
+    match rest
+        [] -> true
+        [x, ..xs] -> match restB
+            [] -> false
+            [y, ..ys] -> Bool.and(memberEq(ma, ga, x, mb, gb, y, fuel), membersEq(ma, ga, xs, mb, gb, ys, fuel))
+
+fn memberEq(ma: Module, ga: List<Int>, x: Int, mb: Module, gb: List<Int>, y: Int, fuel: Int) -> Bool
+    ? "One pair of group members."
+    match Vector.get(ma.types, x)
+        Option.None -> false
+        Option.Some(sa) -> match Vector.get(mb.types, y)
+            Option.None -> false
+            Option.Some(sb) -> Bool.and(Bool.and(sa.final == sb.final, supersEq(ma, ga, sa.supers, mb, gb, sb.supers, fuel)), compsEq(ma, ga, sa.comp, mb, gb, sb.comp, fuel))
+
+fn supersEq(ma: Module, ga: List<Int>, a: List<Int>, mb: Module, gb: List<Int>, b: List<Int>, fuel: Int) -> Bool
+    ? "Declared supertypes: none on both sides, or the same type on both."
+    match a
+        [] -> List.len(b) == 0
+        [x, .._] -> match b
+            [] -> false
+            [y, .._] -> heapIn(ma, ga, x, mb, gb, y, fuel)
+
+fn subX(ma: Module, a: Int, mb: Module, b: Int, fuel: Int) -> Bool
+    ? "Whether concrete type a of ma is b of mb or reaches it through its declared supertypes."
+    match compEq(ma, a, mb, b, fuel)
+        true -> true
+        false -> match Bool.and(fuel > 0, superOf(ma, a) >= 0)
+            true -> subX(ma, superOf(ma, a), mb, b, fuel - 1)
+            false -> false
+
+fn superOf(m: Module, t: Int) -> Int
+    ? "The declared supertype of t, or -1."
+    match Vector.get(m.types, t)
+        Option.Some(st) -> match st.supers
+            [x, .._] -> x
+            [] -> -1
+        Option.None -> -1
+
+verify supersEq
+    supersEq(Ast.emptyModule(), [], [], Ast.emptyModule(), [], [0], 4) => false
+
+verify subX
+    subX(Ast.emptyModule(), 0, Ast.emptyModule(), 0, 0) => true
+
+verify superOf
+    superOf(Ast.emptyModule(), 0) => -1
+
+verify groupOf
+    groupOf(Ast.emptyModule(), 3) => [3]
+
+verify sameGroup
+    sameGroup(Ast.emptyModule(), 0, 0, []) => []
+
+verify groupsEq
+    groupsEq(Ast.emptyModule(), [0, 1], 0, Ast.emptyModule(), [0], 0, 4) => false
+
+verify placeIn
+    placeIn([4, 5], 5, 0) => 1
+
+verify membersEq
+    membersEq(Ast.emptyModule(), [], [], Ast.emptyModule(), [1], [1], 4) => true
+
+verify memberEq
+    memberEq(Ast.emptyModule(), [], 0, Ast.emptyModule(), [], 0, 4) => false
+
+fn compsEq(ma: Module, ga: List<Int>, a: Comp, mb: Module, gb: List<Int>, b: Comp, fuel: Int) -> Bool
+    ? "Composite types of the same shape with equal parts."
+    match a
+        Comp.FuncT(pa, ra) -> match b
+            Comp.FuncT(pb, rb) -> Bool.and(valsEq(ma, ga, pa, mb, gb, pb, fuel), valsEq(ma, ga, ra, mb, gb, rb, fuel))
+            _ -> false
+        Comp.StructT(fa) -> match b
+            Comp.StructT(fb) -> valsEq(ma, ga, List.fromVector(fa), mb, gb, List.fromVector(fb), fuel)
+            _ -> false
+        Comp.ArrayT(ea) -> match b
+            Comp.ArrayT(eb) -> valIn(ma, ga, ea, mb, gb, eb, fuel)
+            _ -> false
+
+fn valsEq(ma: Module, ga: List<Int>, a: List<ValType>, mb: Module, gb: List<Int>, b: List<ValType>, fuel: Int) -> Bool
+    ? "Two lists of value types, pairwise."
+    match a
+        [] -> List.len(b) == 0
+        [x, ..xs] -> match b
+            [] -> false
+            [y, ..ys] -> Bool.and(valIn(ma, ga, x, mb, gb, y, fuel), valsEq(ma, ga, xs, mb, gb, ys, fuel))
+
+fn spectestOk(m: Module, i: Import) -> Result<Unit, String>
+    ? "An import from spectest: its print functions, four immutable globals, a table of 10 to 20 function references and a memory of 1 to 2 pages."
+    match spectestFits(m, i)
+        Option.None -> Result.Err("unknown import {i.mod}.{i.name}")
+        Option.Some(ok) -> compatible(ok)
+
+fn spectestFits(m: Module, i: Import) -> Option<Bool>
+    ? "None when spectest has nothing of that name and kind... or of that name at all; else whether it fits."
+    match i.name
+        "print" -> kindIs(i, 0, sigIs(m, i, []))
+        "print_i32" -> kindIs(i, 0, sigIs(m, i, [ValType.I32]))
+        "print_i64" -> kindIs(i, 0, sigIs(m, i, [ValType.I64]))
+        "print_f32" -> kindIs(i, 0, sigIs(m, i, [ValType.F32]))
+        "print_f64" -> kindIs(i, 0, sigIs(m, i, [ValType.F64]))
+        "print_i32_f32" -> kindIs(i, 0, sigIs(m, i, [ValType.I32, ValType.F32]))
+        "print_f64_f64" -> kindIs(i, 0, sigIs(m, i, [ValType.F64, ValType.F64]))
+        "global_i32" -> kindIs(i, 3, globalIs(m, i, ValType.I32))
+        "global_i64" -> kindIs(i, 3, globalIs(m, i, ValType.I64))
+        "global_f32" -> kindIs(i, 3, globalIs(m, i, ValType.F32))
+        "global_f64" -> kindIs(i, 3, globalIs(m, i, ValType.F64))
+        "table" -> kindIs(i, 1, Bool.and(Bool.and(tableType(m, i.index) == ValType.Ref(true, -16), Bool.not(Ast.tableIs64(m, i.index))), limitsFit(i, 10, 20, true)))
+        "table64" -> kindIs(i, 1, Bool.and(Bool.and(tableType(m, i.index) == ValType.Ref(true, -16), Ast.tableIs64(m, i.index)), limitsFit(i, 10, 20, true)))
+        "memory" -> kindIs(i, 2, Bool.and(Bool.not(Ast.memIs64(m, i.index)), limitsFit(i, 1, 2, true)))
+        _ -> Option.None
+
+fn kindIs(i: Import, kind: Int, ok: Bool) -> Option<Bool>
+    ? "ok when the import is of the provided kind; a kind mismatch is incompatible."
+    Option.Some(Bool.and(i.kind == kind, ok))
+
+fn sigIs(m: Module, i: Import, params: List<ValType>) -> Bool
+    ? "Whether imported function i takes params and returns nothing."
+    match Ast.funcType(m, funcTypeOf(m, i.index))
+        Comp.FuncT(ps, rs) -> Bool.and(ps == params, List.len(rs) == 0)
+        _ -> false
+
+fn globalIs(m: Module, i: Import, t: ValType) -> Bool
+    ? "Whether imported global i is an immutable global of type t."
+    g = globalOf(m, i.index)
+    Bool.and(Bool.not(g.mut), g.ty == t)
+
+verify importsOk
+    importsOk(empty(), Ast.emptyModule(), []) => Result.Ok(Unit)
+
+verify importsNext
+    importsNext(empty(), Ast.emptyModule(), Result.Err("x"), []) => Result.Err("x")
+
+verify importOk
+    importOk(empty(), Ast.emptyModule(), Import(mod = "M", name = "f", kind = 0, index = 0, lo = 0, hi = 0, hasMax = false)) => Result.Err("unknown import M.f")
+    importOk(empty(), Ast.emptyModule(), Import(mod = "spectest", name = "nothing", kind = 0, index = 0, lo = 0, hi = 0, hasMax = false)) => Result.Err("unknown import spectest.nothing")
+
+verify fromInstance
+    fromInstance(empty(), Ast.emptyModule(), Import(mod = "M", name = "f", kind = 0, index = 0, lo = 0, hi = 0, hasMax = false), Option.None) => Result.Err("unknown import M.f")
+
+verify compatible
+    compatible(false) => Result.Err("incompatible import type")
+
+verify anyExport
+    anyExport([Export(name = "a", kind = 2, index = 0)], "a") => Option.Some(Export(name = "a", kind = 2, index = 0))
+
+verify kindMatches
+    kindMatches(Ast.emptyModule(), Import(mod = "M", name = "t", kind = 4, index = 0, lo = 0, hi = 0, hasMax = false), Instance(x = Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), s = blankStore(), shares = []), 0) => false
+
+verify limitsFit
+    limitsFit(Import(mod = "M", name = "m", kind = 2, index = 0, lo = 2, hi = 0, hasMax = false), 1, 2, true) => false
+    limitsFit(Import(mod = "M", name = "m", kind = 2, index = 0, lo = 1, hi = 3, hasMax = true), 1, 2, true) => true
+
+verify funcTypeOf
+    funcTypeOf(Ast.emptyModule(), 0) => -1
+
+verify tableType
+    tableType(Ast.emptyModule(), 0) => ValType.I32
+
+verify tableHasMax
+    tableHasMax(Ast.emptyModule(), 0) => false
+
+verify memMaxOf
+    memMaxOf(Ast.emptyModule(), 0) => 65536
+
+verify memHasMax
+    memHasMax(Ast.emptyModule(), 0) => false
+
+verify globalOf
+    globalOf(Ast.emptyModule(), 0).mut => false
+
+verify globalsMatch
+    globalsMatch(Ast.emptyModule(), Global(ty = ValType.I32, init = Vector.fromList([]), from = "", mut = true), Ast.emptyModule(), Global(ty = ValType.I32, init = Vector.fromList([]), from = "", mut = false)) => false
+
+verify valEq
+    valEq(Ast.emptyModule(), ValType.Ref(true, -16), Ast.emptyModule(), ValType.Ref(false, -16), 8) => false
+    valEq(Ast.emptyModule(), ValType.I32, Ast.emptyModule(), ValType.I32, 8) => true
+
+verify valIn
+    valIn(Ast.emptyModule(), [0], ValType.Ref(false, 0), Ast.emptyModule(), [], ValType.Ref(false, 0), 4) => false
+
+verify heapIn
+    heapIn(Ast.emptyModule(), [3], 3, Ast.emptyModule(), [5, 3], 3, 4) => false
+
+verify heapEq
+    heapEq(Ast.emptyModule(), -16, Ast.emptyModule(), -17, 8) => false
+
+verify compEq
+    compEq(Ast.emptyModule(), 0, Ast.emptyModule(), 0, 0) => true
+
+verify compsEq
+    compsEq(Ast.emptyModule(), [], Comp.FuncT([], []), Ast.emptyModule(), [], Comp.ArrayT(ValType.I32), 4) => false
+
+verify valsEq
+    valsEq(Ast.emptyModule(), [], [ValType.I32], Ast.emptyModule(), [], [], 4) => false
+
+verify spectestOk
+    spectestOk(Ast.emptyModule(), Import(mod = "spectest", name = "memory", kind = 2, index = 0, lo = 2, hi = 0, hasMax = false)) => Result.Err("incompatible import type")
+
+verify spectestFits
+    spectestFits(Ast.emptyModule(), Import(mod = "spectest", name = "memory", kind = 2, index = 0, lo = 1, hi = 2, hasMax = true)) => Option.Some(true)
+
+verify kindIs
+    kindIs(Import(mod = "spectest", name = "memory", kind = 1, index = 0, lo = 0, hi = 0, hasMax = false), 2, true) => Option.Some(false)
+
+verify sigIs
+    sigIs(Ast.emptyModule(), Import(mod = "spectest", name = "print", kind = 0, index = 0, lo = 0, hi = 0, hasMax = false), []) => true
+
+verify globalIs
+    globalIs(Ast.emptyModule(), Import(mod = "spectest", name = "global_i32", kind = 3, index = 0, lo = 0, hi = 0, hasMax = false), ValType.I32) => true
+
+fn exportOf(m: Module, name: String, kind: Int) -> Option<Int>
+    ? "The index of the export of this kind named name."
+    findExport(m.exports, name, kind)
+
+fn findExport(es: List<Export>, name: String, kind: Int) -> Option<Int>
+    ? "Searches the exports."
+    match es
+        [] -> Option.None
+        [e, ..rest] -> match Bool.and(e.name == name, e.kind == kind)
+            true -> Option.Some(e.index)
+            false -> findExport(rest, name, kind)
+
+verify exportOf
+    exportOf(Module.update(Ast.emptyModule(), exports = [Export(name = "m", kind = 2, index = 0)]), "m", 2) => Option.Some(0)
+    exportOf(Ast.emptyModule(), "m", 2) => Option.None
+
+verify findExport
+    findExport([Export(name = "m", kind = 0, index = 1)], "m", 2) => Option.None
+
+fn sharesOf(w: World, is: List<Import>, acc: List<Share>) -> Result<List<Share>, String>
+    ? "The memories, tables and globals the imports take from registered instances, each traced to the instance that defines it."
+    match is
+        [] -> Result.Ok(List.reverse(acc))
+        [i, ..rest] -> sharesOf(w, rest, shareOf(w, i, acc)?)
+
+fn shareOf(w: World, i: Import, acc: List<Share>) -> Result<List<Share>, String>
+    ? "acc with the share an import makes, when it makes one: functions are resolved when called, spectest's objects are Kompost's own."
+    match Bool.or(Bool.or(i.kind == 0, i.kind == 4), Bool.not(Map.has(w.named, i.mod)))
+        true -> Result.Ok(acc)
+        false -> shareFrom(w, i, Option.withDefault(Map.get(w.named, i.mod), 0), acc)
+
+fn shareFrom(w: World, i: Import, e: Int, acc: List<Share>) -> Result<List<Share>, String>
+    ? "The share of an import from instance e."
+    match Map.get(w.insts, e)
+        Option.None -> Result.Err("unknown import {i.mod}.{i.name}")
+        Option.Some(inst) -> match exportOf(inst.x.m, i.name, i.kind)
+            Option.None -> Result.Err("unknown import {i.mod}.{i.name}")
+            Option.Some(k) -> Result.Ok(List.prepend(rootShare(inst, i.kind, i.index, e, k), acc))
+
+fn rootShare(inst: Instance, kind: Int, local: Int, e: Int, k: Int) -> Share
+    ? "A share of object k of instance e, or of the instance e itself imports it from."
+    match findShare(inst.shares, kind, k)
+        Option.Some(sh) -> Share(kind = kind, local = local, owner = sh.owner, index = sh.index)
+        Option.None -> Share(kind = kind, local = local, owner = e, index = k)
+
+fn findShare(shs: List<Share>, kind: Int, local: Int) -> Option<Share>
+    ? "The share that brings object local of this kind into an instance."
+    match shs
+        [] -> Option.None
+        [sh, ..rest] -> match Bool.and(sh.kind == kind, sh.local == local)
+            true -> Option.Some(sh)
+            false -> findShare(rest, kind, local)
+
+verify sharesOf
+    sharesOf(empty(), [Import(mod = "spectest", name = "memory", kind = 2, index = 0, lo = 0, hi = 0, hasMax = false)], []) => Result.Ok([])
+
+verify shareOf
+    shareOf(register(empty(), "M", 0), Import(mod = "M", name = "mem", kind = 2, index = 0, lo = 0, hi = 0, hasMax = false), []) => Result.Err("unknown import M.mem")
+
+verify shareFrom
+    shareFrom(empty(), Import(mod = "M", name = "t", kind = 1, index = 0, lo = 0, hi = 0, hasMax = false), 4, []) => Result.Err("unknown import M.t")
+
+verify rootShare
+    rootShare(Instance(x = Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), s = Store.update(emptyStoreOf(), pages = 0), shares = [Share(kind = 2, local = 0, owner = 7, index = 3)]), 2, 1, 5, 0) => Share(kind = 2, local = 1, owner = 7, index = 3)
+
+verify findShare
+    findShare([Share(kind = 1, local = 0, owner = 2, index = 0)], 2, 0) => Option.None
+
+fn emptyStoreOf() -> Store
+    ? "The store of an empty module, for examples."
+    Result.withDefault(Exec.prepare(Ast.emptyModule(), {}, Vector.fromList([]), 0), Ready(x = Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), s = blankStore())).s
+
+fn blankStore() -> Store
+    ? "A store with nothing in it."
+    Store(globals = Vector.fromList([]), heap = Kompost.empty(), mem = {}, pages = 0, maxPages = 0, others = {}, tables = Vector.fromList([]), elems = Vector.fromList([]), datas = Vector.fromList([]), gcAt = 0, pinned = [], steps = 0)
+
+verify emptyStoreOf
+    emptyStoreOf().pages => 0
+
+verify blankStore
+    blankStore().steps => 0
+
+fn linkedGlobals(w: World, is: List<Import>, acc: Map<String, Val>) -> Result<Map<String, Val>, String>
+    ? "The host's globals with every global imported from a registered instance added, at its owner's current value."
+    match is
+        [] -> Result.Ok(acc)
+        [i, ..rest] -> linkedGlobals(w, rest, linkedGlobal(w, i, acc)?)
+
+fn linkedGlobal(w: World, i: Import, acc: Map<String, Val>) -> Result<Map<String, Val>, String>
+    ? "acc with one imported global's value, when it comes from a registered instance."
+    match Bool.and(i.kind == 3, Map.has(w.named, i.mod))
+        false -> Result.Ok(acc)
+        true -> globalFrom(w, i, Option.withDefault(Map.get(w.named, i.mod), 0), acc)
+
+fn globalFrom(w: World, i: Import, e: Int, acc: Map<String, Val>) -> Result<Map<String, Val>, String>
+    ? "The value of the global instance e exports under the import's name."
+    match Map.get(w.insts, e)
+        Option.None -> Result.Err("unknown import {i.mod}.{i.name}")
+        Option.Some(inst) -> match exportOf(inst.x.m, i.name, 3)
+            Option.None -> Result.Err("unknown import {i.mod}.{i.name}")
+            Option.Some(k) -> Result.Ok(Map.set(acc, "{i.mod}.{i.name}", Option.withDefault(Vector.get(inst.s.globals, k), Val.Null)))
+
+verify linkedGlobals
+    linkedGlobals(empty(), [], {}) => Result.Ok({})
+
+verify linkedGlobal
+    linkedGlobal(empty(), Import(mod = "M", name = "g", kind = 3, index = 0, lo = 0, hi = 0, hasMax = false), {}) => Result.Ok({})
+
+verify globalFrom
+    globalFrom(empty(), Import(mod = "M", name = "g", kind = 3, index = 0, lo = 0, hi = 0, hasMax = false), 0, {}) => Result.Err("unknown import M.g")
+
+// ---- shared objects ----
+
+fn pullAll(w: World, shs: List<Share>, s: Store) -> Store
+    ? "s with every shared object replaced by its owner's copy."
+    match shs
+        [] -> s
+        [sh, ..rest] -> pullAll(w, rest, pullOne(w, sh, s))
+
+fn pullOne(w: World, sh: Share, s: Store) -> Store
+    ? "One shared object taken from its owner."
+    match Map.get(w.insts, sh.owner)
+        Option.None -> s
+        Option.Some(o) -> moved(o.s, sh.index, s, sh.local, sh.kind)
+
+fn pushAll(w: World, id: Int) -> World
+    ? "Instance id's copies of the objects it imports given back to their owners."
+    match Map.get(w.insts, id)
+        Option.None -> w
+        Option.Some(inst) -> pushShares(w, inst.s, inst.shares)
+
+fn pushShares(w: World, s: Store, shs: List<Share>) -> World
+    ? "Each share's object from s written into its owner."
+    match shs
+        [] -> w
+        [sh, ..rest] -> pushShares(pushOne(w, s, sh), s, rest)
+
+fn pushOne(w: World, s: Store, sh: Share) -> World
+    ? "One object written back into its owner's store."
+    match Map.get(w.insts, sh.owner)
+        Option.None -> w
+        Option.Some(o) -> putInst(w, sh.owner, Instance.update(o, s = moved(s, sh.local, o.s, sh.index, sh.kind)))
+
+fn moved(from: Store, k: Int, to: Store, j: Int, kind: Int) -> Store
+    ? "to with its object j of this kind (1 table, 2 memory, 3 global) replaced by from's object k."
+    match kind
+        1 -> Exec.setTable(to, j, Exec.table(from, k))
+        2 -> Exec.putMemState(to, j, Exec.memState(from, k))
+        _ -> Store.update(to, globals = Option.withDefault(Vector.set(to.globals, j, Option.withDefault(Vector.get(from.globals, k), Val.Null)), to.globals))
+
+verify pullAll
+    pullAll(empty(), [], blankStore()) => blankStore()
+
+verify pullOne
+    pullOne(empty(), Share(kind = 2, local = 0, owner = 3, index = 0), blankStore()) => blankStore()
+
+verify pushAll
+    Map.len(pushAll(empty(), 0).insts) => 0
+
+verify pushShares
+    Map.len(pushShares(empty(), blankStore(), []).insts) => 0
+
+verify pushOne
+    Map.len(pushOne(empty(), blankStore(), Share(kind = 1, local = 0, owner = 1, index = 0)).insts) => 0
+
+verify moved
+    moved(Store.update(blankStore(), globals = Vector.fromList([Val.I32(7)])), 0, Store.update(blankStore(), globals = Vector.fromList([Val.I32(1)])), 0, 3).globals => Vector.fromList([Val.I32(7)])
+    moved(Store.update(blankStore(), pages = 3), 0, blankStore(), 0, 2).pages => 3
+
+// ---- running ----
+
+fn call(w: World, id: Int, fi: Int, args: List<Val>) -> Called
+    ? "Calls function fi of instance id with its shared objects taken from their owners; when it ends they go back."
+    match Map.get(w.insts, id)
+        Option.None -> Called(w = w, r = Result.Err("no instance {id}"), exn = Option.None)
+        Option.Some(inst) -> runOut(w, id, inst, Exec.invoke(inst.x, pullAll(w, inst.shares, inst.s), fi, args))
+
+fn runOut(w: World, id: Int, inst: Instance, out: Outcome) -> Called
+    ? "Follows the machine: done keeps the new store, a trap keeps the old one, a call to an import is answered."
+    match out
+        Outcome.Done(vs, s) -> Called(w = pushAll(putInst(w, id, Instance.update(inst, s = s)), id), r = Result.Ok(vs), exn = Option.None)
+        Outcome.Trap(e, s) -> Called(w = pushAll(putInst(w, id, Instance.update(inst, s = s)), id), r = Result.Err("trap: {e}"), exn = Option.None)
+        Outcome.Thrown(t, vs, s) -> Called(w = pushAll(putInst(w, id, Instance.update(inst, s = s)), id), r = Result.Err("uncaught exception"), exn = Option.Some(Exn(tag = t, vals = vs)))
+        Outcome.Host(fi, args, tail, mach) -> match fi < 0
+            true -> foreignAt(pushAll(putInst(w, id, Instance.update(inst, s = mach.store)), id), id, inst, -1 - fi, args, tail, mach)
+            false -> hostOut(w, id, inst, Vector.get(inst.x.fns, fi), args, tail, mach)
+
+fn hostOut(w: World, id: Int, inst: Instance, g: Option<Fn>, args: List<Val>, tail: Bool, mach: Machine) -> Called
+    ? "An imported function called: spectest's do nothing; one from a registered instance runs there."
+    match g
+        Option.None -> Called(w = w, r = Result.Err("call to an undefined import"), exn = Option.None)
+        Option.Some(fnc) -> match fnc.mod == "spectest"
+            true -> runOut(w, id, inst, Exec.resume(inst.x, mach, [], tail))
+            false -> foreign(w, id, inst, fnc, args, tail, mach)
+
+fn foreign(w: World, id: Int, inst: Instance, fnc: Fn, args: List<Val>, tail: Bool, mach: Machine) -> Called
+    ? "A call into another instance: this one's shared objects go back to their owners first, and come back from them before it resumes."
+    match Map.get(w.named, fnc.mod)
+        Option.None -> Called(w = w, r = Result.Err("unknown import {fnc.mod}.{fnc.name}"), exn = Option.None)
+        Option.Some(e) -> foreignIn(pushAll(putInst(w, id, Instance.update(inst, s = mach.store)), id), id, inst, e, fnc, args, tail, mach)
+
+fn foreignIn(w: World, id: Int, inst: Instance, e: Int, fnc: Fn, args: List<Val>, tail: Bool, mach: Machine) -> Called
+    ? "Finds the exported function and calls it."
+    match moduleOf(w, e)
+        Option.None -> Called(w = w, r = Result.Err("unknown import {fnc.mod}.{fnc.name}"), exn = Option.None)
+        Option.Some(m) -> match exportOf(m, fnc.name, 0)
+            Option.None -> Called(w = w, r = Result.Err("unknown import {fnc.mod}.{fnc.name}"), exn = Option.None)
+            Option.Some(efi) -> resumed(call(w, e, efi, args), id, inst, tail, mach)
+
+fn foreignAt(w: World, id: Int, inst: Instance, a: Int, args: List<Val>, tail: Bool, mach: Machine) -> Called
+    ? "A call through a reference to another instance's function: the instance is the address divided by 2^32, the function the rest."
+    resumed(call(w, Int.div(a, 4294967296), Int.mod(a, 4294967296), args), id, inst, tail, mach)
+
+verify foreignAt
+    foreignAt(empty(), 0, Instance(x = Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), s = blankStore(), shares = []), 4294967296, [], false, Machine(frame = Frame(code = Vector.fromList([]), pc = 0, locals = Vector.fromList([]), stack = Vector.fromList([]), sp = 0, targets = Vector.fromList([]), arity = 0, depth = 0), calls = [], store = blankStore())).r => Result.Err("no instance 1")
+
+fn resumed(c: Called, id: Int, inst: Instance, tail: Bool, mach: Machine) -> Called
+    ? "Resumes the caller with the callee's results and its shared objects as the callee left them."
+    match c.exn
+        Option.Some(ex) -> runOut(c.w, id, inst, Exec.resumeThrow(inst.x, Machine.update(mach, store = pullAll(c.w, inst.shares, mach.store)), ex.tag, ex.vals))
+        Option.None -> resumedWith(c, id, inst, tail, mach)
+
+fn resumedWith(c: Called, id: Int, inst: Instance, tail: Bool, mach: Machine) -> Called
+    ? "Resumes with the results, or passes a trap on."
+    match c.r
+        Result.Err(e) -> c
+        Result.Ok(vs) -> runOut(c.w, id, inst, Exec.resume(inst.x, Machine.update(mach, store = pullAll(c.w, inst.shares, mach.store)), vs, tail))
+
+verify call
+    call(empty(), 0, 0, []).r => Result.Err("no instance 0")
+
+verify runOut
+    runOut(empty(), 0, Instance(x = Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), s = blankStore(), shares = []), Outcome.Trap("x", blankStore())).r => Result.Err("trap: x")
+
+verify hostOut
+    hostOut(empty(), 0, Instance(x = Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), s = blankStore(), shares = []), Option.None, [], false, Machine(frame = Frame(code = Vector.fromList([]), pc = 0, locals = Vector.fromList([]), stack = Vector.fromList([]), sp = 0, targets = Vector.fromList([]), arity = 0, depth = 0), calls = [], store = blankStore())).r => Result.Err("call to an undefined import")
+
+verify foreign
+    foreign(empty(), 0, Instance(x = Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), s = blankStore(), shares = []), Fn(code = Vector.fromList([]), targets = Vector.fromList([]), defaults = Vector.fromList([]), params = 0, results = 0, imported = true, mod = "M", name = "f", ty = 0, cap = 1), [], false, Machine(frame = Frame(code = Vector.fromList([]), pc = 0, locals = Vector.fromList([]), stack = Vector.fromList([]), sp = 0, targets = Vector.fromList([]), arity = 0, depth = 0), calls = [], store = blankStore())).r => Result.Err("unknown import M.f")
+
+verify foreignIn
+    foreignIn(empty(), 0, Instance(x = Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), s = blankStore(), shares = []), 3, Fn(code = Vector.fromList([]), targets = Vector.fromList([]), defaults = Vector.fromList([]), params = 0, results = 0, imported = true, mod = "M", name = "f", ty = 0, cap = 1), [], false, Machine(frame = Frame(code = Vector.fromList([]), pc = 0, locals = Vector.fromList([]), stack = Vector.fromList([]), sp = 0, targets = Vector.fromList([]), arity = 0, depth = 0), calls = [], store = blankStore())).r => Result.Err("unknown import M.f")
+
+verify resumedWith
+    resumedWith(Called(w = empty(), r = Result.Err("x"), exn = Option.None), 0, Instance(x = Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), s = blankStore(), shares = []), false, Machine(frame = Frame(code = Vector.fromList([]), pc = 0, locals = Vector.fromList([]), stack = Vector.fromList([]), sp = 0, targets = Vector.fromList([]), arity = 0, depth = 0), calls = [], store = blankStore())).r => Result.Err("x")
+
+verify resumed
+    resumed(Called(w = empty(), r = Result.Err("x"), exn = Option.None), 0, Instance(x = Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), s = blankStore(), shares = []), false, Machine(frame = Frame(code = Vector.fromList([]), pc = 0, locals = Vector.fromList([]), stack = Vector.fromList([]), sp = 0, targets = Vector.fromList([]), arity = 0, depth = 0), calls = [], store = blankStore())).r => Result.Err("x")

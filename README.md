@@ -10,28 +10,33 @@ Kompost implements the WebAssembly 3.0 core: GC (structs, arrays, i31,
 subtyping, casts, iso-recursive type canonicalization), typed function
 references, tail calls, exception handling, multiple memories, memory64 and
 table64, SIMD and relaxed SIMD, bulk memory and tables, with a full
-validator and a strict binary decoder. It runs the output of
+validator, a strict binary decoder and linking of several modules. It runs the output of
 `aver compile --target wasm-gc` with the host imports Aver's programs use.
 
 ## Status
 
 Checked against the official spec testsuite with `bin/wast`, which compares
-every result bit for bit (NaN classes and v128 lanes included):
+every result bit for bit (NaN classes and v128 lanes included) and counts a
+crash, a timeout or a killed process as an error, never as a pass:
 
 | | passed | failed |
 |---|---|---|
-| core and GC testsuite (114 files) | 19 609 | 37 |
+| core and GC testsuite (114 files) and `tests/wast/review.wast` | 20 070 | 3 |
 | SIMD and relaxed SIMD (66 files) | 25 073 | 0 |
-| memory64, multi-memory, exceptions, bulk, … (the other 94 files) | 16 498 | 580 |
+| memory64, multi-memory, exceptions, bulk, linking, … (the other 94 files) | 17 188 | 0 |
 
-Every remaining failure needs **linking**: a module importing a function, memory,
-table, global or tag that another module exports. Kompost instantiates one
-module at a time; host imports come from Kompost itself (`spectest`, Aver's
-`aver.*`).
+The 3 failures are one known limitation: a module that imports the same
+global, table or memory twice, under two names, gets two copies, so a write
+through one name is not seen through the other.
 
-Not supported: linking several modules, threads and atomics (not part of
-3.0), the legacy exception instructions, Aver host imports beyond console,
-arguments and reading files.
+Linking runs each instance on its own store. A call into another instance
+stops the machine like a call to the host and runs the callee there; shared
+memories, tables and globals belong to the instance that defines them and
+are handed over when control passes between instances. Also not supported:
+GC objects (structs, arrays) passed between instances, since each instance
+has its own heap; calling back into an instance that is itself waiting on a
+call it made; threads and atomics (not part of 3.0); the legacy exception
+instructions; Aver host imports beyond console, arguments and reading files.
 
 **Speed.** Kompost resolves control flow before running and fuses frequent
 instruction sequences, but it is an interpreter written in a language
@@ -58,7 +63,7 @@ bin/build                         # → .build/target/release/kompost
 kompost FILE.wasm [ARGS...]              # runs _start; ARGS are the program's arguments
 kompost --invoke NAME FILE.wasm [ARGS]   # one export, prints its results
 kompost --validate FILE.wasm             # decode and validate only
-kompost --script FILE.wasm SCRIPT        # invocations from SCRIPT on one instance (used by bin/wast)
+kompost --script SCRIPT                  # a spec-test script: module, register, invoke (used by bin/wast)
 ```
 
 The same runs on Aver's VM: `aver run src/main.av --module-root src -- FILE.wasm`.
@@ -68,9 +73,11 @@ The same runs on Aver's VM: `aver run src/main.av --module-root src -- FILE.wasm
 - `aver verify src/main.av --module-root src` — examples and laws attached to
   every function (about 1 300 cases).
 - `bin/wast FILE.wast|NAME…` — spec tests through `wasm-tools json-from-wast`
-  (needs `wasm-tools`; names are looked up in `SPEC_DIR`). Each module's
-  invocations run on one instance and every value is compared exactly;
-  `assert_invalid` and `assert_malformed` modules must be refused.
+  (needs `wasm-tools`; names are looked up in `SPEC_DIR`). A whole file runs
+  as one script in one Kompost process, modules linked as the file registers
+  them, and every value is compared exactly; `assert_invalid` and
+  `assert_malformed` modules must be refused by Kompost itself, not by a
+  crash. `tests/wast/review.wast` holds regressions from an outside review.
 - `bin/wattest` — hand-written `tests/wat/*.wat` against Wasmtime.
 - `bin/difftest` — `tests/av/*.av` compiled to wasm-gc, run by Wasmtime and by
   Kompost; output must match.
@@ -100,6 +107,7 @@ The same runs on Aver's VM: `aver run src/main.av --module-root src -- FILE.wasm
 | `src/arr.av` | GC array storage, packed for i8 and i16 elements |
 | `src/exec.av` | resolution of control flow, instruction fusion and the machine |
 | `src/kompost.av` | the heap and its garbage collector |
+| `src/link.av` | several instances linked: imports checked, calls and exceptions between instances, shared objects |
 | `src/main.av` | command line and host imports |
 
 ## License
