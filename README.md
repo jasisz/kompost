@@ -1,4 +1,5 @@
 <p align="center"><img src="assets/logo.svg" width="160" alt="Kompost"></p>
+<p align="center"><a href="https://github.com/jasisz/aver"><img src="https://img.shields.io/badge/written%20in-Aver-6b4f9e" alt="Written in Aver"></a></p>
 
 # Kompost
 
