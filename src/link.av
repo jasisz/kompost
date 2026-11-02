@@ -10,8 +10,8 @@ module Link
         "with the callee's memory 0 on top and the caller's frames pinned for"
         "the collector, then resumes the caller. Exceptions cross instances"
         "with tag identities; imports are checked against what provides them."
-    exposes [World, Called, Exn, empty, add, register, call, moduleOf]
-    depends [Ast, Value, Exec, Kompost, Valid, Types]
+    exposes [World, Called, Exn, empty, add, register, call, moduleOf, compiled]
+    depends [Ast, Value, Exec, Kompost, Valid, Types, Rt, Native]
     effects []
 
 record World
@@ -23,6 +23,10 @@ record Called
     w: World
     r: Result<List<Val>, String>
     exn: Option<Exn>
+
+record Hold
+    pinned: List<Val>
+    held: List<List<Frame>>
 
 record Exn
     tag: Int
@@ -50,21 +54,21 @@ fn moduleOf(w: World, id: Int) -> Option<Module>
 
 verify moduleOf
     moduleOf(empty(), 0) => Option.None
-    moduleOf(add(empty(), 0, Ast.emptyModule(), Vector.fromList([]), {}).w, 0) => Option.Some(Ast.emptyModule())
+    moduleOf(add(empty(), 0, Ast.emptyModule(), Vector.fromList([]), {}, -1).w, 0) => Option.Some(Ast.emptyModule())
 
 // ---- instantiation ----
 
-fn add(w: World, id: Int, m: Module, shapes: Vector<Shape>, hostGlobals: Map<String, Val>) -> Called
+fn add(w: World, id: Int, m: Module, shapes: Vector<Shape>, hostGlobals: Map<String, Val>, key: Int) -> Called
     ? "Instantiates m as instance id: imports checked, its own objects added to the store, what it imports linked to the exporters' objects, segments placed, then its start function run. When a segment does not fit, the instantiation fails but what earlier segments wrote stays in the store, and the instance stays (unnamed) so functions it put into an imported table can still be called."
     match importsOk(w, m, m.imports)
         Result.Err(e) -> Called(w = w, r = Result.Err(e), exn = Option.None)
-        Result.Ok(_) -> prepared(w, id, m.start, Exec.prepareIn(w.s, m, hostGlobals, shapes, id, linksOf(w, m, id)))
+        Result.Ok(_) -> prepared(w, id, m.start, Exec.prepareIn(w.s, m, hostGlobals, shapes, id, linksOf(w, m, id)), key)
 
-fn prepared(w: World, id: Int, start: Int, r: Result<Ready, String>) -> Called
-    ? "Places the segments of a prepared instance."
+fn prepared(w: World, id: Int, start: Int, r: Result<Ready, String>, key: Int) -> Called
+    ? "Places the segments of a prepared instance, its compiled functions marked (key is its module's in Native, or -1)."
     match r
         Result.Err(e) -> Called(w = w, r = Result.Err(e), exn = Option.None)
-        Result.Ok(ready) -> settled(World.update(w, insts = Map.set(w.insts, id, ready.x)), id, start, Exec.settlePart(ready.x, ready.s))
+        Result.Ok(ready) -> settled(World.update(w, insts = Map.set(w.insts, id, compiled(ready.x, key))), id, start, Exec.settlePart(ready.x, ready.s))
 
 fn settled(w: World, id: Int, start: Int, r: Settled) -> Called
     ? "Keeps the store the segments left; runs the start function when they all fit."
@@ -79,10 +83,10 @@ fn started(w: World, id: Int, start: Int) -> Called
         false -> call(w, id, start, [])
 
 verify add
-    add(empty(), 0, Ast.emptyModule(), Vector.fromList([]), {}).r => Result.Ok([])
+    add(empty(), 0, Ast.emptyModule(), Vector.fromList([]), {}, -1).r => Result.Ok([])
 
 verify prepared
-    prepared(empty(), 0, -1, Result.Err("x")).r => Result.Err("x")
+    prepared(empty(), 0, -1, Result.Err("x"), -1).r => Result.Err("x")
 
 verify settled
     settled(empty(), 0, -1, Settled(s = Exec.blankStore(), err = "x")).r => Result.Err("x")
@@ -151,7 +155,65 @@ fn hostOut(w: World, x: Inst, fi: Int, args: List<Val>, tail: Bool, mach: Machin
         true -> across(w, x, Int.div(-1 - fi, 4294967296), Int.mod(-1 - fi, 4294967296), args, tail, mach)
         false -> match Vector.get(x.fns, fi)
             Option.None -> Called(w = w, r = Result.Err("call to an undefined import"), exn = Option.None)
-            Option.Some(g) -> imported(w, x, g, args, tail, mach)
+            Option.Some(g) -> match g.mod == "*native"
+                true -> nativeOut(w, x, Result.withDefault(Int.fromString(g.name), -1), fi, args, tail, mach)
+                false -> imported(w, x, g, args, tail, mach)
+
+fn nativeOut(w: World, x: Inst, key: Int, fi: Int, args: List<Val>, tail: Bool, mach: Machine) -> Called
+    ? "A compiled function the interpreter stopped at runs on the machine's store, what the machine holds pinned for the collector; the machine then resumes with its results."
+    before = Hold(pinned = mach.store.pinned, held = mach.store.held)
+    s = Exec.suspended(mach.store, mach, [])
+    bare = Machine.update(mach, store = Exec.blankStore())
+    nativeBack(w, x, Native.call(key, x, s, 0, fi, args), before, tail, bare)
+
+fn nativeBack(w: World, x: Inst, r: R, before: Hold, tail: Bool, mach: Machine) -> Called
+    ? "Resumes the machine after a compiled function, unpinned; a trap ends the run."
+    match r
+        R.Trap(e, s) -> Called(w = World.update(w, s = restored(s, before)), r = Result.Err("trap: {e}"), exn = Option.None)
+        R.V0(s) -> resumedWith(w, Result.Ok([]), x, restored(s, before), tail, mach)
+        R.V1(a, s) -> resumedWith(w, Result.Ok([a]), x, restored(s, before), tail, mach)
+        R.V2(a, c, s) -> resumedWith(w, Result.Ok([a, c]), x, restored(s, before), tail, mach)
+        R.VN(vs, s) -> resumedWith(w, Result.Ok(vs), x, restored(s, before), tail, mach)
+        R.Tail(_, _, s) -> Called(w = World.update(w, s = restored(s, before)), r = Result.Err("trap: unresolved tail call"), exn = Option.None)
+
+fn restored(s: Store, before: Hold) -> Store
+    ? "The store with what was pinned and held before the call."
+    Store.update(s, pinned = before.pinned, held = before.held)
+
+verify restored
+    restored(Exec.blankStore(), Hold(pinned = [], held = [])) => Exec.blankStore()
+
+// ---- compiled functions ----
+
+fn compiled(x: Inst, key: Int) -> Inst
+    ? "The instance with the functions Native compiled from its module (key, or -1 for none) marked, so the interpreter hands them over like imports."
+    match key < 0
+        true -> x
+        false -> Inst.update(x, fns = Vector.fromList(markAll(List.fromVector(x.fns), key, 0, [])))
+
+fn markAll(fs: List<Fn>, key: Int, k: Int, acc: List<Fn>) -> List<Fn>
+    ? "Marks every compiled function from index k on."
+    match fs
+        [] -> List.reverse(acc)
+        [g, ..rest] -> markAll(rest, key, k + 1, List.prepend(markOne(g, key, k), acc))
+
+fn markOne(g: Fn, key: Int, k: Int) -> Fn
+    ? "A local function Native has, marked as one the host runs, with its module's key."
+    match Bool.and(Native.has(key, k), g.imported == false)
+        true -> Fn.update(g, imported = true, mod = "*native", name = "{key}")
+        false -> g
+
+verify nativeBack
+    nativeBack(empty(), Exec.emptyInst(), R.Trap("x", Exec.blankStore()), Hold(pinned = [], held = []), false, Machine(frame = Frame(code = Vector.fromList([]), pc = 0, locals = Vector.fromList([]), stack = Vector.fromList([]), sp = 0, targets = Vector.fromList([]), arity = 0, depth = 0), calls = [], store = Exec.blankStore())).r => Result.Err("trap: x")
+
+verify compiled
+    compiled(Exec.emptyInst(), -1).base => 0
+
+verify markAll
+    markAll([], 0, 0, []) => []
+
+verify markOne
+    markOne(Fn(code = Vector.fromList([]), targets = Vector.fromList([]), defaults = Vector.fromList([]), params = 0, results = 0, imported = false, mod = "", name = "", ty = 0, cap = 1), -1, 0).imported => false
 
 fn imported(w: World, x: Inst, g: Fn, args: List<Val>, tail: Bool, mach: Machine) -> Called
     ? "An imported function: spectest's do nothing, a registered instance's export runs there."
@@ -172,12 +234,14 @@ fn importedFrom(w: World, x: Inst, e: Int, g: Fn, args: List<Val>, tail: Bool, m
 fn across(w: World, x: Inst, e: Int, efi: Int, args: List<Val>, tail: Bool, mach: Machine) -> Called
     ? "Runs function efi of instance e on the caller's store, the caller's frames and the arguments pinned so the collector keeps what they hold, then resumes the caller."
     pinnedBefore = mach.store.pinned
-    s = Store.update(mach.store, pinned = List.concat(args, List.concat(Exec.machineRoots(mach), mach.store.pinned)))
-    back(call(World.update(w, s = s), e, efi, args), x, pinnedBefore, tail, mach)
+    heldBefore = mach.store.held
+    s = Exec.suspended(mach.store, mach, args)
+    bare = Machine.update(mach, store = Exec.blankStore())
+    back(call(World.update(w, s = s), e, efi, args), x, Hold(pinned = pinnedBefore, held = heldBefore), tail, bare)
 
-fn back(c: Called, x: Inst, pinnedBefore: List<Val>, tail: Bool, mach: Machine) -> Called
+fn back(c: Called, x: Inst, before: Hold, tail: Bool, mach: Machine) -> Called
     ? "The caller resumed on the store the callee left, unpinned, with its memory 0 on top again: with the results, or with the exception the callee did not catch; a trap ends the run."
-    s = Exec.swapTo(Store.update(c.w.s, pinned = pinnedBefore), Exec.maddr(x, 0))
+    s = Exec.swapTo(Store.update(c.w.s, pinned = before.pinned, held = before.held), Exec.maddr(x, 0))
     w = World.update(c.w, s = s)
     match c.exn
         Option.Some(ex) -> runOut(w, x, Exec.resumeThrow(x, Machine.update(mach, store = s), ex.tag, ex.vals))
@@ -208,7 +272,7 @@ verify across
     across(empty(), Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), 3, 0, [], false, Machine(frame = Frame(code = Vector.fromList([]), pc = 0, locals = Vector.fromList([]), stack = Vector.fromList([]), sp = 0, targets = Vector.fromList([]), arity = 0, depth = 0), calls = [], store = Exec.blankStore())).r => Result.Err("no instance 3")
 
 verify back
-    back(Called(w = empty(), r = Result.Err("x"), exn = Option.None), Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), [], false, Machine(frame = Frame(code = Vector.fromList([]), pc = 0, locals = Vector.fromList([]), stack = Vector.fromList([]), sp = 0, targets = Vector.fromList([]), arity = 0, depth = 0), calls = [], store = Exec.blankStore())).r => Result.Err("x")
+    back(Called(w = empty(), r = Result.Err("x"), exn = Option.None), Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), Hold(pinned = [], held = []), false, Machine(frame = Frame(code = Vector.fromList([]), pc = 0, locals = Vector.fromList([]), stack = Vector.fromList([]), sp = 0, targets = Vector.fromList([]), arity = 0, depth = 0), calls = [], store = Exec.blankStore())).r => Result.Err("x")
 
 verify resumedWith
     resumedWith(empty(), Result.Err("x"), Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), Exec.blankStore(), false, Machine(frame = Frame(code = Vector.fromList([]), pc = 0, locals = Vector.fromList([]), stack = Vector.fromList([]), sp = 0, targets = Vector.fromList([]), arity = 0, depth = 0), calls = [], store = Exec.blankStore())).r => Result.Err("x")

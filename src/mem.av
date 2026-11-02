@@ -29,8 +29,85 @@ verify octetIn
     octetIn(513, 1) => 2
 
 fn read(mem: Map<Int, Vector<Int>>, ea: Int, n: Int) -> Int
-    ? "n octets at ea as an unsigned little-endian number."
-    readFrom(mem, ea + n - 1, n, 0)
+    ? "n octets at ea as an unsigned little-endian number: within one page its page is looked up once, else octet by octet."
+    off = Int.mod(ea, 65536)
+    match off + n <= 65536
+        true -> readIn(Map.get(mem, Int.div(ea, 65536)), off, n)
+        false -> readFrom(mem, ea + n - 1, n, 0)
+
+fn readIn(p: Option<Vector<Int>>, off: Int, n: Int) -> Int
+    ? "n octets at off within a page; a page never written reads as zero."
+    match p
+        Option.Some(page) -> readPage(page, off, n)
+        Option.None -> 0
+
+fn readPage(page: Vector<Int>, off: Int, n: Int) -> Int
+    ? "n octets at off of a page: an aligned word or two read whole, octets within one word shifted out of it, anything else octet by octet."
+    w = Int.div(off, 4)
+    sh = Int.mod(off, 4)
+    match Bool.and(sh == 0, Bool.or(n == 4, n == 8))
+        true -> alignedRead(page, w, n)
+        false -> match sh + n <= 4
+            true -> lowOctets(shifted(pageWord(page, w), sh), n)
+            false -> readPageFrom(page, off + n - 1, n, 0)
+
+fn alignedRead(page: Vector<Int>, w: Int, n: Int) -> Int
+    ? "An aligned load of 4 or 8 octets."
+    match n == 8
+        true -> pageWord(page, w) + pageWord(page, w + 1) * 4294967296
+        false -> pageWord(page, w)
+
+fn pageWord(page: Vector<Int>, w: Int) -> Int
+    ? "Word w of a page."
+    Option.withDefault(Vector.get(page, w), 0)
+
+fn shifted(x: Int, sh: Int) -> Int
+    ? "x without its low sh octets, for sh below 4."
+    match sh
+        0 -> x
+        1 -> Int.div(x, 256)
+        2 -> Int.div(x, 65536)
+        _ -> Int.div(x, 16777216)
+
+fn lowOctets(x: Int, n: Int) -> Int
+    ? "The low n octets (1, 2 or 4) of a non-negative number."
+    match n
+        1 -> Int.mod(x, 256)
+        2 -> Int.mod(x, 65536)
+        _ -> Int.mod(x, 4294967296)
+
+fn readPageFrom(page: Vector<Int>, a: Int, n: Int, acc: Int) -> Int
+    ? "Folds n octets of a page from the most significant one at offset a downwards."
+    match n <= 0
+        true -> acc
+        false -> readPageFrom(page, a - 1, n - 1, acc * 256 + octetIn(pageWord(page, Int.div(a, 4)), Int.mod(a, 4)))
+
+verify write
+    read(write({}, 0, 16, 340282366920938463463374607431768211455), 0, 16) => 340282366920938463463374607431768211455
+    read(write({}, 4, 16, 18446744073709551616), 4, 16) => 18446744073709551616
+
+verify readIn
+    readIn(Option.None, 4, 4) => 0
+
+verify readPage
+    readPage(Vector.fromList([67305985, 134678021]), 0, 8) => 578437695752307201
+    readPage(Vector.fromList([67305985, 134678021]), 2, 4) => 100992003
+    readPage(Vector.fromList([67305985]), 1, 2) => 770
+
+verify alignedRead
+    alignedRead(Vector.fromList([1, 2]), 0, 8) => 8589934593
+
+verify pageWord
+    pageWord(Vector.fromList([]), 3) => 0
+
+verify shifted
+    shifted(16777216, 3) => 1
+
+verify lowOctets
+    lowOctets(65793, 1) => 1
+
+verify readPageFrom
+    readPageFrom(Vector.fromList([513]), 1, 2, 0) => 513
 
 fn readFrom(mem: Map<Int, Vector<Int>>, a: Int, n: Int, acc: Int) -> Int
     ? "Folds n octets from the most significant one at a downwards."
@@ -46,8 +123,46 @@ verify readFrom
     readFrom({}, 3, 1, 7) => 1792
 
 fn write(mem: Map<Int, Vector<Int>>, ea: Int, n: Int, v: Int) -> Map<Int, Vector<Int>>
-    ? "mem with the low n octets of v written at ea, little-endian."
-    writeList(mem, ea, octetsOf(v, n, []))
+    ? "mem with the low n octets of v written at ea, little-endian: within one page the page is taken out once and written in place, an aligned word or two whole."
+    off = Int.mod(ea, 65536)
+    match Bool.and(off + n <= 65536, n <= 8)
+        true -> writeIn(mem, Int.div(ea, 65536), off, n, v)
+        false -> writeList(mem, ea, octetsOf(v, n, []))
+
+fn writeIn(mem: Map<Int, Vector<Int>>, pn: Int, off: Int, n: Int, v: Int) -> Map<Int, Vector<Int>>
+    ? "Writes within page pn: the page is taken out of the map, so it has one owner, written, and put back."
+    page = pageOf(Map.get(mem, pn))
+    Map.set(Map.remove(mem, pn), pn, writePage1(page, off, n, Bits.low(v, 64)))
+
+fn writePage1(page: Vector<Int>, off: Int, n: Int, u: Int) -> Vector<Int>
+    ? "The low n octets of u (non-negative) written at off: aligned 4 or 8 octets as whole words, anything else octet by octet."
+    w = Int.div(off, 4)
+    match Bool.and(Int.mod(off, 4) == 0, Bool.or(n == 4, n == 8))
+        true -> alignedWrite(page, w, n, u)
+        false -> fill(page, off, octetsOf(u, n, []))
+
+fn alignedWrite(page: Vector<Int>, w: Int, n: Int, u: Int) -> Vector<Int>
+    ? "An aligned store of 4 or 8 octets."
+    match n == 8
+        true -> setWord(setWord(page, w, Int.mod(u, 4294967296)), w + 1, Int.div(u, 4294967296))
+        false -> setWord(page, w, Int.mod(u, 4294967296))
+
+fn setWord(page: Vector<Int>, w: Int, x: Int) -> Vector<Int>
+    ? "Word w of a page replaced, in place."
+    Option.withDefault(Vector.set(page, w, x), page)
+
+verify writeIn
+    read(writeIn({}, 0, 4, 4, -1), 4, 4) => 4294967295
+
+verify writePage1
+    writePage1(Vector.fromList([0, 0]), 0, 8, 8589934593) => Vector.fromList([1, 2])
+    writePage1(Vector.fromList([0]), 1, 2, 770) => Vector.fromList([197120])
+
+verify alignedWrite
+    alignedWrite(Vector.fromList([0, 0]), 0, 4, 7) => Vector.fromList([7, 0])
+
+verify setWord
+    setWord(Vector.fromList([0]), 0, 5) => Vector.fromList([5])
 
 fn octetsOf(v: Int, n: Int, acc: List<Int>) -> List<Int>
     ? "The low n octets of v, the lowest first."

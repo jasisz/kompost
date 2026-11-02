@@ -22,7 +22,7 @@ crash, a timeout or a killed process as an error, never as a pass:
 
 | | passed | failed |
 |---|---|---|
-| core and GC testsuite (114 files) and Kompost's own `tests/wast` | 20 081 | 0 |
+| core and GC testsuite (114 files) and Kompost's own `tests/wast` | 20 092 | 0 |
 | SIMD and relaxed SIMD (66 files) | 25 073 | 0 |
 | memory64, multi-memory, exceptions, bulk, linking, … (the other 94 files) | 17 186 | 0 |
 
@@ -42,7 +42,47 @@ instruction sequences, but it is an interpreter written in a language
 without mutable arrays: about 35–40 ns per instruction, roughly 60 times
 slower than Wasmtime on the same module. It is meant as an independent
 implementation to check other engines and compilers against, not as a fast
-runtime.
+runtime. For speed there is ahead-of-time compilation, below.
+
+## Ahead-of-time compilation
+
+`bin/aot FILE.wasm...` compiles a module's functions to Aver (`kompost
+--compile`, written in Aver like the rest) and builds a Kompost with them
+native. The compiled module replaces `src/native.av` in a copy of the
+sources; a binary built this way runs those modules with their compiled
+functions and everything else interpreted, and any other module it is given
+entirely interpreted, as it recognises modules by their octets.
+
+The operand stack and the locals turn into named values, i32 and i64 into
+machine words, the rest into Kompost's values; every block a branch targets,
+every if and every loop becomes a function of its own, taking only the
+locals live there. The store is threaded through and written in place.
+Instructions the compiler does not write out (the rarer GC, table and memory
+instructions) run through the interpreter one at a time, so their meaning is
+written once. A function is compiled when its every instruction is one the
+compiler handles and every function it calls is compiled too; the
+interpreter hands a compiled function over the way it hands an import to the
+host, and compiled code calls back into the interpreter for one that is not.
+Indirect calls (`call_ref`, `call_indirect`) are compiled only in a module
+that imports nothing but Aver's host functions and exports no table, global
+or function taking a function reference, so no other instance can hand it a
+function; exceptions and SIMD stay interpreted.
+
+Compiled code is checked as the interpreter is: the spec testsuite's core,
+GC, reference, table and indirect-call files (about 18 000 cases) run with
+every module they define compiled, with the same results bit for bit. What
+it gains depends on what a program spends its time on:
+
+| program | interpreted | compiled |
+|---|---|---|
+| fib(32) from Aver's wasm-gc output | 5.6 s | 0.27 s |
+| a loop of 200 000 i32 loads and stores, 20 passes | 1.04 s | 0.30 s |
+| Pestka on a small Lean export (GC data, hashing) | 5.3 s | 3.2 s |
+
+A program dominated by dispatch gains most; one dominated by GC data gains
+least, since compiled code keeps Kompost's heap and values. Building is
+slow: Pestka's 2 900 functions become about 146 000 lines of Aver and take
+several minutes of rustc and some gigabytes of memory.
 
 ## Building
 
@@ -85,6 +125,11 @@ The same runs on Aver's VM: `aver run src/main.av --module-root src -- FILE.wasm
   [miscast](https://github.com/jasisz/miscast) with Wasmtime as the oracle.
 - `bin/pestka` — a larger wasm-gc program (Pestka, a Lean export checker
   written in Aver) run in Kompost against its native build.
+- `bin/aot FILE.wasm...` — a Kompost with these modules compiled ahead of time
+  (see above); `KOMPOST=` that binary with `bin/wast` runs the spec files
+  whose modules were compiled. `tests/wast/aot-*.wast` hold what compiled
+  code once got wrong, and loops long enough to tell compiled from
+  interpreted.
 - `bin/guard CMD` — runs a command under a memory limit for its whole process
   tree (`GUARD_GB`, default 6); the test scripts above are worth running
   under it.
@@ -108,6 +153,9 @@ The same runs on Aver's VM: `aver run src/main.av --module-root src -- FILE.wasm
 | `src/exec.av` | resolution of control flow, instruction fusion and the machine |
 | `src/kompost.av` | the heap and its garbage collector |
 | `src/link.av` | several instances in one store: imports checked and linked, calls and exceptions between instances |
+| `src/aot.av` | the ahead-of-time compiler: a module's functions as an Aver module |
+| `src/rt.av` | what compiled code calls at run time: machine words, the heap, indirect calls, the interpreter |
+| `src/native.av` | the compiled functions; this copy has none, bin/aot replaces it |
 | `src/types.av` | types compared across modules (iso-recursive identity, subtyping) |
 | `src/main.av` | command line and host imports |
 

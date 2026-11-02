@@ -1,0 +1,47 @@
+;; Linear memory: aligned and unaligned loads and stores, across a page
+;; boundary and inside one word, then long loops of them (bin/aot's builds
+;; and the interpreter both run it; it is also a benchmark).
+(module
+  (memory 16)
+  (func (export "fill") (param $n i32)
+    (local $i i32)
+    (block $d (loop $l
+      (br_if $d (i32.ge_u (local.get $i) (local.get $n)))
+      (i32.store (i32.shl (local.get $i) (i32.const 2)) (i32.mul (local.get $i) (i32.const -1640531535)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $l))))
+  (func (export "sum") (param $n i32) (result i32)
+    (local $i i32) (local $acc i32)
+    (block $d (loop $l
+      (br_if $d (i32.ge_u (local.get $i) (local.get $n)))
+      (local.set $acc (i32.add (local.get $acc) (i32.load (i32.shl (local.get $i) (i32.const 2)))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $l)))
+    (local.get $acc))
+  (func (export "sum64") (param $n i32) (result i64)
+    (local $i i32) (local $acc i64)
+    (block $d (loop $l
+      (br_if $d (i32.ge_u (local.get $i) (local.get $n)))
+      (local.set $acc (i64.add (local.get $acc) (i64.load (i32.shl (local.get $i) (i32.const 3)))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $l)))
+    (local.get $acc))
+  (func (export "bench") (param $n i32) (param $r i32) (result i32)
+    (local $k i32) (local $acc i32)
+    (block $d (loop $l
+      (br_if $d (i32.ge_u (local.get $k) (local.get $r)))
+      (local.set $acc (i32.add (local.get $acc) (call 1 (local.get $n))))
+      (local.set $k (i32.add (local.get $k) (i32.const 1)))
+      (br $l)))
+    (local.get $acc))
+  (func (export "edges") (result i64 i32 i32)
+    (i64.store (i32.const 65532) (i64.const 0x0123456789abcdef))
+    (i32.store16 (i32.const 70003) (i32.const 0xbeef))
+    (i64.load (i32.const 65532))
+    (i32.load (i32.const 65530))
+    (i32.load offset=1 (i32.const 70000))))
+(invoke "fill" (i32.const 200000))
+(assert_return (invoke "sum" (i32.const 200000)) (i32.const 132748128))
+(assert_return (invoke "sum64" (i32.const 100000)) (i64.const -5260935199341088928))
+(assert_return (invoke "bench" (i32.const 200000) (i32.const 20)) (i32.const -1640004736))
+(assert_return (invoke "edges") (i64.const 81985529216486895) (i32.const -839933443) (i32.const -1091616065))

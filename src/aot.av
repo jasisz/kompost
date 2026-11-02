@@ -1,0 +1,2388 @@
+module Aot
+    intent =
+        "Compiles a validated module's functions ahead of time into an Aver"
+        "module, Native, which Kompost is then built with (see bin/aot). A"
+        "function is compiled when every instruction in it is one the compiler"
+        "knows and every function it calls is compiled too; the rest stay with"
+        "the interpreter, which hands a compiled function over the way it hands"
+        "an import to the host. The operand stack and the locals disappear into"
+        "named values: i32 and i64 become Ints, everything else stays a Val, and"
+        "the store is threaded through. Each block that a branch targets, each"
+        "if and each loop becomes a function of its own taking the locals, the"
+        "values beneath it on the stack and the values the branch carries; a"
+        "branch is a call, a loop a function that calls itself. Instructions"
+        "that may trap or that return a store become a match, the rest of the"
+        "function nested in the arm that goes on. What the compiler does not"
+        "write out itself (memory, tables, the rarer GC instructions) runs"
+        "through the interpreter one instruction at a time (Rt.via)."
+    exposes [compile, Mod]
+    depends [Ast, Valid]
+    effects []
+
+record E
+    c: String
+    t: ValType
+
+record Lab
+    kind: Int
+    name: String
+    tys: List<ValType>
+    below: List<ValType>
+    keep: List<Int>
+
+record Cx
+    m: Module
+    pre: String
+    fi: Int
+    code: Vector<Instr>
+    ltys: List<ValType>
+    res: List<ValType>
+    natives: Map<Int, Unit>
+    allocs: Map<Int, Unit>
+    tails: Map<Int, Unit>
+    live: Vector<Int>
+
+record St
+    ls: List<E>
+    stk: List<E>
+    s: String
+    top: Bool
+    ind: Int
+
+record Gl
+    n: Int
+    fns: List<String>
+    alias: List<Alias>
+
+record Alias
+    from: String
+    to: String
+
+record Out
+    t: String
+    g: Gl
+
+record Pre
+    t: String
+    st: St
+    g: Gl
+
+record Mod
+    m: Module
+    size: Int
+    sum: Int
+
+// ---- the module ----
+
+fn compile(ms: List<Mod>) -> String
+    ? "The Native module for these modules, each known by its binary's size and checksum."
+    header(ms) + String.join(modulesOf(ms, 0, []), "")
+
+fn header(ms: List<Mod>) -> String
+    ? "The module header and the dispatch from a module's key and a function number."
+    h1 = "module Native\n    intent = \"Functions compiled ahead of time by kompost --compile.\"\n    exposes [keyOf, has, call]\n    depends [Ast, Value, Num, Exec, Rt]\n    effects []\n\n"
+    h2 = "fn keyOf(size: Int, sum: Int) -> Int\n    ? \"The key of the compiled module with this size and checksum, or -1.\"\n    keyIn([" + String.join(prints(ms, []), ", ") + "], size, sum, 0)\n\n"
+    h3 = "fn keyIn(ps: List<Tuple<Int, Int>>, size: Int, sum: Int, k: Int) -> Int\n    ? \"Finds the module.\"\n    match ps\n        [] -> -1\n        [(a, b), ..rest] -> match Bool.and(a == size, b == sum)\n            true -> k\n            false -> keyIn(rest, size, sum, k + 1)\n\n"
+    h4 = "fn has(key: Int, fi: Int) -> Bool\n    ? \"Whether function fi of module key is compiled.\"\n    match key\n" + keyArms(List.len(ms), 0, "has#(fi)", "") + "        _ -> false\n\n"
+    h5 = "fn call(key: Int, x: Inst, s: Store, d: Int, fi: Int, args: List<Val>) -> R\n    ? \"Runs compiled function fi of module key with its arguments in order.\"\n    match key\n" + keyArms(List.len(ms), 0, "m#call(x, s, d, Rt.noRoots(), fi, args)", "") + "        _ -> R.Trap(\"module is not compiled\", s)\n\n"
+    h1 + h2 + h3 + h4 + h5
+
+fn prints(ms: List<Mod>, acc: List<String>) -> List<String>
+    ? "Each module's size and checksum."
+    match ms
+        [] -> List.reverse(acc)
+        [d, ..rest] -> prints(rest, List.prepend("({d.size}, {d.sum})", acc))
+
+fn keyArms(n: Int, k: Int, call: String, acc: String) -> String
+    ? "One arm per module key, the call with # replaced by the key."
+    match k >= n
+        true -> acc
+        false -> keyArms(n, k + 1, call, acc + "        {k} -> " + String.replace(call, "#", "{k}") + "\n")
+
+fn modulesOf(ms: List<Mod>, k: Int, acc: List<String>) -> List<String>
+    ? "The text of each module's compiled functions."
+    match ms
+        [] -> List.reverse(acc)
+        [d, ..rest] -> modulesOf(rest, k + 1, List.prepend(moduleText(d.m, k), acc))
+
+fn moduleText(m: Module, k: Int) -> String
+    ? "Module k's compiled functions and its dispatch."
+    ind = indirectSafe(m)
+    natives = chosen(m, candidates(m, ind, 0, Vector.len(m.funcs), {}))
+    allocs = allocating(m, natives, Map.keys(natives), {}, true)
+    fis = Map.keys(natives)
+    recs = recursive(m, calleesOf(m, natives, fis, {}), fis, {})
+    pre = "m{k}"
+    h = "fn has{k}(fi: Int) -> Bool\n    ? \"Whether function fi of module {k} is compiled.\"\n    " + fnTree(0, m, pre, fis, 4) + "\n\n"
+    c = "fn {pre}call(x: Inst, s: Store, d: Int, rs: List<Val>, fi: Int, args: List<Val>) -> R\n    ? \"Runs function fi of module {k} and every tail call it ends with; compiled indirect calls come here too, with their callers' roots.\"\n    Rt.resolve({pre}callIn(x, s, d, rs, fi, args), x, d, rs, {pre}callIn)\n\nfn {pre}callIn(x: Inst, s: Store, d: Int, rs: List<Val>, fi: Int, args: List<Val>) -> R\n    ? \"Runs function fi of module {k}, through the bucket of 32 it falls in; the interpreter runs one that is not compiled.\"\n    match Int.div(fi, 32)\n" + bucketArms(pre, buckets(fis, []), "") + "        _ -> " + fnMissing(1, pre) + "\n\n" + bucketFns(m, k, pre, buckets(fis, []), "")
+    h + c + String.join(functionsOf(m, pre, fis, natives, allocs, tailing(m, fis, {}, true), recs, []), "")
+
+fn buckets(fis: List<Int>, acc: List<List<Int>>) -> List<List<Int>>
+    ? "The functions grouped by fi / 32, in order (fis ascending), so one dispatch never holds more than 32 calls: rustc builds one huge function far more slowly than many small ones."
+    match fis
+        [] -> List.reverse(acc)
+        [f, ..rest] -> match acc
+            [b, ..more] -> match Int.div(firstOf(b), 32) == Int.div(f, 32)
+                true -> buckets(rest, List.prepend(List.concat(b, [f]), more))
+                false -> buckets(rest, List.prepend([f], acc))
+            [] -> buckets(rest, [[f]])
+
+fn firstOf(xs: List<Int>) -> Int
+    ? "The first number of a list."
+    match xs
+        [x, .._] -> x
+        [] -> 0
+
+fn bucketArms(pre: String, bs: List<List<Int>>, acc: String) -> String
+    ? "One arm per bucket."
+    match bs
+        [] -> acc
+        [b, ..rest] -> bucketArms(pre, rest, acc + "        {Int.div(firstOf(b), 32)} -> {pre}callb{Int.div(firstOf(b), 32)}(x, s, d, rs, fi, args)\n")
+
+fn bucketFns(m: Module, k: Int, pre: String, bs: List<List<Int>>, acc: String) -> String
+    ? "The dispatch of each bucket."
+    match bs
+        [] -> acc
+        [b, ..rest] -> bucketFns(m, k, pre, rest, acc + "fn {pre}callb{Int.div(firstOf(b), 32)}(x: Inst, s: Store, d: Int, rs: List<Val>, fi: Int, args: List<Val>) -> R\n    ? \"Functions {firstOf(b)} on of module {k}.\"\n    " + fnTree(1, m, pre, b, 4) + "\n\n")
+
+verify buckets
+    buckets([1, 5, 33, 40, 70], []) => [[1, 5], [33, 40], [70]]
+
+verify firstOf
+    firstOf([]) => 0
+
+verify bucketArms
+    bucketArms("m0", [[33]], "") => "        1 -> m0callb1(x, s, d, rs, fi, args)\n"
+
+verify bucketFns
+    bucketFns(Ast.emptyModule(), 0, "m0", [], "") => ""
+
+fn fnTree(kind: Int, m: Module, pre: String, fis: List<Int>, ind: Int) -> String
+    ? "A dispatch on fi over the compiled functions: kind 0 answers whether one is compiled, kind 1 calls it."
+    "match fi\n" + fnArms(kind, m, pre, fis, ind, "") + "{sp(ind + 4)}_ -> " + fnMissing(kind, pre)
+
+fn fnArms(kind: Int, m: Module, pre: String, fis: List<Int>, ind: Int, acc: String) -> String
+    ? "One arm per function."
+    match fis
+        [] -> acc
+        [f, ..rest] -> fnArms(kind, m, pre, rest, ind, acc + "{sp(ind + 4)}{f} -> " + fnArm(kind, m, pre, f, ind + 4) + "\n")
+
+fn fnArm(kind: Int, m: Module, pre: String, f: Int, ind: Int) -> String
+    ? "What an arm does: true, or the call."
+    match kind
+        0 -> "true"
+        _ -> entry(m, pre, f, ind)
+
+fn fnMissing(kind: Int, pre: String) -> String
+    ? "The answer for a function that is not compiled: the interpreter runs it."
+    match kind
+        0 -> "false"
+        _ -> "Rt.interp(x, s, d, rs, fi, args, {pre}call)"
+
+verify fnTree
+    fnTree(0, Ast.emptyModule(), "m0", [2], 4) => "match fi\n        2 -> true\n        _ -> false"
+
+verify fnArms
+    fnArms(0, Ast.emptyModule(), "m0", [], 4, "") => ""
+
+verify fnArm
+    fnArm(0, Ast.emptyModule(), "m0", 1, 8) => "true"
+
+verify fnMissing
+    fnMissing(0, "m0") => "false"
+    fnMissing(1, "m0") => "Rt.interp(x, s, d, rs, fi, args, m0call)"
+
+verify header
+    String.len(header([])) > 100 => true
+
+verify compile
+    String.len(compile([Mod(m = Ast.emptyModule(), size = 0, sum = 0)])) > 100 => true
+
+verify prints
+    prints([Mod(m = Ast.emptyModule(), size = 8, sum = 9)], []) => ["(8, 9)"]
+
+verify keyArms
+    keyArms(2, 0, "f#()", "") => "        0 -> f0()\n        1 -> f1()\n"
+
+verify modulesOf
+    modulesOf([], 0, []) => []
+
+verify moduleText
+    String.len(moduleText(Ast.emptyModule(), 0)) > 10 => true
+
+// ---- which functions ----
+
+fn candidates(m: Module, ind: Bool, k: Int, n: Int, acc: Map<Int, Unit>) -> Map<Int, Unit>
+    ? "Local functions whose every instruction the compiler knows, calls aside."
+    match k >= n
+        true -> acc
+        false -> candidates(m, ind, k + 1, n, candidateIf(m, ind, k, Vector.get(m.funcs, k), acc))
+
+fn candidateIf(m: Module, ind: Bool, k: Int, f: Option<Func>, acc: Map<Int, Unit>) -> Map<Int, Unit>
+    ? "Adds function k when its body is all known instructions."
+    match f
+        Option.Some(Func.Local(_, ls, code)) -> match Bool.and(allKnown(m, ind, List.fromVector(code)), localsOk(List.fromVector(ls)))
+            true -> Map.set(acc, k, Unit)
+            false -> acc
+        _ -> acc
+
+fn localsOk(ls: List<ValType>) -> Bool
+    ? "Locals the compiler can hold: no v128."
+    match ls
+        [] -> true
+        [ValType.V128, .._] -> false
+        [_, ..rest] -> localsOk(rest)
+
+fn allKnown(m: Module, ind: Bool, is: List<Instr>) -> Bool
+    ? "Whether the compiler knows every instruction."
+    match is
+        [] -> true
+        [i, ..rest] -> match known(m, ind, i)
+            true -> allKnown(m, ind, rest)
+            false -> false
+
+fn known(m: Module, ind: Bool, i: Instr) -> Bool
+    ? "Instructions the compiler writes out or sends through the interpreter; indirect calls only in a module where that is safe (ind, see indirectSafe)."
+    match i
+        Instr.CallRef(_) -> ind
+        Instr.ReturnCallRef(_) -> ind
+        Instr.CallIndirect(_, _) -> ind
+        Instr.ReturnCallIndirect(_, _) -> ind
+        Instr.TryTable(_, _, _, _, _) -> false
+        Instr.Throw(_) -> false
+        Instr.ThrowRef -> false
+        Instr.BrOnCast(_, _, _, _) -> false
+        Instr.BrOnCastFail(_, _, _, _) -> false
+        Instr.Simd(_, _, _, _, _) -> false
+        Instr.Bad(_) -> false
+        Instr.Un(o) -> numKnown(o)
+        Instr.Bin(o) -> numKnown(o)
+        Instr.GlobalGet(k) -> globalKnown(m, k)
+        Instr.GlobalSet(k) -> globalKnown(m, k)
+        _ -> true
+
+fn numKnown(o: Int) -> Bool
+    ? "Numeric instructions on scalars (not v128)."
+    List.len(Valid.numType(o).outs) == 1
+
+fn globalKnown(m: Module, k: Int) -> Bool
+    ? "A global of a scalar or reference type."
+    match Vector.get(m.globals, k)
+        Option.Some(g) -> g.ty != ValType.V128
+        Option.None -> false
+
+fn chosen(m: Module, c: Map<Int, Unit>) -> Map<Int, Unit>
+    ? "The candidates whose every call goes to a candidate, until nothing more drops out."
+    next = keepCalling(m, c, Map.keys(c), c)
+    match Map.len(next) == Map.len(c)
+        true -> c
+        false -> chosen(m, next)
+
+fn keepCalling(m: Module, c: Map<Int, Unit>, ks: List<Int>, acc: Map<Int, Unit>) -> Map<Int, Unit>
+    ? "Drops each function that calls one outside c."
+    match ks
+        [] -> acc
+        [k, ..rest] -> match callsOnly(c, List.fromVector(codeOf(m, k)))
+            true -> keepCalling(m, c, rest, acc)
+            false -> keepCalling(m, c, rest, Map.remove(acc, k))
+
+fn callsOnly(c: Map<Int, Unit>, is: List<Instr>) -> Bool
+    ? "Whether every call in the code goes to a function in c."
+    match is
+        [] -> true
+        [Instr.Call(f), ..rest] -> Bool.and(Map.has(c, f), callsOnly(c, rest))
+        [Instr.ReturnCall(f), ..rest] -> Bool.and(Map.has(c, f), callsOnly(c, rest))
+        [_, ..rest] -> callsOnly(c, rest)
+
+fn codeOf(m: Module, k: Int) -> Vector<Instr>
+    ? "The body of function k; empty for an import."
+    match Vector.get(m.funcs, k)
+        Option.Some(Func.Local(_, _, code)) -> code
+        _ -> Vector.fromList([])
+
+fn allocating(m: Module, natives: Map<Int, Unit>, ks: List<Int>, acc: Map<Int, Unit>, changed: Bool) -> Map<Int, Unit>
+    ? "The compiled functions that may allocate: those that allocate themselves or call one that may, until nothing changes."
+    match changed
+        false -> acc
+        true -> allocRound(m, natives, ks, ks, acc, false)
+
+fn allocRound(m: Module, natives: Map<Int, Unit>, all: List<Int>, ks: List<Int>, acc: Map<Int, Unit>, changed: Bool) -> Map<Int, Unit>
+    ? "One pass over the compiled functions."
+    match ks
+        [] -> allocating(m, natives, all, acc, changed)
+        [k, ..rest] -> match Bool.and(Map.has(acc, k) == false, mayAlloc(acc, List.fromVector(codeOf(m, k))))
+            true -> allocRound(m, natives, all, rest, Map.set(acc, k, Unit), true)
+            false -> allocRound(m, natives, all, rest, acc, changed)
+
+fn mayAlloc(acc: Map<Int, Unit>, is: List<Instr>) -> Bool
+    ? "Whether the code allocates or calls a function in acc."
+    match is
+        [] -> false
+        [i, ..rest] -> Bool.or(allocates(acc, i), mayAlloc(acc, rest))
+
+fn allocates(acc: Map<Int, Unit>, i: Instr) -> Bool
+    ? "Whether one instruction may allocate."
+    match i
+        Instr.Call(f) -> Map.has(acc, f)
+        Instr.ReturnCall(f) -> Map.has(acc, f)
+        _ -> allocOp(i)
+
+fn allocOp(i: Instr) -> Bool
+    ? "Instructions that put something on the heap."
+    match i
+        Instr.StructNew(_) -> true
+        Instr.StructNewDefault(_) -> true
+        Instr.ArrayNew(_) -> true
+        Instr.ArrayNewDefault(_) -> true
+        Instr.ArrayNewFixed(_, _) -> true
+        Instr.ArrayNewData(_, _) -> true
+        Instr.ArrayNewElem(_, _) -> true
+        _ -> indirect(i)
+
+fn indirect(i: Instr) -> Bool
+    ? "call_ref, call_indirect and their tail forms: they may call anything, so they may allocate and recurse."
+    match i
+        Instr.CallRef(_) -> true
+        Instr.ReturnCallRef(_) -> true
+        Instr.CallIndirect(_, _) -> true
+        Instr.ReturnCallIndirect(_, _) -> true
+        _ -> false
+
+fn anyIndirect(is: List<Instr>) -> Bool
+    ? "Whether a body calls indirectly."
+    match is
+        [] -> false
+        [i, ..rest] -> Bool.or(indirect(i), anyIndirect(rest))
+
+verify anyIndirect
+    anyIndirect([Instr.Nop, Instr.CallRef(0)]) => true
+
+// ---- when indirect calls compile ----
+
+fn tailing(m: Module, fis: List<Int>, acc: Map<Int, Unit>, changed: Bool) -> Map<Int, Unit>
+    ? "The compiled functions that may end with an indirect tail call, directly or through a tail call to one that may: their callers resolve what they return."
+    match changed
+        false -> acc
+        true -> tailRound(m, fis, fis, acc, false)
+
+fn tailRound(m: Module, all: List<Int>, fis: List<Int>, acc: Map<Int, Unit>, changed: Bool) -> Map<Int, Unit>
+    ? "One pass."
+    match fis
+        [] -> tailing(m, all, acc, changed)
+        [f, ..rest] -> match Bool.and(Map.has(acc, f) == false, endsIndirect(acc, List.fromVector(codeOf(m, f))))
+            true -> tailRound(m, all, rest, Map.set(acc, f, Unit), true)
+            false -> tailRound(m, all, rest, acc, changed)
+
+fn endsIndirect(acc: Map<Int, Unit>, is: List<Instr>) -> Bool
+    ? "Whether a body has an indirect tail call, or a tail call to a function in acc."
+    match is
+        [] -> false
+        [Instr.ReturnCallRef(_), .._] -> true
+        [Instr.ReturnCallIndirect(_, _), .._] -> true
+        [Instr.ReturnCall(f), ..rest] -> Bool.or(Map.has(acc, f), endsIndirect(acc, rest))
+        [_, ..rest] -> endsIndirect(acc, rest)
+
+verify tailing
+    tailing(Ast.emptyModule(), [], {}, true) => {}
+
+verify tailRound
+    tailRound(Ast.emptyModule(), [], [], {}, false) => {}
+
+verify endsIndirect
+    endsIndirect({}, [Instr.ReturnCallRef(0)]) => true
+    endsIndirect({2 => Unit}, [Instr.ReturnCall(2)]) => true
+    endsIndirect({}, [Instr.ReturnCall(2)]) => false
+
+fn exportsClosed(m: Module, es: List<Export>) -> Bool
+    ? "Whether no other instance can put a function reference where this one finds it: no table or global is exported, and no exported function takes a reference into the function hierarchy."
+    match es
+        [] -> true
+        [e, ..rest] -> match e.kind
+            0 -> Bool.and(noFuncParams(m, Ast.funcParams(m, typeOfFn(m, e.index))), exportsClosed(m, rest))
+            1 -> false
+            3 -> false
+            _ -> exportsClosed(m, rest)
+
+fn noFuncParams(m: Module, ts: List<ValType>) -> Bool
+    ? "Whether none of the types is a function reference."
+    match ts
+        [] -> true
+        [ValType.Ref(_, h), ..rest] -> Bool.and(isFuncHeap(m, h) == false, noFuncParams(m, rest))
+        [_, ..rest] -> noFuncParams(m, rest)
+
+fn isFuncHeap(m: Module, h: Int) -> Bool
+    ? "Whether a heap type is func, nofunc or a function type."
+    match h < 0
+        true -> Bool.or(h == -16, h == -13)
+        false -> match Ast.funcType(m, h)
+            Comp.FuncT(_, _) -> true
+            _ -> false
+
+verify exportsClosed
+    exportsClosed(Ast.emptyModule(), [Export(name = "t", kind = 1, index = 0)]) => false
+    exportsClosed(Ast.emptyModule(), []) => true
+
+verify noFuncParams
+    noFuncParams(Ast.emptyModule(), [ValType.Ref(true, -16)]) => false
+    noFuncParams(Ast.emptyModule(), [ValType.Ref(true, -18), ValType.I32]) => true
+
+verify isFuncHeap
+    isFuncHeap(Ast.emptyModule(), -13) => true
+
+fn indirectSafe(m: Module) -> Bool
+    ? "Whether compiled code may call indirectly: the module imports only Aver's host functions and has no exceptions, so no reference can come from another instance and no exception can cross a compiled frame, and no function a reference can be taken to may reach the host, which compiled code cannot stop for."
+    match Bool.and(Bool.and(importsHostOnly(m.imports), List.len(m.tags) == 0), exportsClosed(m, m.exports))
+        false -> false
+        true -> noneReach(hostReaching(m, direct(m, 0, Vector.len(m.funcs), {})), taken(m))
+
+fn importsHostOnly(is: List<Import>) -> Bool
+    ? "Every import a function from the aver module."
+    match is
+        [] -> true
+        [i, ..rest] -> Bool.and(Bool.and(i.mod == "aver", i.kind == 0), importsHostOnly(rest))
+
+fn noneReach(h: Map<Int, Unit>, ks: List<Int>) -> Bool
+    ? "Whether none of ks is in h."
+    match ks
+        [] -> true
+        [k, ..rest] -> Bool.and(Map.has(h, k) == false, noneReach(h, rest))
+
+fn direct(m: Module, k: Int, n: Int, acc: Map<Int, Unit>) -> Map<Int, Unit>
+    ? "The imports, and the functions that call one directly."
+    match k >= n
+        true -> acc
+        false -> direct(m, k + 1, n, directOne(m, k, acc))
+
+fn directOne(m: Module, k: Int, acc: Map<Int, Unit>) -> Map<Int, Unit>
+    ? "Adds function k when it is an import or calls one."
+    match Vector.get(m.funcs, k)
+        Option.Some(Func.Imported(_, _, _)) -> Map.set(acc, k, Unit)
+        Option.Some(Func.Local(_, _, code)) -> match callsAny(m, List.fromVector(code))
+            true -> Map.set(acc, k, Unit)
+            false -> acc
+        Option.None -> acc
+
+fn callsAny(m: Module, is: List<Instr>) -> Bool
+    ? "Whether a body calls an import."
+    match is
+        [] -> false
+        [Instr.Call(f), ..rest] -> Bool.or(isImport(m, f), callsAny(m, rest))
+        [Instr.ReturnCall(f), ..rest] -> Bool.or(isImport(m, f), callsAny(m, rest))
+        [_, ..rest] -> callsAny(m, rest)
+
+fn isImport(m: Module, f: Int) -> Bool
+    ? "Whether function f is imported."
+    match Vector.get(m.funcs, f)
+        Option.Some(Func.Imported(_, _, _)) -> true
+        _ -> false
+
+fn hostReaching(m: Module, h: Map<Int, Unit>) -> Map<Int, Unit>
+    ? "The functions that may reach the host: those in h, those calling one of them, and those calling indirectly when a function a reference can be taken to does; until nothing is added."
+    next = reachRound(m, taken(m), h, 0, Vector.len(m.funcs), h)
+    match Map.len(next) == Map.len(h)
+        true -> h
+        false -> hostReaching(m, next)
+
+fn reachRound(m: Module, tk: List<Int>, h: Map<Int, Unit>, k: Int, n: Int, acc: Map<Int, Unit>) -> Map<Int, Unit>
+    ? "One round over the functions."
+    match k >= n
+        true -> acc
+        false -> reachRound(m, tk, h, k + 1, n, reachOne(m, tk, h, k, acc))
+
+fn reachOne(m: Module, tk: List<Int>, h: Map<Int, Unit>, k: Int, acc: Map<Int, Unit>) -> Map<Int, Unit>
+    ? "Adds function k when it may reach the host through h."
+    code = List.fromVector(codeOf(m, k))
+    match Bool.or(callsInto(h, code), Bool.and(anyIndirect(code), noneReach(h, tk) == false))
+        true -> Map.set(acc, k, Unit)
+        false -> acc
+
+fn callsInto(h: Map<Int, Unit>, is: List<Instr>) -> Bool
+    ? "Whether a body calls a function in h."
+    match is
+        [] -> false
+        [Instr.Call(f), ..rest] -> Bool.or(Map.has(h, f), callsInto(h, rest))
+        [Instr.ReturnCall(f), ..rest] -> Bool.or(Map.has(h, f), callsInto(h, rest))
+        [_, ..rest] -> callsInto(h, rest)
+
+fn taken(m: Module) -> List<Int>
+    ? "The functions a reference can be taken to: ref.func anywhere, in bodies, globals, tables and element segments."
+    funcRefsIn(List.concat(bodiesOf(List.fromVector(m.funcs), []), List.concat(globalInits(List.fromVector(m.globals), []), List.concat(m.tableInits, elemItems(List.fromVector(m.elems), [])))), [])
+
+fn bodiesOf(fs: List<Func>, acc: List<Vector<Instr>>) -> List<Vector<Instr>>
+    ? "Every local body."
+    match fs
+        [] -> acc
+        [Func.Local(_, _, code), ..rest] -> bodiesOf(rest, List.prepend(code, acc))
+        [_, ..rest] -> bodiesOf(rest, acc)
+
+fn globalInits(gs: List<Global>, acc: List<Vector<Instr>>) -> List<Vector<Instr>>
+    ? "Every global's initializer."
+    match gs
+        [] -> acc
+        [gl, ..rest] -> globalInits(rest, List.prepend(gl.init, acc))
+
+fn elemItems(es: List<Elem>, acc: List<Vector<Instr>>) -> List<Vector<Instr>>
+    ? "Every element segment's items."
+    match es
+        [] -> acc
+        [e, ..rest] -> elemItems(rest, List.concat(e.items, acc))
+
+fn funcRefsIn(cs: List<Vector<Instr>>, acc: List<Int>) -> List<Int>
+    ? "The functions ref.func names in these bodies."
+    match cs
+        [] -> acc
+        [c, ..rest] -> funcRefsIn(rest, refFuncs(List.fromVector(c), acc))
+
+fn refFuncs(is: List<Instr>, acc: List<Int>) -> List<Int>
+    ? "The functions ref.func names in one body."
+    match is
+        [] -> acc
+        [Instr.RefFunc(k), ..rest] -> refFuncs(rest, List.prepend(k, acc))
+        [_, ..rest] -> refFuncs(rest, acc)
+
+verify indirectSafe
+    indirectSafe(Ast.emptyModule()) => true
+
+verify importsHostOnly
+    importsHostOnly([Import(mod = "aver", name = "p", kind = 0, index = 0, lo = 0, hi = 0, hasMax = false)]) => true
+    importsHostOnly([Import(mod = "spectest", name = "p", kind = 0, index = 0, lo = 0, hi = 0, hasMax = false)]) => false
+
+verify noneReach
+    noneReach({1 => Unit}, [2, 1]) => false
+
+verify direct
+    direct(Ast.emptyModule(), 0, 0, {}) => {}
+
+verify directOne
+    directOne(Ast.emptyModule(), 0, {}) => {}
+
+verify callsAny
+    callsAny(Ast.emptyModule(), [Instr.Call(0)]) => false
+
+verify isImport
+    isImport(Ast.emptyModule(), 0) => false
+
+verify hostReaching
+    hostReaching(Ast.emptyModule(), {}) => {}
+
+verify reachRound
+    reachRound(Ast.emptyModule(), [], {}, 0, 0, {}) => {}
+
+verify reachOne
+    reachOne(Ast.emptyModule(), [], {}, 0, {}) => {}
+
+verify callsInto
+    callsInto({3 => Unit}, [Instr.ReturnCall(3)]) => true
+
+verify taken
+    taken(Ast.emptyModule()) => []
+
+verify bodiesOf
+    bodiesOf([Func.Imported("a", "b", 0)], []) => []
+
+verify globalInits
+    globalInits([], []) => []
+
+verify elemItems
+    elemItems([], []) => []
+
+verify funcRefsIn
+    funcRefsIn([Vector.fromList([Instr.RefFunc(4), Instr.Drop])], []) => [4]
+
+verify refFuncs
+    refFuncs([Instr.RefFunc(1), Instr.RefFunc(2)], []) => [2, 1]
+
+verify indirect
+    indirect(Instr.CallIndirect(0, 0)) => true
+    indirect(Instr.Nop) => false
+
+verify candidates
+    candidates(Ast.emptyModule(), false, 0, 0, {}) => {}
+
+verify candidateIf
+    candidateIf(Ast.emptyModule(), false, 0, Option.Some(Func.Local(0, Vector.fromList([]), Vector.fromList([Instr.End]))), {}) => {0 => Unit}
+    candidateIf(Ast.emptyModule(), false, 0, Option.Some(Func.Local(0, Vector.fromList([ValType.V128]), Vector.fromList([Instr.End]))), {}) => {}
+
+verify localsOk
+    localsOk([ValType.I32]) => true
+
+verify allKnown
+    allKnown(Ast.emptyModule(), false, [Instr.Throw(0)]) => false
+
+verify known
+    known(Ast.emptyModule(), false, Instr.Nop) => true
+    known(Ast.emptyModule(), false, Instr.CallRef(0)) => false
+    known(Ast.emptyModule(), true, Instr.CallRef(0)) => true
+
+verify numKnown
+    numKnown(106) => true
+
+verify globalKnown
+    globalKnown(Ast.emptyModule(), 0) => false
+
+verify chosen
+    chosen(Ast.emptyModule(), {}) => {}
+
+verify keepCalling
+    keepCalling(Ast.emptyModule(), {}, [], {}) => {}
+
+verify callsOnly
+    callsOnly({1 => Unit}, [Instr.Call(1)]) => true
+    callsOnly({1 => Unit}, [Instr.Call(2)]) => false
+
+verify codeOf
+    Vector.len(codeOf(Ast.emptyModule(), 0)) => 0
+
+verify allocating
+    allocating(Ast.emptyModule(), {}, [], {}, true) => {}
+
+verify allocRound
+    allocRound(Ast.emptyModule(), {}, [], [], {}, false) => {}
+
+verify mayAlloc
+    mayAlloc({}, [Instr.StructNew(0)]) => true
+    mayAlloc({2 => Unit}, [Instr.Call(2)]) => true
+
+verify allocates
+    allocates({}, Instr.Call(1)) => false
+
+verify allocOp
+    allocOp(Instr.ArrayLen) => false
+
+// ---- functions ----
+
+fn functionsOf(m: Module, pre: String, fis: List<Int>, natives: Map<Int, Unit>, allocs: Map<Int, Unit>, tails: Map<Int, Unit>, recs: Map<Int, Unit>, acc: List<String>) -> List<String>
+    ? "The text of every compiled function."
+    match fis
+        [] -> List.reverse(acc)
+        [f, ..rest] -> functionsOf(m, pre, rest, natives, allocs, tails, recs, List.prepend(compileFn(m, pre, f, natives, allocs, tails, Map.has(recs, f)), acc))
+
+fn compileFn(m: Module, pre: String, fi: Int, natives: Map<Int, Unit>, allocs: Map<Int, Unit>, tails: Map<Int, Unit>, rec: Bool) -> String
+    ? "Compiled function fi: its body and the functions its body was cut into; a recursive one (rec) checks how deep the calls go before its body, which nothing else can make unbounded."
+    t = typeOfFn(m, fi)
+    ps = Ast.funcParams(m, t)
+    ls = localsOf(m, fi)
+    cx = Cx(m = m, pre = pre, fi = fi, code = codeOf(m, fi), ltys = List.concat(ps, ls), res = Ast.funcResults(m, t), natives = natives, allocs = allocs, tails = tails, live = liveness(codeOf(m, fi)))
+    pnames = names("p", List.len(ps), 0, [])
+    st = St(ls = List.concat(exprs(pnames, ps, []), defaultsOf(ls, [])), stk = [], s = "s", top = true, ind = 4)
+    o = seq(cx, 0, st, [Lab(kind = 3, name = "", tys = cx.res, below = [], keep = [])], Gl(n = 0, fns = [], alias = []))
+    unaliased(headOf(rec, pre, fi, ps, pnames) + "(x: Inst, s: Store, d: Int, rs: List<Val>{paramList(pnames, ps)}) -> R\n    ? \"Body.\"\n    " + o.t + "\n\n" + String.join(List.reverse(o.g.fns), ""), o.g.alias, o.g.alias)
+
+fn headOf(rec: Bool, pre: String, fi: Int, ps: List<ValType>, pnames: List<String>) -> String
+    ? "Where a body begins: a recursive function's after its depth check."
+    match rec
+        true -> check(pre, fi, ps, pnames) + "fn {pre}w{fi}b"
+        false -> "fn {pre}w{fi}"
+
+verify headOf
+    headOf(false, "m0", 3, [], []) => "fn m0w3"
+
+fn entry(m: Module, pre: String, fi: Int, ind: Int) -> String
+    ? "The dispatcher's arm for function fi: its arguments taken from the list, unboxed."
+    ps = Ast.funcParams(m, typeOfFn(m, fi))
+    an = names("a", List.len(ps), 0, [])
+    "match args\n{sp(ind + 4)}[{String.join(an, ", ")}] -> {pre}w{fi}(x, s, d, rs{argList(an, ps)})\n{sp(ind + 4)}_ -> R.Trap(\"wrong arguments\", s)"
+
+fn argList(ns: List<String>, ts: List<ValType>) -> String
+    ? "Arguments unboxed for their types, each after a comma."
+    match ns
+        [] -> ""
+        [n, ..rest] -> ", " + unboxed(n, firstTy(ts)) + argList(rest, List.drop(ts, 1))
+
+fn check(pre: String, fi: Int, ps: List<ValType>, pnames: List<String>) -> String
+    ? "The function itself: the depth check, then its body."
+    "fn {pre}w{fi}(x: Inst, s: Store, d: Int, rs: List<Val>{paramList(pnames, ps)}) -> R\n    ? \"Compiled function {fi}.\"\n    match Rt.deep(d)\n        true -> R.Trap(\"call stack exhausted\", s)\n        false -> {pre}w{fi}b(x, s, d, rs{commaList(pnames)})\n\n"
+
+fn typeOfFn(m: Module, fi: Int) -> Int
+    ? "The type index of function fi."
+    match Vector.get(m.funcs, fi)
+        Option.Some(Func.Local(t, _, _)) -> t
+        Option.Some(Func.Imported(_, _, t)) -> t
+        Option.None -> -1
+
+fn localsOf(m: Module, fi: Int) -> List<ValType>
+    ? "The declared locals of function fi, beyond its parameters (the decoded locals start with them)."
+    match Vector.get(m.funcs, fi)
+        Option.Some(Func.Local(t, ls, _)) -> List.drop(List.fromVector(ls), List.len(Ast.funcParams(m, t)))
+        _ -> []
+
+fn names(p: String, n: Int, k: Int, acc: List<String>) -> List<String>
+    ? "p0 .. p(n-1)."
+    match k >= n
+        true -> List.reverse(acc)
+        false -> names(p, n, k + 1, List.prepend("{p}{k}", acc))
+
+fn exprs(ns: List<String>, ts: List<ValType>, acc: List<E>) -> List<E>
+    ? "Names paired with their types."
+    match ns
+        [] -> List.reverse(acc)
+        [n, ..rest] -> exprs(rest, List.drop(ts, 1), List.prepend(E(c = n, t = firstTy(ts)), acc))
+
+fn firstTy(ts: List<ValType>) -> ValType
+    ? "The first type of a list."
+    match ts
+        [t, .._] -> t
+        [] -> ValType.I32
+
+fn defaultsOf(ts: List<ValType>, acc: List<E>) -> List<E>
+    ? "Each declared local at its default."
+    match ts
+        [] -> List.reverse(acc)
+        [t, ..rest] -> defaultsOf(rest, List.prepend(E(c = defaultText(t), t = t), acc))
+
+fn defaultText(t: ValType) -> String
+    ? "The default of a type, as compiled code holds it."
+    match t
+        ValType.I32 -> "Rt.zero32()"
+        ValType.I64 -> "Rt.zero64()"
+        ValType.F32 -> "Val.F32(0.0)"
+        ValType.F64 -> "Val.F64(0.0)"
+        ValType.V128 -> "Val.V128(0)"
+        ValType.I8 -> "Val.I32(0)"
+        ValType.I16 -> "Val.I32(0)"
+        ValType.Ref(_, _) -> "Val.Null"
+
+fn paramList(ns: List<String>, ts: List<ValType>) -> String
+    ? "Typed parameters, each after a comma."
+    match ns
+        [] -> ""
+        [n, ..rest] -> ", {n}: {repr(firstTy(ts))}" + paramList(rest, List.drop(ts, 1))
+
+fn commaList(ns: List<String>) -> String
+    ? "Names, each after a comma."
+    match ns
+        [] -> ""
+        [n, ..rest] -> ", {n}" + commaList(rest)
+
+fn repr(t: ValType) -> String
+    ? "How compiled code holds a value of type t."
+    match t
+        ValType.I32 -> "W32"
+        ValType.I64 -> "W64"
+        _ -> "Val"
+
+fn isInt(t: ValType) -> Bool
+    ? "Whether compiled code holds a type as an Int."
+    match t
+        ValType.I32 -> true
+        ValType.I64 -> true
+        _ -> false
+
+fn boxed(e: E) -> String
+    ? "A value as a Val."
+    match e.t
+        ValType.I32 -> "Rt.val32({e.c})"
+        ValType.I64 -> "Rt.val64({e.c})"
+        _ -> e.c
+
+fn unboxed(c: String, t: ValType) -> String
+    ? "A Val read as compiled code holds type t."
+    match t
+        ValType.I32 -> "Rt.of32({c})"
+        ValType.I64 -> "Rt.of64({c})"
+        _ -> c
+
+verify compileFn
+    String.len(compileFn(Ast.emptyModule(), "m0", 0, {}, {}, {}, true)) > 10 => true
+
+verify entry
+    entry(Ast.emptyModule(), "m0", 1, 8) => "match args\n            [] -> m0w1(x, s, d, rs)\n            _ -> R.Trap(\"wrong arguments\", s)"
+
+verify argList
+    argList(["a"], [ValType.F64]) => ", a"
+
+verify check
+    String.len(check("m0", 1, [], [])) > 10 => true
+
+verify typeOfFn
+    typeOfFn(Ast.emptyModule(), 0) => -1
+
+verify localsOf
+    localsOf(Ast.emptyModule(), 0) => []
+
+verify names
+    names("p", 2, 0, []) => ["p0", "p1"]
+
+verify exprs
+    exprs(["a"], [ValType.I64], []) => [E(c = "a", t = ValType.I64)]
+
+verify firstTy
+    firstTy([]) => ValType.I32
+
+verify defaultsOf
+    defaultsOf([ValType.F64], []) => [E(c = "Val.F64(0.0)", t = ValType.F64)]
+
+verify defaultText
+    defaultText(ValType.Ref(true, -18)) => "Val.Null"
+
+verify paramList
+    paramList(["p0", "p1"], [ValType.I32, ValType.F64]) => ", p0: W32, p1: Val"
+
+verify commaList
+    commaList(["a", "b"]) => ", a, b"
+
+verify repr
+    repr(ValType.I64) => "W64"
+
+verify isInt
+    isInt(ValType.F32) => false
+
+verify boxed
+    boxed(E(c = "v1", t = ValType.I64)) => "Rt.val64(v1)"
+
+verify unboxed
+    unboxed("v", ValType.I32) => "Rt.of32(v)"
+
+// ---- state ----
+
+fn push(st: St, e: E) -> St
+    ? "A value pushed."
+    St.update(st, stk = List.prepend(e, st.stk))
+
+fn pop1(st: St) -> E
+    ? "The value on top."
+    match st.stk
+        [e, .._] -> e
+        [] -> E(c = "0", t = ValType.I32)
+
+fn popped(st: St, n: Int) -> St
+    ? "n values taken off."
+    St.update(st, stk = List.drop(st.stk, n))
+
+fn topN(st: St, n: Int) -> List<E>
+    ? "The top n values in the order they were pushed."
+    List.reverse(List.take(st.stk, n))
+
+fn nthE(es: List<E>, k: Int) -> E
+    ? "Entry k."
+    match List.drop(es, k)
+        [e, .._] -> e
+        [] -> E(c = "0", t = ValType.I32)
+
+fn setNth(es: List<E>, k: Int, e: E) -> List<E>
+    ? "Entry k replaced."
+    List.concat(List.take(es, k), List.prepend(e, List.drop(es, k + 1)))
+
+fn fresh(g: Gl) -> Gl
+    ? "The counter moved on."
+    Gl.update(g, n = g.n + 1)
+
+fn sp(n: Int) -> String
+    ? "n spaces."
+    match n <= 0
+        true -> ""
+        false -> "    " + sp(n - 4)
+
+fn cond(c: String) -> String
+    ? "An i32 condition as a Bool: a comparison made an i32 is used as it is."
+    match Bool.and(String.startsWith(c, "Rt.b("), String.endsWith(c, ")"))
+        true -> String.slice(c, 5, String.len(c) - 1)
+        false -> "Rt.nz32({c})"
+
+fn simple(c: String) -> Bool
+    ? "Whether an expression is a name or a literal, cheap to repeat."
+    Bool.and(String.len(c) < 24, Bool.and(String.contains(c, "(") == false, String.contains(c, " ") == false))
+
+verify push
+    push(St(ls = [], stk = [], s = "s", top = true, ind = 4), E(c = "1", t = ValType.I32)).stk => [E(c = "1", t = ValType.I32)]
+
+verify pop1
+    pop1(St(ls = [], stk = [], s = "s", top = true, ind = 4)) => E(c = "0", t = ValType.I32)
+
+verify popped
+    popped(St(ls = [], stk = [E(c = "1", t = ValType.I32)], s = "s", top = true, ind = 4), 1).stk => []
+
+verify topN
+    topN(St(ls = [], stk = [E(c = "b", t = ValType.I32), E(c = "a", t = ValType.I32)], s = "s", top = true, ind = 4), 2) => [E(c = "a", t = ValType.I32), E(c = "b", t = ValType.I32)]
+
+verify nthE
+    nthE([E(c = "a", t = ValType.I32)], 0) => E(c = "a", t = ValType.I32)
+
+verify setNth
+    setNth([E(c = "a", t = ValType.I32), E(c = "b", t = ValType.I32)], 1, E(c = "c", t = ValType.I32)) => [E(c = "a", t = ValType.I32), E(c = "c", t = ValType.I32)]
+
+verify fresh
+    fresh(Gl(n = 1, fns = [], alias = [])).n => 2
+
+verify sp
+    sp(8) => "        "
+
+verify cond
+    cond("Rt.b(a < b)") => "a < b"
+    cond("v1") => "Rt.nz32(v1)"
+
+verify simple
+    simple("v12") => true
+    simple("Num.wrap32(v1 + v2)") => false
+
+// ---- binding values ----
+
+fn letPre(st: St, g: Gl, v: String, e: String) -> Pre
+    ? "Binds v to e: a plain binding at the top of a function, else a match with one arm, the rest of the code in it."
+    match st.top
+        true -> Pre(t = "{v} = {e}\n{sp(st.ind)}", st = st, g = g)
+        false -> Pre(t = "match {e}\n{sp(st.ind + 4)}{v} -> ", st = St.update(st, ind = st.ind + 8), g = g)
+
+fn bindTo(cx: Cx, pc: Int, st: St, labs: List<Lab>, g: Gl, e: String, t: ValType) -> Out
+    ? "Pushes e, bound to a fresh name unless it is cheap to repeat, and goes on."
+    match simple(e)
+        true -> seq(cx, pc + 1, push(st, E(c = e, t = t)), labs, g)
+        false -> bindFresh(cx, pc, st, labs, fresh(g), "v{g.n}", e, t)
+
+fn bindFresh(cx: Cx, pc: Int, st: St, labs: List<Lab>, g: Gl, v: String, e: String, t: ValType) -> Out
+    ? "Binds e to v, pushes v and goes on."
+    p = letPre(st, g, v, e)
+    o = seq(cx, pc + 1, push(p.st, E(c = v, t = t)), labs, p.g)
+    Out(t = p.t + o.t, g = o.g)
+
+fn split(cx: Cx, pc: Int, st: St, labs: List<Lab>, g: Gl, subject: String, okPat: String, okSt: St, errPat: String, errText: String) -> Out
+    ? "A match on subject: the code goes on in the first arm with okSt, the second ends with errText."
+    inner = St.update(okSt, top = false, ind = st.ind + 8)
+    o = seq(cx, pc + 1, inner, labs, g)
+    Out(t = "match {subject}\n{sp(st.ind + 4)}{okPat} -> " + o.t + "\n{sp(st.ind + 4)}{errPat} -> {errText}", g = o.g)
+
+verify letPre
+    letPre(St(ls = [], stk = [], s = "s", top = true, ind = 4), Gl(n = 0, fns = [], alias = []), "v0", "f(x)").t => "v0 = f(x)\n    "
+    letPre(St(ls = [], stk = [], s = "s", top = false, ind = 4), Gl(n = 0, fns = [], alias = []), "v0", "f(x)").t => "match f(x)\n        v0 -> "
+
+verify bindTo
+    String.len(bindTo(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.End]), ltys = [], res = [ValType.I32], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), -1, St(ls = [], stk = [], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [ValType.I32], below = [], keep = [])], Gl(n = 0, fns = [], alias = []), "f(x)", ValType.I32).t) > 0 => true
+
+verify bindFresh
+    bindFresh(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.End]), ltys = [], res = [ValType.I32], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), -1, St(ls = [], stk = [], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [ValType.I32], below = [], keep = [])], Gl(n = 0, fns = [], alias = []), "v0", "f(x)", ValType.I32).t => "v0 = f(x)\n    R.V1(Rt.val32(v0), s)"
+
+verify split
+    String.len(split(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.End]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), -1, St(ls = [], stk = [], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [], below = [], keep = [])], Gl(n = 0, fns = [], alias = []), "c", "true", St(ls = [], stk = [], s = "s", top = true, ind = 4), "false", "x").t) > 0 => true
+
+// ---- the walk ----
+
+fn seq(cx: Cx, pc: Int, st: St, labs: List<Lab>, g: Gl) -> Out
+    ? "The code from pc to the end of the innermost construct that has a function or an arm of its own; nested too deep (rustc's parser has a limit), the rest goes into a function of its own."
+    match st.ind > maxIndent()
+        true -> cut(cx, pc, st, labs, fresh(g), "{cx.pre}w{cx.fi}_{g.n}")
+        false -> match Vector.get(cx.code, pc)
+            Option.None -> Out(t = returned(cx, st), g = g)
+            Option.Some(i) -> one(cx, pc, i, st, labs, g)
+
+fn maxIndent() -> Int
+    ? "How deep compiled code nests before the rest is cut off into a function."
+    120
+
+fn cut(cx: Cx, pc: Int, st: St, labs: List<Lab>, g: Gl, name: String) -> Out
+    ? "A call to a function that runs the code from pc on, taking the locals and the whole stack."
+    l = Lab(kind = 1, name = name, tys = [], below = List.reverse(typesOf(st.stk)), keep = liveAt(cx, pc))
+    Out(t = jumpTo(st, l), g = joinFn(cx, pc, l, labs, g))
+
+fn one(cx: Cx, pc: Int, i: Instr, st: St, labs: List<Lab>, g: Gl) -> Out
+    ? "One instruction and everything after it."
+    match i
+        Instr.Nop -> seq(cx, pc + 1, st, labs, g)
+        Instr.LocalGet(k) -> seq(cx, pc + 1, push(st, nthE(st.ls, k)), labs, g)
+        Instr.LocalSet(k) -> setLocal(cx, pc, k, false, st, labs, g)
+        Instr.LocalTee(k) -> setLocal(cx, pc, k, true, st, labs, g)
+        Instr.I32Const(c) -> seq(cx, pc + 1, push(st, E(c = "Rt.w32({lit(c)})", t = ValType.I32)), labs, g)
+        Instr.I64Const(c) -> seq(cx, pc + 1, push(st, E(c = "Rt.w64({lit(c)})", t = ValType.I64)), labs, g)
+        Instr.F32Const(c) -> seq(cx, pc + 1, push(st, E(c = "Num.f32Val({lit(c)})", t = ValType.F32)), labs, g)
+        Instr.F64Const(c) -> seq(cx, pc + 1, push(st, E(c = "Num.f64Val({lit(c)})", t = ValType.F64)), labs, g)
+        Instr.Drop -> seq(cx, pc + 1, popped(st, 1), labs, g)
+        Instr.Un(o) -> numeric(cx, pc, o, st, labs, g)
+        Instr.Bin(o) -> numeric(cx, pc, o, st, labs, g)
+        Instr.End -> endOf(cx, pc, st, labs, g)
+        Instr.Else -> Out(t = fallOut(cx, st, labs), g = g)
+        _ -> control(cx, pc, i, st, labs, g)
+
+fn control(cx: Cx, pc: Int, i: Instr, st: St, labs: List<Lab>, g: Gl) -> Out
+    ? "Blocks, branches, calls and returns."
+    match i
+        Instr.Block(_, _, end, sg) -> block(cx, pc, end, sg, st, labs, g)
+        Instr.Loop(_, sg) -> loop(cx, pc, sg, st, labs, g)
+        Instr.If(_, _, els, end, sg) -> ifThen(cx, pc, els, end, sg, st, labs, g)
+        Instr.Br(d) -> Out(t = branchTo(cx, st, labs, d), g = g)
+        Instr.BrIf(d) -> brIf(cx, pc, d, st, labs, g)
+        Instr.BrTable(ls, d) -> Out(t = brTable(cx, popped(st, 1), labs, pop1(st).c, List.fromVector(ls), d), g = g)
+        Instr.Return -> Out(t = returned(cx, st), g = g)
+        Instr.Unreachable -> Out(t = "R.Trap(\"unreachable\", {st.s})", g = g)
+        Instr.Call(f) -> callOf(cx, pc, f, false, st, labs, g)
+        Instr.ReturnCall(f) -> callOf(cx, pc, f, true, st, labs, g)
+        Instr.CallRef(t) -> callVia(cx, pc, t, -1, false, st, labs, g)
+        Instr.ReturnCallRef(t) -> callVia(cx, pc, t, -1, true, st, labs, g)
+        Instr.CallIndirect(t, tb) -> callVia(cx, pc, t, tb, false, st, labs, g)
+        Instr.ReturnCallIndirect(t, tb) -> callVia(cx, pc, t, tb, true, st, labs, g)
+        Instr.BrOnNull(d) -> brOnNull(cx, pc, d, true, st, labs, g)
+        Instr.BrOnNonNull(d) -> brOnNull(cx, pc, d, false, st, labs, g)
+        _ -> refs(cx, pc, i, st, labs, g)
+
+fn refs(cx: Cx, pc: Int, i: Instr, st: St, labs: List<Lab>, g: Gl) -> Out
+    ? "References, selects and globals."
+    match i
+        Instr.RefNull(_) -> seq(cx, pc + 1, push(st, E(c = "Val.Null", t = anyRef())), labs, g)
+        Instr.RefIsNull -> seq(cx, pc + 1, push(popped(st, 1), E(c = "Rt.b(Value.isNull({pop1(st).c}))", t = ValType.I32)), labs, g)
+        Instr.RefFunc(k) -> seq(cx, pc + 1, push(st, E(c = "Val.Func(x.base + {k})", t = anyRef())), labs, g)
+        Instr.AnyConvertExtern -> seq(cx, pc + 1, st, labs, g)
+        Instr.ExternConvertAny -> seq(cx, pc + 1, st, labs, g)
+        Instr.Select -> selectOf(cx, pc, st, labs, g)
+        Instr.SelectT(_) -> selectOf(cx, pc, st, labs, g)
+        Instr.GlobalGet(k) -> bindTo(cx, pc, st, labs, g, unboxed("Rt.global(x, {st.s}, {k})", globalTy(cx.m, k)), globalTy(cx.m, k))
+        Instr.GlobalSet(k) -> newStore(cx, pc, popped(st, 1), labs, g, "Rt.setGlobal(x, {st.s}, {k}, {boxed(pop1(st))})")
+        _ -> heap(cx, pc, i, st, labs, g)
+
+fn lit(c: Int) -> String
+    ? "An integer literal, parenthesised when negative."
+    match c < 0
+        true -> "({c})"
+        false -> "{c}"
+
+fn anyRef() -> ValType
+    ? "A reference type for a value whose exact type does not matter here."
+    ValType.Ref(true, -18)
+
+fn globalTy(m: Module, k: Int) -> ValType
+    ? "The type of global k."
+    match Vector.get(m.globals, k)
+        Option.Some(gl) -> gl.ty
+        Option.None -> ValType.I32
+
+verify maxIndent
+    maxIndent() => 120
+
+verify cut
+    cut(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.End]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, St(ls = [], stk = [], s = "s", top = false, ind = 200), [Lab(kind = 3, name = "", tys = [], below = [], keep = [])], Gl(n = 0, fns = [], alias = []), "w0_9").t => "w0_9(x, Rt.st(s), d, rs)"
+
+verify seq
+    seq(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.I32Const(2), Instr.End]), ltys = [], res = [ValType.I32], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, St(ls = [], stk = [], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [ValType.I32], below = [], keep = [])], Gl(n = 0, fns = [], alias = [])).t => "R.V1(Rt.val32(Rt.w32(2)), s)"
+
+verify one
+    one(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.End]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, Instr.Unreachable, St(ls = [], stk = [], s = "s", top = true, ind = 4), [], Gl(n = 0, fns = [], alias = [])).t => "R.Trap(\"unreachable\", s)"
+
+verify control
+    control(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, Instr.Return, St(ls = [], stk = [], s = "s", top = true, ind = 4), [], Gl(n = 0, fns = [], alias = [])).t => "R.V0(s)"
+
+verify refs
+    refs(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.End]), ltys = [], res = [ValType.I32], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, Instr.RefIsNull, St(ls = [], stk = [E(c = "r", t = ValType.Ref(true, -18))], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [ValType.I32], below = [], keep = [])], Gl(n = 0, fns = [], alias = [])).t => "R.V1(Rt.val32(Rt.b(Value.isNull(r))), s)"
+
+verify lit
+    lit(-3) => "(-3)"
+
+verify anyRef
+    anyRef() => ValType.Ref(true, -18)
+
+verify globalTy
+    globalTy(Ast.emptyModule(), 0) => ValType.I32
+
+// ---- locals ----
+
+fn setLocal(cx: Cx, pc: Int, k: Int, tee: Bool, st: St, labs: List<Lab>, g: Gl) -> Out
+    ? "local.set and local.tee: a cheap value goes in as it is, anything else is bound first, so it is computed once."
+    e = pop1(st)
+    match simple(e.c)
+        true -> seq(cx, pc + 1, keptIf(tee, St.update(popped(st, 1), ls = setNth(st.ls, k, e)), e), labs, g)
+        false -> setBound(cx, pc, k, tee, st, labs, fresh(g), E(c = "v{g.n}", t = e.t), e.c)
+
+fn setBound(cx: Cx, pc: Int, k: Int, tee: Bool, st: St, labs: List<Lab>, g: Gl, v: E, e: String) -> Out
+    ? "Binds the value, then sets the local to the name."
+    p = letPre(popped(st, 1), g, v.c, e)
+    o = seq(cx, pc + 1, keptIf(tee, St.update(p.st, ls = setNth(p.st.ls, k, v)), v), labs, p.g)
+    Out(t = p.t + o.t, g = o.g)
+
+fn keptIf(tee: Bool, st: St, e: E) -> St
+    ? "local.tee leaves the value on the stack."
+    match tee
+        true -> push(st, e)
+        false -> st
+
+verify setLocal
+    setLocal(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.LocalSet(0), Instr.LocalGet(0), Instr.End]), ltys = [ValType.I32], res = [ValType.I32], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, 0, false, St(ls = [E(c = "0", t = ValType.I32)], stk = [E(c = "Rt.add32(a, b)", t = ValType.I32)], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [ValType.I32], below = [], keep = [])], Gl(n = 0, fns = [], alias = [])).t => "v0 = Rt.add32(a, b)\n    R.V1(Rt.val32(v0), s)"
+
+verify setBound
+    String.len(setBound(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.End, Instr.End]), ltys = [ValType.I32], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, 0, false, St(ls = [E(c = "0", t = ValType.I32)], stk = [E(c = "f(a)", t = ValType.I32)], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [], below = [], keep = [])], Gl(n = 0, fns = [], alias = []), E(c = "v0", t = ValType.I32), "f(a)").t) > 0 => true
+
+verify keptIf
+    keptIf(false, St(ls = [], stk = [], s = "s", top = true, ind = 4), E(c = "a", t = ValType.I32)).stk => []
+
+// ---- numbers ----
+
+fn numeric(cx: Cx, pc: Int, o: Int, st: St, labs: List<Lab>, g: Gl) -> Out
+    ? "A numeric instruction: the common integer ones written out, the others through Num; only those that can trap need a match."
+    ty = Valid.numType(o)
+    n = List.len(ty.ins)
+    args = topN(st, n)
+    out = firstTy(ty.outs)
+    rest = popped(st, n)
+    match inline(o, args)
+        Option.Some(e) -> pushed(cx, pc, rest, labs, g, e, out)
+        Option.None -> numCall(cx, pc, o, args, out, rest, labs, g)
+
+fn pushed(cx: Cx, pc: Int, st: St, labs: List<Lab>, g: Gl, e: String, t: ValType) -> Out
+    ? "Pushes a pure expression, bound to a name once it grows long, so expressions never nest deep."
+    match String.len(e) > 200
+        true -> bindFresh(cx, pc, st, labs, fresh(g), "v{g.n}", e, t)
+        false -> seq(cx, pc + 1, push(st, E(c = e, t = t)), labs, g)
+
+fn numCall(cx: Cx, pc: Int, o: Int, args: List<E>, out: ValType, rest: St, labs: List<Lab>, g: Gl) -> Out
+    ? "A numeric instruction through Num."
+    call = numText(o, args, out)
+    match traps(o)
+        false -> pushed(cx, pc, rest, labs, g, "Result.withDefault({call}, {zeroOf(out)})", out)
+        true -> split(cx, pc, rest, labs, fresh(g), call, "Result.Ok(v{g.n})", push(rest, E(c = "v{g.n}", t = out)), "Result.Err(e{g.n})", "R.Trap(e{g.n}, {rest.s})")
+
+fn numText(o: Int, args: List<E>, out: ValType) -> String
+    ? "The call to Num for a numeric instruction not written out: the operands as values, the result read as compiled code holds it."
+    valCall(o, args, out)
+
+fn valCall(o: Int, args: List<E>, out: ValType) -> String
+    ? "Rt.binV or unV, the result read as compiled code holds it."
+    match args
+        [a, c] -> readAs("Rt.binV({o}, {boxed(a)}, {boxed(c)})", out)
+        [a] -> readAs("Rt.unV({o}, {boxed(a)})", out)
+        _ -> "Result.Err(\"bad arity\")"
+
+fn readAs(call: String, out: ValType) -> String
+    ? "A Result of a value turned into one of a word when the type is held as a word."
+    match out
+        ValType.I32 -> "Rt.res32({call})"
+        ValType.I64 -> "Rt.res64({call})"
+        _ -> call
+
+fn width(t: ValType) -> String
+    ? "32 or 64."
+    match t
+        ValType.I64 -> "64"
+        _ -> "32"
+
+fn allInt(es: List<E>) -> Bool
+    ? "Whether every value is held as an Int."
+    match es
+        [] -> true
+        [e, ..rest] -> Bool.and(isInt(e.t), allInt(rest))
+
+fn zeroOf(t: ValType) -> String
+    ? "A placeholder for a Result that cannot fail."
+    match t
+        ValType.I32 -> "Rt.zero32()"
+        ValType.I64 -> "Rt.zero64()"
+        _ -> "Val.Null"
+
+fn traps(o: Int) -> Bool
+    ? "Integer division and remainder, and truncation that is not saturating."
+    Bool.or(Bool.and(o >= 109, o <= 112), Bool.or(Bool.and(o >= 127, o <= 130), Bool.or(Bool.and(o >= 168, o <= 171), Bool.and(o >= 174, o <= 177))))
+
+fn inline(o: Int, args: List<E>) -> Option<String>
+    ? "The integer operations written out in place, on the machine words."
+    match args
+        [a, c] -> inline2(o, a.c, c.c)
+        [a] -> inline1(o, a)
+        _ -> Option.None
+
+fn inline1(o: Int, a: E) -> Option<String>
+    ? "eqz."
+    match Bool.or(o == 69, o == 80)
+        true -> Option.Some("Rt.b(Rt.eqz{width(a.t)}({a.c}))")
+        false -> Option.None
+
+fn inline2(o: Int, a: String, c: String) -> Option<String>
+    ? "add, sub, mul, the bitwise operations and the comparisons on i32 and i64."
+    match Bool.and(o >= 106, o <= 115)
+        true -> wordOp(o - 106, "32", a, c)
+        false -> match Bool.and(o >= 124, o <= 133)
+            true -> wordOp(o - 124, "64", a, c)
+            false -> inlineCmp(o, a, c)
+
+fn wordOp(k: Int, w: String, a: String, c: String) -> Option<String>
+    ? "The k-th of add, sub, mul, div_s, div_u, rem_s, rem_u, and, or, xor: the ones that cannot trap."
+    match k
+        0 -> Option.Some("Rt.add{w}({a}, {c})")
+        1 -> Option.Some("Rt.sub{w}({a}, {c})")
+        2 -> Option.Some("Rt.mul{w}({a}, {c})")
+        7 -> Option.Some("Rt.and{w}({a}, {c})")
+        8 -> Option.Some("Rt.or{w}({a}, {c})")
+        9 -> Option.Some("Rt.xor{w}({a}, {c})")
+        _ -> Option.None
+
+fn inlineCmp(o: Int, a: String, c: String) -> Option<String>
+    ? "The integer comparisons, on the words."
+    match Bool.or(Bool.and(o >= 70, o <= 79), Bool.and(o >= 81, o <= 90))
+        false -> Option.None
+        true -> Option.Some("Rt.b({cmpText(o, a, c)})")
+
+fn cmpText(o: Int, a: String, c: String) -> String
+    ? "One comparison, a Bool."
+    w = cmpWidth(o)
+    k = cmpKind(o)
+    match k
+        0 -> "Rt.eq{w}({a}, {c})"
+        1 -> "Rt.ne{w}({a}, {c})"
+        2 -> "Rt.lt{w}({a}, {c})"
+        3 -> "Rt.ltu{w}({a}, {c})"
+        4 -> "Rt.gt{w}({a}, {c})"
+        5 -> "Rt.gtu{w}({a}, {c})"
+        6 -> "Rt.le{w}({a}, {c})"
+        7 -> "Rt.leu{w}({a}, {c})"
+        8 -> "Rt.ge{w}({a}, {c})"
+        _ -> "Rt.geu{w}({a}, {c})"
+
+fn cmpWidth(o: Int) -> String
+    ? "32 for the i32 comparisons, 64 for the i64 ones."
+    match o < 80
+        true -> "32"
+        false -> "64"
+
+fn cmpKind(o: Int) -> Int
+    ? "Which comparison: 0 eq, 1 ne, 2 lt_s, 3 lt_u, 4 gt_s, 5 gt_u, 6 le_s, 7 le_u, 8 ge_s, 9 ge_u."
+    match o < 80
+        true -> o - 70
+        false -> o - 81
+
+verify numeric
+    numeric(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.Bin(106), Instr.End]), ltys = [], res = [ValType.I32], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, 106, St(ls = [], stk = [E(c = "b", t = ValType.I32), E(c = "a", t = ValType.I32)], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [ValType.I32], below = [], keep = [])], Gl(n = 0, fns = [], alias = [])).t => "R.V1(Rt.val32(Rt.add32(a, b)), s)"
+
+verify pushed
+    pushed(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.Nop, Instr.End]), ltys = [], res = [ValType.I32], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, St(ls = [], stk = [], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [ValType.I32], below = [], keep = [])], Gl(n = 0, fns = [], alias = []), "a", ValType.I32).t => "R.V1(Rt.val32(a), s)"
+
+verify numCall
+    String.len(numCall(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.Bin(109), Instr.End]), ltys = [], res = [ValType.I32], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, 109, [E(c = "a", t = ValType.I32), E(c = "b", t = ValType.I32)], ValType.I32, St(ls = [], stk = [], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [ValType.I32], below = [], keep = [])], Gl(n = 0, fns = [], alias = [])).t) > 0 => true
+
+verify numText
+    numText(109, [E(c = "a", t = ValType.I32), E(c = "b", t = ValType.I32)], ValType.I32) => "Rt.res32(Rt.binV(109, Rt.val32(a), Rt.val32(b)))"
+    numText(170, [E(c = "a", t = ValType.F64)], ValType.I32) => "Rt.res32(Rt.unV(170, a))"
+
+verify valCall
+    valCall(160, [E(c = "a", t = ValType.F64), E(c = "b", t = ValType.F64)], ValType.F64) => "Rt.binV(160, a, b)"
+
+verify readAs
+    readAs("c", ValType.F32) => "c"
+
+verify width
+    width(ValType.I64) => "64"
+
+verify allInt
+    allInt([E(c = "a", t = ValType.F32)]) => false
+
+verify zeroOf
+    zeroOf(ValType.F64) => "Val.Null"
+
+verify traps
+    traps(109) => true
+    traps(106) => false
+
+verify inline
+    inline(69, [E(c = "a", t = ValType.I32)]) => Option.Some("Rt.b(Rt.eqz32(a))")
+
+verify inline1
+    inline1(103, E(c = "a", t = ValType.I32)) => Option.None
+    inline1(80, E(c = "a", t = ValType.I64)) => Option.Some("Rt.b(Rt.eqz64(a))")
+
+verify inline2
+    inline2(124, "a", "b") => Option.Some("Rt.add64(a, b)")
+
+verify inlineCmp
+    inlineCmp(73, "a", "b") => Option.Some("Rt.b(Rt.ltu32(a, b))")
+    inlineCmp(83, "a", "b") => Option.Some("Rt.b(Rt.lt64(a, b))")
+
+verify cmpText
+    cmpText(70, "a", "b") => "Rt.eq32(a, b)"
+
+verify wordOp
+    wordOp(9, "64", "a", "b") => Option.Some("Rt.xor64(a, b)")
+    wordOp(3, "32", "a", "b") => Option.None
+
+verify cmpWidth
+    cmpWidth(83) => "64"
+
+verify cmpKind
+    cmpKind(90) => 9
+
+// ---- select ----
+
+fn selectOf(cx: Cx, pc: Int, st: St, labs: List<Lab>, g: Gl) -> Out
+    ? "select: the condition on top, then the second and the first value."
+    vs = topN(st, 3)
+    a = nthE(vs, 0)
+    c = nthE(vs, 1)
+    k = nthE(vs, 2)
+    bindTo(cx, pc, popped(st, 3), labs, g, "Rt.pick{pickKind(a.t)}({k.c}, {a.c}, {c.c})", a.t)
+
+fn pickKind(t: ValType) -> String
+    ? "pick32 and pick64 for words, pickV for values."
+    match t
+        ValType.I32 -> "32"
+        ValType.I64 -> "64"
+        _ -> "V"
+
+verify selectOf
+    String.len(selectOf(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.Select, Instr.End]), ltys = [], res = [ValType.I32], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, St(ls = [], stk = [E(c = "k", t = ValType.I32), E(c = "b", t = ValType.I32), E(c = "a", t = ValType.I32)], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [ValType.I32], below = [], keep = [])], Gl(n = 0, fns = [], alias = [])).t) > 0 => true
+
+verify pickKind
+    pickKind(ValType.F32) => "V"
+
+// ---- the store ----
+
+fn newStore(cx: Cx, pc: Int, st: St, labs: List<Lab>, g: Gl, e: String) -> Out
+    ? "An expression that gives the next store."
+    p = letPre(st, fresh(g), "s{g.n}", e)
+    o = seq(cx, pc + 1, St.update(p.st, s = "s{g.n}"), labs, p.g)
+    Out(t = p.t + o.t, g = o.g)
+
+fn rOf(cx: Cx, pc: Int, st: St, labs: List<Lab>, g: Gl, call: String, outs: List<ValType>) -> Out
+    ? "A call that returns an R: the code goes on with its results and store, a trap is handed on."
+    k = g.n
+    vs = resultNames(k, List.len(outs))
+    okSt = St.update(pushAll(st, exprs(unboxedAll(vs, outs, []), outs, [])), s = "s{k}")
+    split(cx, pc, st, labs, fresh(g), call, bindPattern(k, vs), okSt, "t{k}", "t{k}")
+
+fn resultNames(k: Int, n: Int) -> List<String>
+    ? "How the results of call k are read: by name up to two; from three on, from the list R.VN carries, since a list pattern inside it makes Aver match by reference and copy the store."
+    match n >= 3
+        true -> nths("v{k}l", n, 0, [])
+        false -> names("v{k}x", n, 0, [])
+
+fn nths(l: String, n: Int, j: Int, acc: List<String>) -> List<String>
+    ? "Rt.nth of each position."
+    match j >= n
+        true -> List.reverse(acc)
+        false -> nths(l, n, j + 1, List.prepend("Rt.nth({l}, {j})", acc))
+
+fn bindPattern(k: Int, vs: List<String>) -> String
+    ? "The pattern that binds call k's results and store."
+    match List.len(vs) >= 3
+        true -> "R.VN(v{k}l, s{k})"
+        false -> rPattern(vs, "s{k}")
+
+verify resultNames
+    resultNames(4, 1) => ["v4x0"]
+    resultNames(4, 3) => ["Rt.nth(v4l, 0)", "Rt.nth(v4l, 1)", "Rt.nth(v4l, 2)"]
+
+verify nths
+    nths("l", 1, 0, []) => ["Rt.nth(l, 0)"]
+
+verify bindPattern
+    bindPattern(4, ["a", "b", "c"]) => "R.VN(v4l, s4)"
+    bindPattern(4, ["a"]) => "R.V1(a, s4)"
+
+fn rPattern(vs: List<String>, s: String) -> String
+    ? "The pattern for an R with these results."
+    match vs
+        [] -> "R.V0({s})"
+        [a] -> "R.V1({a}, {s})"
+        [a, c] -> "R.V2({a}, {c}, {s})"
+        _ -> "R.VN([{String.join(vs, ", ")}], {s})"
+
+fn unboxedAll(vs: List<String>, ts: List<ValType>, acc: List<String>) -> List<String>
+    ? "Each result read as compiled code holds its type."
+    match vs
+        [] -> List.reverse(acc)
+        [v, ..rest] -> unboxedAll(rest, List.drop(ts, 1), List.prepend(unboxed(v, firstTy(ts)), acc))
+
+fn pushAll(st: St, es: List<E>) -> St
+    ? "Values pushed in order."
+    match es
+        [] -> st
+        [e, ..rest] -> pushAll(push(st, e), rest)
+
+fn resultOf(cx: Cx, pc: Int, st: St, labs: List<Lab>, g: Gl, call: String, out: ValType) -> Out
+    ? "A Result of a value: the code goes on with it, an error traps."
+    k = g.n
+    split(cx, pc, st, labs, fresh(g), call, "Result.Ok(v{k})", push(st, E(c = unboxed("v{k}", out), t = out)), "Result.Err(e{k})", "R.Trap(e{k}, {st.s})")
+
+verify newStore
+    newStore(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.Nop, Instr.End]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, St(ls = [], stk = [], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [], below = [], keep = [])], Gl(n = 0, fns = [], alias = []), "f(s)").t => "s0 = f(s)\n    R.V0(s0)"
+
+verify rOf
+    String.len(rOf(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.Nop, Instr.End]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, St(ls = [], stk = [], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [], below = [], keep = [])], Gl(n = 0, fns = [], alias = []), "f(s)", []).t) > 0 => true
+
+verify rPattern
+    rPattern(["a"], "s1") => "R.V1(a, s1)"
+    rPattern(["a", "b", "c"], "s1") => "R.VN([a, b, c], s1)"
+
+verify unboxedAll
+    unboxedAll(["a"], [ValType.I64], []) => ["Rt.of64(a)"]
+
+verify pushAll
+    pushAll(St(ls = [], stk = [], s = "s", top = true, ind = 4), [E(c = "a", t = ValType.I32), E(c = "b", t = ValType.I32)]).stk => [E(c = "b", t = ValType.I32), E(c = "a", t = ValType.I32)]
+
+verify resultOf
+    String.len(resultOf(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.Nop, Instr.End]), ltys = [], res = [ValType.I32], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, St(ls = [], stk = [], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [ValType.I32], below = [], keep = [])], Gl(n = 0, fns = [], alias = []), "f(s)", ValType.I32).t) > 0 => true
+
+// ---- roots ----
+
+fn rootsOf(cx: Cx, pc: Int, st: St, skip: Int) -> String
+    ? "The roots handed on at instruction pc: every reference the function still needs after it, in its live locals and on its stack below the top skip values, before what its callers hold."
+    keptText(List.concat(refsIn(kept(st.ls, liveAt(cx, pc + 1), 0, [])), refsIn(List.drop(st.stk, skip))))
+
+fn refsIn(es: List<E>) -> List<String>
+    ? "The values that may be references."
+    match es
+        [] -> []
+        [e, ..rest] -> match isInt(e.t)
+            true -> refsIn(rest)
+            false -> List.prepend(e.c, refsIn(rest))
+
+fn keptText(cs: List<String>) -> String
+    ? "The callers' roots with these values added: a few by one Rt.keep each, which allocates only for a value that is a reference; many as one flat Rt.keepAll, since nesting deeper would pass Aver's limit on expression depth."
+    match List.len(cs) <= 16
+        true -> keptNested(cs, "rs")
+        false -> "Rt.keepAll([{String.join(cs, ", ")}], rs)"
+
+fn keptNested(cs: List<String>, acc: String) -> String
+    ? "Rt.keep around the roots, one value at a time."
+    match cs
+        [] -> acc
+        [c, ..rest] -> keptNested(rest, "Rt.keep({c}, {acc})")
+
+verify rootsOf
+    rootsOf(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([]), ltys = [ValType.I32, ValType.Ref(true, -18)], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, St(ls = [E(c = "a", t = ValType.I32), E(c = "r", t = ValType.Ref(true, -18))], stk = [], s = "s", top = true, ind = 4), 0) => "Rt.keep(r, rs)"
+
+verify refsIn
+    refsIn([E(c = "a", t = ValType.F64)]) => ["a"]
+
+verify keptText
+    keptText(["a", "b"]) => "Rt.keep(b, Rt.keep(a, rs))"
+    keptText([]) => "rs"
+
+verify keptNested
+    keptNested(["a"], "rs") => "Rt.keep(a, rs)"
+
+// ---- structs, arrays and the rest ----
+
+fn heap(cx: Cx, pc: Int, i: Instr, st: St, labs: List<Lab>, g: Gl) -> Out
+    ? "Structs and arrays written out; everything else through the interpreter."
+    match i
+        Instr.StructNew(t) -> structNew(cx, pc, t, st, labs, g)
+        Instr.StructNewDefault(t) -> rOf(cx, pc, st, labs, g, "Rt.structNew(x, {st.s}, {rootsOf(cx, pc, st, 0)}, {t}, [{String.join(defaultVals(List.fromVector(Ast.structFields(cx.m, t)), []), ", ")}])", [anyRef()])
+        Instr.StructGet(t, k, e) -> structGet(cx, pc, t, k, e, st, labs, g)
+        Instr.StructSet(t, k) -> rOf(cx, pc, popped(st, 2), labs, g, "Rt.setField({st.s}, {nthE(topN(st, 2), 0).c}, {k}, {packed(fieldTy(cx.m, t, k), pop1(st))})", [])
+        Instr.ArrayNew(t) -> rOf(cx, pc, popped(st, 2), labs, g, "Rt.arrayNew(x, {st.s}, {rootsOf(cx, pc, st, 2)}, {t}, {pop1(st).c}, {boxed(nthE(topN(st, 2), 0))})", [anyRef()])
+        Instr.ArrayNewDefault(t) -> rOf(cx, pc, popped(st, 1), labs, g, "Rt.arrayNewDefault(x, {st.s}, {rootsOf(cx, pc, st, 1)}, {t}, {pop1(st).c})", [anyRef()])
+        Instr.ArrayGet(t, e) -> arrayGet(cx, pc, t, e, st, labs, g)
+        Instr.ArraySet(t) -> rOf(cx, pc, popped(st, 3), labs, g, "Rt.arraySet({st.s}, {nthE(topN(st, 3), 0).c}, {nthE(topN(st, 3), 1).c}, {packed(Ast.arrayElem(cx.m, t), pop1(st))})", [])
+        Instr.ArrayLen -> resultOf(cx, pc, popped(st, 1), labs, g, "Rt.arrayLen({st.s}, {pop1(st).c})", ValType.I32)
+        Instr.Load(op, off, _, k) -> rOf(cx, pc, popped(st, 1), labs, g, "Rt.load(x, {st.s}, {op}, {off}, {k}, {boxed(pop1(st))})", [loadTy(op)])
+        Instr.Store(op, off, _, k) -> rOf(cx, pc, popped(st, 2), labs, g, "Rt.store(x, {st.s}, {op}, {off}, {k}, {boxed(nthE(topN(st, 2), 0))}, {boxed(pop1(st))})", [])
+        Instr.RefTest(nl, h) -> bindTo(cx, pc, popped(st, 1), labs, g, "Rt.refTest(x, {st.s}, {pop1(st).c}, {nl}, {lit(h)})", ValType.I32)
+        Instr.RefCast(nl, h) -> resultOf(cx, pc, popped(st, 1), labs, g, "Rt.refCast(x, {st.s}, {pop1(st).c}, {nl}, {lit(h)})", anyRef())
+        Instr.RefAsNonNull -> resultOf(cx, pc, popped(st, 1), labs, g, "Rt.nonNull({pop1(st).c})", anyRef())
+        _ -> viaOf(cx, pc, i, st, labs, g)
+
+fn structNew(cx: Cx, pc: Int, t: Int, st: St, labs: List<Lab>, g: Gl) -> Out
+    ? "struct.new with its fields packed."
+    fs = List.fromVector(Ast.structFields(cx.m, t))
+    n = List.len(fs)
+    vals = packedAll(fs, topN(st, n), [])
+    rOf(cx, pc, popped(st, n), labs, g, "Rt.structNew(x, {st.s}, {rootsOf(cx, pc, st, n)}, {t}, [{String.join(vals, ", ")}])", [anyRef()])
+
+fn structGet(cx: Cx, pc: Int, t: Int, k: Int, e: Int, st: St, labs: List<Lab>, g: Gl) -> Out
+    ? "struct.get: a packed field read signed or unsigned."
+    ft = fieldTy(cx.m, t, k)
+    r = pop1(st).c
+    match ft
+        ValType.I8 -> resultOf(cx, pc, popped(st, 1), labs, g, "Rt.fieldPacked({st.s}, {r}, {k}, ValType.I8, {e})", ValType.I32)
+        ValType.I16 -> resultOf(cx, pc, popped(st, 1), labs, g, "Rt.fieldPacked({st.s}, {r}, {k}, ValType.I16, {e})", ValType.I32)
+        _ -> resultOf(cx, pc, popped(st, 1), labs, g, "Rt.field({st.s}, {r}, {k})", ft)
+
+fn arrayGet(cx: Cx, pc: Int, t: Int, e: Int, st: St, labs: List<Lab>, g: Gl) -> Out
+    ? "array.get: the element unpacked, held as its type says."
+    et = Ast.arrayElem(cx.m, t)
+    args = topN(st, 2)
+    resultOf(cx, pc, popped(st, 2), labs, g, "Rt.arrayGet({st.s}, {nthE(args, 0).c}, {nthE(args, 1).c}, {tyText(et)}, {e})", unpackedTy(et))
+
+fn fieldTy(m: Module, t: Int, k: Int) -> ValType
+    ? "The storage type of field k of struct type t."
+    Option.withDefault(Vector.get(Ast.structFields(m, t), k), ValType.I32)
+
+fn unpackedTy(t: ValType) -> ValType
+    ? "A packed type read onto the stack is an i32."
+    match t
+        ValType.I8 -> ValType.I32
+        ValType.I16 -> ValType.I32
+        _ -> t
+
+fn packed(t: ValType, e: E) -> String
+    ? "A value as a field or element of storage type t holds it."
+    match t
+        ValType.I8 -> "Rt.pack8({e.c})"
+        ValType.I16 -> "Rt.pack16({e.c})"
+        _ -> boxed(e)
+
+fn packedAll(ts: List<ValType>, es: List<E>, acc: List<String>) -> List<String>
+    ? "Each value packed for its field."
+    match es
+        [] -> List.reverse(acc)
+        [e, ..rest] -> packedAll(List.drop(ts, 1), rest, List.prepend(packed(firstTy(ts), e), acc))
+
+fn defaultVals(ts: List<ValType>, acc: List<String>) -> List<String>
+    ? "The default of each field, as a value."
+    match ts
+        [] -> List.reverse(acc)
+        [t, ..rest] -> defaultVals(rest, List.prepend(defaultVal(t), acc))
+
+fn defaultVal(t: ValType) -> String
+    ? "A default as a Val."
+    match t
+        ValType.I32 -> "Val.I32(0)"
+        ValType.I64 -> "Val.I64(0)"
+        _ -> defaultText(t)
+
+fn tyText(t: ValType) -> String
+    ? "A value type as Aver source."
+    match t
+        ValType.I32 -> "ValType.I32"
+        ValType.I64 -> "ValType.I64"
+        ValType.F32 -> "ValType.F32"
+        ValType.F64 -> "ValType.F64"
+        ValType.V128 -> "ValType.V128"
+        ValType.I8 -> "ValType.I8"
+        ValType.I16 -> "ValType.I16"
+        ValType.Ref(n, h) -> "ValType.Ref({n}, {lit(h)})"
+
+verify heap
+    String.len(heap(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.ArrayLen, Instr.End]), ltys = [], res = [ValType.I32], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, Instr.ArrayLen, St(ls = [], stk = [E(c = "r", t = ValType.Ref(true, -18))], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [ValType.I32], below = [], keep = [])], Gl(n = 0, fns = [], alias = [])).t) > 0 => true
+
+verify structNew
+    String.len(structNew(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.StructNew(0), Instr.End]), ltys = [], res = [ValType.Ref(true, -18)], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, 0, St(ls = [], stk = [], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [ValType.Ref(true, -18)], below = [], keep = [])], Gl(n = 0, fns = [], alias = [])).t) > 0 => true
+
+verify structGet
+    String.len(structGet(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.StructGet(0, 0, 0), Instr.End]), ltys = [], res = [ValType.I32], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, 0, 0, 0, St(ls = [], stk = [E(c = "r", t = ValType.Ref(true, -18))], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [ValType.I32], below = [], keep = [])], Gl(n = 0, fns = [], alias = [])).t) > 0 => true
+
+verify arrayGet
+    String.len(arrayGet(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.ArrayGet(0, 0), Instr.End]), ltys = [], res = [ValType.I32], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, 0, 0, St(ls = [], stk = [E(c = "k", t = ValType.I32), E(c = "r", t = ValType.Ref(true, -18))], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [ValType.I32], below = [], keep = [])], Gl(n = 0, fns = [], alias = [])).t) > 0 => true
+
+verify fieldTy
+    fieldTy(Ast.emptyModule(), 0, 0) => ValType.I32
+
+verify unpackedTy
+    unpackedTy(ValType.I16) => ValType.I32
+
+verify packed
+    packed(ValType.I8, E(c = "a", t = ValType.I32)) => "Rt.pack8(a)"
+
+verify packedAll
+    packedAll([ValType.I64], [E(c = "a", t = ValType.I64)], []) => ["Rt.val64(a)"]
+
+verify defaultVals
+    defaultVals([ValType.I32, ValType.F64], []) => ["Val.I32(0)", "Val.F64(0.0)"]
+
+verify defaultVal
+    defaultVal(ValType.I64) => "Val.I64(0)"
+
+verify tyText
+    tyText(ValType.Ref(false, -18)) => "ValType.Ref(false, (-18))"
+
+// ---- through the interpreter ----
+
+fn viaOf(cx: Cx, pc: Int, i: Instr, st: St, labs: List<Lab>, g: Gl) -> Out
+    ? "An instruction the interpreter runs: its operands go in as values, its results come back as an R."
+    n = popsOf(cx.m, i)
+    outs = pushesOf(cx.m, i)
+    args = String.join(boxedAll(topN(st, n), []), ", ")
+    rest = popped(st, n)
+    match allocOp(i)
+        true -> rOf(cx, pc, rest, labs, g, "Rt.viaRooted(x, {st.s}, {rootsOf(cx, pc, st, n)}, {instrText(i)}, [{args}], {List.len(outs)})", outs)
+        false -> rOf(cx, pc, rest, labs, g, "Rt.via(x, {st.s}, {instrText(i)}, [{args}], {List.len(outs)})", outs)
+
+fn boxedAll(es: List<E>, acc: List<String>) -> List<String>
+    ? "Each value as a Val."
+    match es
+        [] -> List.reverse(acc)
+        [e, ..rest] -> boxedAll(rest, List.prepend(boxed(e), acc))
+
+fn popsOf(m: Module, i: Instr) -> Int
+    ? "How many operands an instruction the interpreter runs takes."
+    match i
+        Instr.Load(_, _, _, _) -> 1
+        Instr.Store(_, _, _, _) -> 2
+        Instr.MemoryGrow(_) -> 1
+        Instr.MemoryFill(_) -> 3
+        Instr.MemoryCopy(_, _) -> 3
+        Instr.MemoryInit(_, _) -> 3
+        Instr.TableGet(_) -> 1
+        Instr.TableSet(_) -> 2
+        Instr.TableGrow(_) -> 2
+        Instr.TableFill(_) -> 3
+        Instr.TableCopy(_, _) -> 3
+        Instr.TableInit(_, _) -> 3
+        _ -> popsGc(i)
+
+fn popsGc(i: Instr) -> Int
+    ? "Operands of the GC and reference instructions the interpreter runs."
+    match i
+        Instr.ArrayNewFixed(_, n) -> n
+        Instr.ArrayNewData(_, _) -> 2
+        Instr.ArrayNewElem(_, _) -> 2
+        Instr.ArrayFill(_) -> 4
+        Instr.ArrayCopy(_, _) -> 5
+        Instr.ArrayInitData(_, _) -> 4
+        Instr.ArrayInitElem(_, _) -> 4
+        Instr.RefI31 -> 1
+        Instr.I31Get(_) -> 1
+        Instr.RefTest(_, _) -> 1
+        Instr.RefCast(_, _) -> 1
+        Instr.RefEq -> 2
+        Instr.RefAsNonNull -> 1
+        _ -> 0
+
+fn pushesOf(m: Module, i: Instr) -> List<ValType>
+    ? "The types of what an instruction the interpreter runs leaves."
+    match i
+        Instr.Load(op, _, _, _) -> [loadTy(op)]
+        Instr.MemorySize(k) -> [Ast.addrType(Ast.memIs64(m, k))]
+        Instr.MemoryGrow(k) -> [Ast.addrType(Ast.memIs64(m, k))]
+        Instr.TableGet(_) -> [anyRef()]
+        Instr.TableSize(t) -> [Ast.addrType(Ast.tableIs64(m, t))]
+        Instr.TableGrow(t) -> [Ast.addrType(Ast.tableIs64(m, t))]
+        Instr.ArrayNewFixed(_, _) -> [anyRef()]
+        Instr.ArrayNewData(_, _) -> [anyRef()]
+        Instr.ArrayNewElem(_, _) -> [anyRef()]
+        Instr.RefI31 -> [anyRef()]
+        Instr.I31Get(_) -> [ValType.I32]
+        Instr.RefTest(_, _) -> [ValType.I32]
+        Instr.RefCast(_, _) -> [anyRef()]
+        Instr.RefEq -> [ValType.I32]
+        Instr.RefAsNonNull -> [anyRef()]
+        _ -> []
+
+fn loadTy(op: Int) -> ValType
+    ? "The type a load leaves."
+    match op
+        41 -> ValType.I64
+        42 -> ValType.F32
+        43 -> ValType.F64
+        _ -> match op >= 48
+            true -> ValType.I64
+            false -> ValType.I32
+
+fn instrText(i: Instr) -> String
+    ? "An instruction the interpreter runs, as Aver source."
+    match i
+        Instr.Load(a, b, c, k) -> "Instr.Load({a}, {b}, {c}, {k})"
+        Instr.Store(a, b, c, k) -> "Instr.Store({a}, {b}, {c}, {k})"
+        Instr.MemorySize(k) -> "Instr.MemorySize({k})"
+        Instr.MemoryGrow(k) -> "Instr.MemoryGrow({k})"
+        Instr.MemoryFill(k) -> "Instr.MemoryFill({k})"
+        Instr.MemoryCopy(a, b) -> "Instr.MemoryCopy({a}, {b})"
+        Instr.MemoryInit(a, b) -> "Instr.MemoryInit({a}, {b})"
+        Instr.DataDrop(k) -> "Instr.DataDrop({k})"
+        Instr.TableGet(k) -> "Instr.TableGet({k})"
+        Instr.TableSet(k) -> "Instr.TableSet({k})"
+        Instr.TableSize(k) -> "Instr.TableSize({k})"
+        Instr.TableGrow(k) -> "Instr.TableGrow({k})"
+        Instr.TableFill(k) -> "Instr.TableFill({k})"
+        Instr.TableCopy(a, b) -> "Instr.TableCopy({a}, {b})"
+        Instr.TableInit(a, b) -> "Instr.TableInit({a}, {b})"
+        Instr.ElemDrop(k) -> "Instr.ElemDrop({k})"
+        _ -> instrGc(i)
+
+fn instrGc(i: Instr) -> String
+    ? "The GC and reference instructions as Aver source."
+    match i
+        Instr.ArrayNewFixed(a, b) -> "Instr.ArrayNewFixed({a}, {b})"
+        Instr.ArrayNewData(a, b) -> "Instr.ArrayNewData({a}, {b})"
+        Instr.ArrayNewElem(a, b) -> "Instr.ArrayNewElem({a}, {b})"
+        Instr.ArrayFill(a) -> "Instr.ArrayFill({a})"
+        Instr.ArrayCopy(a, b) -> "Instr.ArrayCopy({a}, {b})"
+        Instr.ArrayInitData(a, b) -> "Instr.ArrayInitData({a}, {b})"
+        Instr.ArrayInitElem(a, b) -> "Instr.ArrayInitElem({a}, {b})"
+        Instr.RefI31 -> "Instr.RefI31"
+        Instr.I31Get(sg) -> "Instr.I31Get({sg})"
+        Instr.RefTest(n, h) -> "Instr.RefTest({n}, {lit(h)})"
+        Instr.RefCast(n, h) -> "Instr.RefCast({n}, {lit(h)})"
+        Instr.RefEq -> "Instr.RefEq"
+        Instr.RefAsNonNull -> "Instr.RefAsNonNull"
+        _ -> "Instr.Bad(0)"
+
+verify viaOf
+    String.len(viaOf(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.RefEq, Instr.End]), ltys = [], res = [ValType.I32], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, Instr.RefEq, St(ls = [], stk = [E(c = "a", t = ValType.Ref(true, -18)), E(c = "b", t = ValType.Ref(true, -18))], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [ValType.I32], below = [], keep = [])], Gl(n = 0, fns = [], alias = [])).t) > 0 => true
+
+verify boxedAll
+    boxedAll([E(c = "a", t = ValType.I32)], []) => ["Rt.val32(a)"]
+
+verify popsOf
+    popsOf(Ast.emptyModule(), Instr.Store(54, 0, 2, 0)) => 2
+
+verify popsGc
+    popsGc(Instr.ArrayCopy(0, 0)) => 5
+
+verify pushesOf
+    pushesOf(Ast.emptyModule(), Instr.Load(41, 0, 3, 0)) => [ValType.I64]
+
+verify loadTy
+    loadTy(45) => ValType.I32
+    loadTy(53) => ValType.I64
+
+verify instrText
+    instrText(Instr.Load(40, 4, 2, 0)) => "Instr.Load(40, 4, 2, 0)"
+
+verify instrGc
+    instrGc(Instr.RefTest(true, -18)) => "Instr.RefTest(true, (-18))"
+
+// ---- calls ----
+
+fn callOf(cx: Cx, pc: Int, f: Int, tail: Bool, st: St, labs: List<Lab>, g: Gl) -> Out
+    ? "A call to a compiled function: a return_call is the function's last word, a call a match on what it returns."
+    t = typeOfFn(cx.m, f)
+    n = List.len(Ast.funcParams(cx.m, t))
+    args = commaList(codesOf(topN(st, n)))
+    rs = rootsIf(cx, pc, Map.has(cx.allocs, f), st, n)
+    match tail
+        true -> Out(t = "{cx.pre}w{f}(x, {st.s}, d, rs{args})", g = g)
+        false -> rOf(cx, pc, popped(st, n), labs, g, resolvedCall(cx, Map.has(cx.tails, f), "{cx.pre}w{f}(x, {st.s}, d + 1, {rs}{args})", rootsOf(cx, pc, st, n)), Ast.funcResults(cx.m, t))
+
+fn resolvedCall(cx: Cx, tails: Bool, call: String, rs: String) -> String
+    ? "A call to a function that may end with an indirect tail call runs that call, and any it ends with, before going on."
+    match tails
+        true -> "Rt.resolve({call}, x, d + 1, {rs}, {cx.pre}callIn)"
+        false -> call
+
+verify resolvedCall
+    resolvedCall(Cx(m = Ast.emptyModule(), pre = "m0", fi = 0, code = Vector.fromList([]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), true, "f()", "rs") => "Rt.resolve(f(), x, d + 1, rs, m0callIn)"
+
+fn callVia(cx: Cx, pc: Int, t: Int, tb: Int, tail: Bool, st: St, labs: List<Lab>, g: Gl) -> Out
+    ? "call_ref (tb -1) or call_indirect through table tb, of function type t: the reference or index on top, the arguments beneath; Rt finds the function and calls it through the module's dispatch."
+    n = List.len(Ast.funcParams(cx.m, t))
+    top = pop1(st)
+    args = "[{String.join(boxedAll(topN(popped(st, 1), n), []), ", ")}]"
+    target = viaTarget(t, tb, top)
+    match tail
+        true -> Out(t = "{tailFun(tb)}(x, {st.s}, {target.what}, {args})", g = g)
+        false -> rOf(cx, pc, popped(st, n + 1), labs, g, "{target.fun}(x, {st.s}, d + 1, {rootsOf(cx, pc, st, n + 1)}, {target.what}, {args}, {cx.pre}call)", Ast.funcResults(cx.m, t))
+
+record Via
+    fun: String
+    what: String
+
+fn tailFun(tb: Int) -> String
+    ? "The Rt function that hands a tail call on instead of making it."
+    match tb < 0
+        true -> "Rt.tailRef"
+        false -> "Rt.tailIndirect"
+
+verify tailFun
+    tailFun(0) => "Rt.tailIndirect"
+
+fn viaTarget(t: Int, tb: Int, top: E) -> Via
+    ? "Which Rt call finds the function, and what it is given."
+    match tb < 0
+        true -> Via(fun = "Rt.callRef", what = top.c)
+        false -> Via(fun = "Rt.callIndirect", what = "{t}, {tb}, {boxed(top)}")
+
+verify callVia
+    callVia(Cx(m = Ast.emptyModule(), pre = "m0", fi = 0, code = Vector.fromList([]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, 0, -1, true, St(ls = [], stk = [E(c = "r", t = ValType.Ref(true, -16))], s = "s", top = true, ind = 4), [], Gl(n = 0, fns = [], alias = [])).t => "Rt.tailRef(x, s, r, [])"
+
+verify viaTarget
+    viaTarget(3, 0, E(c = "i", t = ValType.I32)).what => "3, 0, Rt.val32(i)"
+
+fn rootsIf(cx: Cx, pc: Int, may: Bool, st: St, skip: Int) -> String
+    ? "The roots for a callee that may allocate; one that cannot gets the callers' as they are."
+    match may
+        true -> rootsOf(cx, pc, st, skip)
+        false -> "rs"
+
+fn codesOf(es: List<E>) -> List<String>
+    ? "The expressions of values."
+    match es
+        [] -> []
+        [e, ..rest] -> List.prepend(e.c, codesOf(rest))
+
+verify callOf
+    callOf(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, 3, true, St(ls = [], stk = [], s = "s", top = true, ind = 4), [], Gl(n = 0, fns = [], alias = [])).t => "w3(x, s, d, rs)"
+
+verify rootsIf
+    rootsIf(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, false, St(ls = [], stk = [], s = "s", top = true, ind = 4), 0) => "rs"
+
+verify codesOf
+    codesOf([E(c = "a", t = ValType.I32)]) => ["a"]
+
+// ---- returns and branches ----
+
+fn returned(cx: Cx, st: St) -> String
+    ? "The function's results with the store."
+    vs = topN(st, List.len(cx.res))
+    rPattern(boxedAll(vs, []), st.s)
+
+fn branchTo(cx: Cx, st: St, labs: List<Lab>, d: Int) -> String
+    ? "A branch to label d: a call to its function with the locals, the values beneath it and the values it carries; the function's own label returns."
+    match List.drop(labs, d)
+        [l, .._] -> match l.kind
+            3 -> returned(cx, st)
+            _ -> jumpTo(st, l)
+        [] -> returned(cx, st)
+
+fn jumpTo(st: St, l: Lab) -> String
+    ? "The call that continues at a label."
+    carried = topN(st, List.len(l.tys))
+    under = List.reverse(List.take(List.reverse(st.stk), List.len(l.below)))
+    "{l.name}(x, Rt.st({st.s}), d, rs{commaList(codesOf(kept(st.ls, l.keep, 0, [])))}{commaList(codesOf(List.reverse(under)))}{commaList(codesOf(carried))})"
+
+fn fallOut(cx: Cx, st: St, labs: List<Lab>) -> String
+    ? "Falling off the end of the innermost construct that has a function."
+    branchTo(cx, st, labs, 0)
+
+fn brIf(cx: Cx, pc: Int, d: Int, st: St, labs: List<Lab>, g: Gl) -> Out
+    ? "br_if: the branch in one arm, the rest of the code in the other."
+    c = pop1(st).c
+    rest = popped(st, 1)
+    o = seq(cx, pc + 1, St.update(rest, top = false, ind = st.ind + 8), labs, g)
+    Out(t = "match {cond(c)}\n{sp(st.ind + 4)}true -> {branchTo(cx, rest, labs, d)}\n{sp(st.ind + 4)}false -> " + o.t, g = o.g)
+
+fn brTable(cx: Cx, st: St, labs: List<Lab>, k: String, ls: List<Int>, d: Int) -> String
+    ? "br_table: one arm per index, the default last."
+    "match Rt.i32v({k})\n" + tableArms(cx, st, labs, ls, 0, "") + "{sp(st.ind + 4)}_ -> {branchTo(cx, st, labs, d)}"
+
+fn tableArms(cx: Cx, st: St, labs: List<Lab>, ls: List<Int>, k: Int, acc: String) -> String
+    ? "The arms for indices from k on."
+    match ls
+        [] -> acc
+        [l, ..rest] -> tableArms(cx, st, labs, rest, k + 1, acc + "{sp(st.ind + 4)}{k} -> {branchTo(cx, st, labs, l)}\n")
+
+fn brOnNull(cx: Cx, pc: Int, d: Int, onNull: Bool, st: St, labs: List<Lab>, g: Gl) -> Out
+    ? "br_on_null and br_on_non_null."
+    r = pop1(st)
+    rest = popped(st, 1)
+    v = "v{g.n}"
+    withV = push(rest, E(c = v, t = r.t))
+    jump = branchTo(cx, pickSt(onNull, rest, withV), labs, d)
+    o = seq(cx, pc + 1, St.update(pickSt(onNull, withV, rest), top = false, ind = st.ind + 8), labs, fresh(g))
+    Out(t = "match {r.c}\n{sp(st.ind + 4)}Val.Null -> {pickS(onNull, jump, o.t)}\n{sp(st.ind + 4)}{v} -> {pickS(onNull, o.t, jump)}", g = o.g)
+
+fn pickSt(c: Bool, a: St, b: St) -> St
+    ? "a when c holds, else b."
+    match c
+        true -> a
+        false -> b
+
+fn pickS(c: Bool, a: String, b: String) -> String
+    ? "a when c holds, else b."
+    match c
+        true -> a
+        false -> b
+
+verify pickSt
+    pickSt(true, St(ls = [], stk = [], s = "a", top = true, ind = 4), St(ls = [], stk = [], s = "b", top = true, ind = 4)).s => "a"
+
+verify pickS
+    pickS(false, "a", "b") => "b"
+
+verify returned
+    returned(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([]), ltys = [], res = [ValType.I64], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), St(ls = [], stk = [E(c = "a", t = ValType.I64)], s = "s3", top = true, ind = 4)) => "R.V1(Rt.val64(a), s3)"
+
+verify branchTo
+    branchTo(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), St(ls = [], stk = [], s = "s", top = true, ind = 4), [], 0) => "R.V0(s)"
+
+verify jumpTo
+    jumpTo(St(ls = [E(c = "l0", t = ValType.I32)], stk = [E(c = "c", t = ValType.I32), E(c = "m", t = ValType.I32), E(c = "u", t = ValType.I32)], s = "s", top = true, ind = 4), Lab(kind = 1, name = "w0_1", tys = [ValType.I32], below = [ValType.I32], keep = [0])) => "w0_1(x, Rt.st(s), d, rs, l0, u, c)"
+
+verify fallOut
+    fallOut(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), St(ls = [], stk = [], s = "s", top = true, ind = 4), []) => "R.V0(s)"
+
+verify brIf
+    String.len(brIf(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.BrIf(0), Instr.End]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, 0, St(ls = [], stk = [E(c = "c", t = ValType.I32)], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [], below = [], keep = [])], Gl(n = 0, fns = [], alias = [])).t) > 0 => true
+
+verify brTable
+    brTable(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), St(ls = [], stk = [], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [], below = [], keep = [])], "k", [], 0) => "match Rt.i32v(k)\n        _ -> R.V0(s)"
+
+verify tableArms
+    tableArms(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), St(ls = [], stk = [], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [], below = [], keep = [])], [0], 0, "") => "        0 -> R.V0(s)\n"
+
+verify brOnNull
+    String.len(brOnNull(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.BrOnNull(0), Instr.End]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, 0, true, St(ls = [], stk = [E(c = "r", t = ValType.Ref(true, -18))], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [], below = [], keep = [])], Gl(n = 0, fns = [], alias = [])).t) > 0 => true
+
+// ---- recursion ----
+
+fn calleesOf(m: Module, natives: Map<Int, Unit>, fis: List<Int>, acc: Map<Int, List<Int>>) -> Map<Int, List<Int>>
+    ? "The compiled functions each compiled function calls."
+    match fis
+        [] -> acc
+        [f, ..rest] -> calleesOf(m, natives, rest, Map.set(acc, f, callsIn(natives, List.fromVector(codeOf(m, f)), [])))
+
+fn callsIn(natives: Map<Int, Unit>, is: List<Instr>, acc: List<Int>) -> List<Int>
+    ? "The compiled functions a body calls."
+    match is
+        [] -> acc
+        [Instr.Call(f), ..rest] -> callsIn(natives, rest, List.prepend(f, acc))
+        [Instr.ReturnCall(f), ..rest] -> callsIn(natives, rest, List.prepend(f, acc))
+        [_, ..rest] -> callsIn(natives, rest, acc)
+
+fn recursive(m: Module, cs: Map<Int, List<Int>>, fis: List<Int>, acc: Map<Int, Unit>) -> Map<Int, Unit>
+    ? "The functions that can call themselves, directly or through others; one that calls indirectly may reach anything, itself included."
+    match fis
+        [] -> acc
+        [f, ..rest] -> match Bool.or(reaches(cs, Option.withDefault(Map.get(cs, f), []), f, {}), anyIndirect(List.fromVector(codeOf(m, f))))
+            true -> recursive(m, cs, rest, Map.set(acc, f, Unit))
+            false -> recursive(m, cs, rest, acc)
+
+fn reaches(cs: Map<Int, List<Int>>, todo: List<Int>, target: Int, seen: Map<Int, Unit>) -> Bool
+    ? "Whether target is among the functions todo leads to."
+    match todo
+        [] -> false
+        [c, ..rest] -> match c == target
+            true -> true
+            false -> match Map.has(seen, c)
+                true -> reaches(cs, rest, target, seen)
+                false -> reaches(cs, List.concat(Option.withDefault(Map.get(cs, c), []), rest), target, Map.set(seen, c, Unit))
+
+verify calleesOf
+    calleesOf(Ast.emptyModule(), {}, [], {}) => {}
+
+verify callsIn
+    callsIn({}, [Instr.Call(2), Instr.Nop, Instr.ReturnCall(3)], []) => [3, 2]
+
+verify recursive
+    recursive(Ast.emptyModule(), {1 => [2], 2 => [1], 3 => [1]}, [1, 2, 3], {}) => {1 => Unit, 2 => Unit}
+
+verify reaches
+    reaches({1 => [2], 2 => [3]}, [2], 1, {}) => false
+
+// ---- liveness ----
+
+record Live
+    v: Vector<Int>
+    changed: Bool
+
+fn liveness(code: Vector<Instr>) -> Vector<Int>
+    ? "For each instruction, the locals read before they are written on some path from it, as bits: a function a label became takes only those."
+    succ = Vector.fromList(succsFrom(List.fromVector(code), 0, [], []))
+    settle(code, succ, Live(v = Result.withDefault(Vector.new(Vector.len(code) + 1, 0), Vector.fromList([])), changed = true))
+
+fn settle(code: Vector<Instr>, succ: Vector<List<Int>>, l: Live) -> Vector<Int>
+    ? "Backward passes until nothing changes; a loop takes a pass more per level."
+    match l.changed
+        false -> l.v
+        true -> settle(code, succ, livePass(code, succ, Vector.len(code) - 1, Live(v = l.v, changed = false)))
+
+fn livePass(code: Vector<Instr>, succ: Vector<List<Int>>, pc: Int, l: Live) -> Live
+    ? "One pass from the last instruction to the first."
+    match pc < 0
+        true -> l
+        false -> livePass(code, succ, pc - 1, liveOne(code, succ, pc, l))
+
+fn liveOne(code: Vector<Instr>, succ: Vector<List<Int>>, pc: Int, l: Live) -> Live
+    ? "What is live before instruction pc: what it reads, and what is live after it that it does not write."
+    out = liveOut(Option.withDefault(Vector.get(succ, pc), []), l.v, 0)
+    i = Option.withDefault(Vector.get(code, pc), Instr.Nop)
+    now = Bits.or(readsOf(i), Bits.and(out, Bits.not(writesOf(i))))
+    match now == Option.withDefault(Vector.get(l.v, pc), 0)
+        true -> l
+        false -> Live(v = Option.withDefault(Vector.set(l.v, pc, now), l.v), changed = true)
+
+fn liveOut(ss: List<Int>, v: Vector<Int>, acc: Int) -> Int
+    ? "What is live at any successor; leaving the function, nothing."
+    match ss
+        [] -> acc
+        [k, ..rest] -> liveOut(rest, v, Bits.or(acc, Option.withDefault(Vector.get(v, k), 0)))
+
+fn readsOf(i: Instr) -> Int
+    ? "The local an instruction reads."
+    match i
+        Instr.LocalGet(k) -> bit(k)
+        _ -> 0
+
+fn writesOf(i: Instr) -> Int
+    ? "The local an instruction writes."
+    match i
+        Instr.LocalSet(k) -> bit(k)
+        Instr.LocalTee(k) -> bit(k)
+        _ -> 0
+
+fn bit(k: Int) -> Int
+    ? "The bit of local k."
+    Result.withDefault(Bits.shiftLeft(1, k), 0)
+
+fn succsFrom(is: List<Instr>, pc: Int, labs: List<Int>, acc: List<List<Int>>) -> List<List<Int>>
+    ? "Where each instruction may go next; labs holds where each enclosing label continues, -1 leaving the function."
+    match is
+        [] -> List.reverse(acc)
+        [i, ..rest] -> succsFrom(rest, pc + 1, labsAfter(i, pc, labs), List.prepend(succOf(i, pc, labs), acc))
+
+fn labsAfter(i: Instr, pc: Int, labs: List<Int>) -> List<Int>
+    ? "The labels inside after an instruction: a block and an if continue after their end, a loop at its start."
+    match i
+        Instr.Block(_, _, end, _) -> List.prepend(end + 1, labs)
+        Instr.If(_, _, _, end, _) -> List.prepend(end + 1, labs)
+        Instr.TryTable(_, _, end, _, _) -> List.prepend(end + 1, labs)
+        Instr.Loop(_, _) -> List.prepend(pc + 1, labs)
+        Instr.End -> List.drop(labs, 1)
+        _ -> labs
+
+fn succOf(i: Instr, pc: Int, labs: List<Int>) -> List<Int>
+    ? "The successors of one instruction."
+    match i
+        Instr.Br(d) -> [labAt(labs, d)]
+        Instr.BrIf(d) -> [pc + 1, labAt(labs, d)]
+        Instr.BrOnNull(d) -> [pc + 1, labAt(labs, d)]
+        Instr.BrOnNonNull(d) -> [pc + 1, labAt(labs, d)]
+        Instr.BrOnCast(d, _, _, _) -> [pc + 1, labAt(labs, d)]
+        Instr.BrOnCastFail(d, _, _, _) -> [pc + 1, labAt(labs, d)]
+        Instr.BrTable(ls, d) -> List.prepend(labAt(labs, d), labsAt(labs, List.fromVector(ls)))
+        Instr.If(_, _, els, end, _) -> [pc + 1, elseStart(els, end)]
+        Instr.Else -> [labAt(labs, 0)]
+        _ -> succRest(i, pc)
+
+fn succRest(i: Instr, pc: Int) -> List<Int>
+    ? "Instructions that end a path, and the rest, which go on."
+    match i
+        Instr.Return -> []
+        Instr.Unreachable -> []
+        Instr.ReturnCall(_) -> []
+        Instr.ReturnCallRef(_) -> []
+        Instr.ReturnCallIndirect(_, _) -> []
+        Instr.Throw(_) -> []
+        Instr.ThrowRef -> []
+        _ -> [pc + 1]
+
+fn elseStart(els: Int, end: Int) -> Int
+    ? "Where an if goes when its condition fails: after its else, or to its end."
+    match els == end
+        true -> end
+        false -> els + 1
+
+fn labAt(labs: List<Int>, d: Int) -> Int
+    ? "Where label d continues."
+    match List.drop(labs, d)
+        [c, .._] -> c
+        [] -> -1
+
+fn labsAt(labs: List<Int>, ds: List<Int>) -> List<Int>
+    ? "Where each of the labels continues."
+    match ds
+        [] -> []
+        [d, ..rest] -> List.prepend(labAt(labs, d), labsAt(labs, rest))
+
+fn liveAt(cx: Cx, pc: Int) -> List<Int>
+    ? "The locals live at pc, in order; all of them when liveness was not computed."
+    bitsIn(Option.withDefault(Vector.get(cx.live, pc), -1), 0, List.len(cx.ltys), [])
+
+fn bitsIn(b: Int, k: Int, n: Int, acc: List<Int>) -> List<Int>
+    ? "The locals below n whose bit is set."
+    match k >= n
+        true -> List.reverse(acc)
+        false -> match Bits.and(b, bit(k)) == 0
+            true -> bitsIn(b, k + 1, n, acc)
+            false -> bitsIn(b, k + 1, n, List.prepend(k, acc))
+
+fn kept(es: List<E>, ks: List<Int>, k: Int, acc: List<E>) -> List<E>
+    ? "The entries whose indices are in ks, in order."
+    match es
+        [] -> List.reverse(acc)
+        [e, ..rest] -> match List.contains(ks, k)
+            true -> kept(rest, ks, k + 1, List.prepend(e, acc))
+            false -> kept(rest, ks, k + 1, acc)
+
+fn localsIn(ts: List<ValType>, ks: List<Int>, pn: List<String>, k: Int, acc: List<E>) -> List<E>
+    ? "The locals of a function a label became: the live ones are its parameters, the dead ones hold their default, never read before written."
+    match ts
+        [] -> List.reverse(acc)
+        [t, ..rest] -> match List.contains(ks, k)
+            true -> localsIn(rest, ks, List.drop(pn, 1), k + 1, List.prepend(E(c = firstName(pn), t = t), acc))
+            false -> localsIn(rest, ks, pn, k + 1, List.prepend(E(c = defaultText(t), t = t), acc))
+
+fn firstName(ns: List<String>) -> String
+    ? "The first name of a list."
+    match ns
+        [n, .._] -> n
+        [] -> "0"
+
+verify liveness
+    liveness(Vector.fromList([Instr.LocalGet(1), Instr.Drop, Instr.End])) => Vector.fromList([2, 0, 0, 0])
+    liveness(Vector.fromList([Instr.I32Const(0), Instr.LocalSet(0), Instr.LocalGet(0), Instr.Drop, Instr.End])) => Vector.fromList([0, 0, 1, 0, 0, 0])
+
+verify settle
+    settle(Vector.fromList([]), Vector.fromList([]), Live(v = Vector.fromList([7]), changed = false)) => Vector.fromList([7])
+
+verify livePass
+    livePass(Vector.fromList([]), Vector.fromList([]), -1, Live(v = Vector.fromList([]), changed = false)).changed => false
+
+verify liveOne
+    liveOne(Vector.fromList([Instr.LocalGet(2)]), Vector.fromList([[1]]), 0, Live(v = Vector.fromList([0, 1]), changed = false)).v => Vector.fromList([5, 1])
+
+verify liveOut
+    liveOut([0, 1], Vector.fromList([1, 4]), 0) => 5
+    liveOut([-1], Vector.fromList([1]), 0) => 0
+
+verify readsOf
+    readsOf(Instr.LocalGet(3)) => 8
+
+verify writesOf
+    writesOf(Instr.LocalTee(0)) => 1
+
+verify bit
+    bit(70) > 0 => true
+
+verify succsFrom
+    succsFrom([Instr.Loop(0, Sig(params = [], results = [], ty = -1)), Instr.Br(0), Instr.End, Instr.End], 0, [-1], []) => [[1], [1], [3], [4]]
+
+verify labsAfter
+    labsAfter(Instr.End, 0, [3, 4]) => [4]
+
+verify succOf
+    succOf(Instr.If(0, 0, 3, 5, Sig(params = [], results = [], ty = -1)), 1, []) => [2, 4]
+    succOf(Instr.BrTable(Vector.fromList([0]), 1), 2, [7, 9]) => [9, 7]
+
+verify succRest
+    succRest(Instr.Return, 0) => []
+
+verify elseStart
+    elseStart(4, 4) => 4
+
+verify labAt
+    labAt([], 0) => -1
+
+verify labsAt
+    labsAt([5], [0]) => [5]
+
+verify liveAt
+    liveAt(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([]), ltys = [ValType.I32, ValType.I64], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([2])), 0) => [1]
+
+verify bitsIn
+    bitsIn(5, 0, 3, []) => [0, 2]
+
+verify kept
+    kept([E(c = "a", t = ValType.I32), E(c = "b", t = ValType.I32)], [1], 0, []) => [E(c = "b", t = ValType.I32)]
+
+verify localsIn
+    localsIn([ValType.I32, ValType.F64], [1], ["q0"], 0, []) => [E(c = "Rt.zero32()", t = ValType.I32), E(c = "q0", t = ValType.F64)]
+
+verify firstName
+    firstName([]) => "0"
+
+// ---- blocks, loops and ifs ----
+
+fn endOf(cx: Cx, pc: Int, st: St, labs: List<Lab>, g: Gl) -> Out
+    ? "end: a block that nothing branches to and a loop go on in place; any other construct falls through to its function."
+    match labs
+        [l, ..rest] -> match Bool.or(l.kind == 0, l.kind == 2)
+            true -> seq(cx, pc + 1, st, rest, g)
+            false -> Out(t = fallOut(cx, st, labs), g = g)
+        [] -> Out(t = returned(cx, st), g = g)
+
+fn block(cx: Cx, pc: Int, end: Int, sg: Sig, st: St, labs: List<Lab>, g: Gl) -> Out
+    ? "block: in place when nothing branches to it, else its end becomes a function the body calls."
+    match targeted(List.fromVector(cx.code), pc + 1, end, 0)
+        false -> seq(cx, pc + 1, st, List.prepend(Lab(kind = 0, name = "", tys = sg.results, below = [], keep = []), labs), g)
+        true -> joined(cx, pc, end, sg, st, labs, fresh(g), "{cx.pre}w{cx.fi}_{g.n}", 1)
+
+fn joined(cx: Cx, pc: Int, end: Int, sg: Sig, st: St, labs: List<Lab>, g: Gl, name: String, kind: Int) -> Out
+    ? "A block with a function for its end: the body, then the function, made from the code after end. When nothing but the function's end follows and nothing lies beneath the block on the stack, a branch to it simply returns what it carries."
+    match Bool.and(returnsAt(cx, end + 1, labs), List.len(st.stk) == List.len(sg.params))
+        true -> seq(cx, pc + 1, st, List.prepend(Lab(kind = 3, name = "", tys = sg.results, below = [], keep = []), labs), g)
+        false -> joinedFn(cx, pc, end, sg, st, labs, g, name, kind)
+
+fn joinedFn(cx: Cx, pc: Int, end: Int, sg: Sig, st: St, labs: List<Lab>, g: Gl, name: String, kind: Int) -> Out
+    ? "The body, then the function its end became."
+    l = Lab.update(labelFor(kind, name, sg.results, st, List.len(sg.params)), keep = liveAt(cx, end + 1))
+    body = seq(cx, pc + 1, st, List.prepend(l, labs), g)
+    after = joinFn(cx, end + 1, l, labs, body.g)
+    Out(t = body.t, g = after)
+
+fn returnsAt(cx: Cx, pc: Int, labs: List<Lab>) -> Bool
+    ? "Whether the code from pc only falls through ends to the end of the function."
+    match Vector.get(cx.code, pc)
+        Option.Some(Instr.End) -> match labs
+            [l, ..rest] -> match l.kind
+                3 -> true
+                0 -> returnsAt(cx, pc + 1, rest)
+                2 -> returnsAt(cx, pc + 1, rest)
+                _ -> false
+            [] -> true
+        _ -> false
+
+fn labelFor(kind: Int, name: String, tys: List<ValType>, st: St, nparams: Int) -> Lab
+    ? "A label whose branches carry tys over the values beneath the construct's parameters."
+    Lab(kind = kind, name = name, tys = tys, below = List.reverse(typesOf(List.drop(st.stk, nparams))), keep = [])
+
+fn typesOf(es: List<E>) -> List<ValType>
+    ? "The types of values."
+    match es
+        [] -> []
+        [e, ..rest] -> List.prepend(e.t, typesOf(rest))
+
+fn joinFn(cx: Cx, from: Int, l: Lab, labs: List<Lab>, g: Gl) -> Gl
+    ? "The function a label continues at, running the code from from with the outer labels."
+    lts = kept(exprs(names("l", List.len(cx.ltys), 0, []), cx.ltys, []), l.keep, 0, [])
+    ps = List.concat(typesOf(lts), List.concat(l.below, l.tys))
+    pn = names("q", List.len(ps), 0, [])
+    nl = List.len(lts)
+    stk = List.reverse(exprs(List.drop(pn, nl), List.drop(ps, nl), []))
+    st = St(ls = localsIn(cx.ltys, l.keep, List.take(pn, nl), 0, []), stk = stk, s = "s", top = true, ind = 4)
+    o = seq(cx, from, st, labs, g)
+    match noCycle(forwardTo(o.t, pn, l.name), o.g.alias, l.name)
+        Option.Some(other) -> Gl.update(o.g, alias = List.prepend(Alias(from = l.name, to = other), o.g.alias))
+        Option.None -> Gl.update(o.g, fns = List.prepend("fn {l.name}(x: Inst, s: Store, d: Int, rs: List<Val>{paramList(pn, ps)}) -> R\n    ? \"Part of function {cx.fi}.\"\n    " + o.t + "\n\n", o.g.fns))
+
+fn forwardTo(t: String, pn: List<String>, name: String) -> Option<String>
+    ? "The function a body only calls with its own parameters as they are: such a function is left out and its callers call that one."
+    tail = "(x, Rt.st(s), d, rs{commaList(pn)})"
+    match String.endsWith(t, tail)
+        false -> Option.None
+        true -> forwardName(String.slice(t, 0, String.len(t) - String.len(tail)), name)
+
+fn noCycle(f: Option<String>, all: List<Alias>, name: String) -> Option<String>
+    ? "A forward that does not lead back to the function itself through others already left out (an endless loop of branches keeps one function)."
+    match f
+        Option.Some(other) -> match finalOf(all, other, 64) == name
+            true -> Option.None
+            false -> Option.Some(other)
+        Option.None -> Option.None
+
+verify noCycle
+    noCycle(Option.Some("b"), [Alias(from = "b", to = "a")], "a") => Option.None
+    noCycle(Option.Some("b"), [], "a") => Option.Some("b")
+
+fn forwardName(callee: String, name: String) -> Option<String>
+    ? "A plain function name other than the function's own."
+    match Bool.or(callee == name, Bool.or(String.contains(callee, " "), Bool.or(String.contains(callee, "("), String.contains(callee, "\n"))))
+        true -> Option.None
+        false -> Option.Some(callee)
+
+fn unaliased(t: String, all: List<Alias>, as: List<Alias>) -> String
+    ? "The text with every call to a function left out going to the one it forwarded to."
+    match as
+        [] -> t
+        [a, ..rest] -> unaliased(String.replace(t, a.from + "(", finalOf(all, a.to, 64) + "("), all, rest)
+
+fn finalOf(all: List<Alias>, n: String, fuel: Int) -> String
+    ? "Where a chain of forwarding functions ends."
+    match fuel <= 0
+        true -> n
+        false -> match aliasOf(all, n)
+            Option.Some(m) -> finalOf(all, m, fuel - 1)
+            Option.None -> n
+
+fn aliasOf(all: List<Alias>, n: String) -> Option<String>
+    ? "What n forwards to, if it was left out."
+    match all
+        [] -> Option.None
+        [a, ..rest] -> match a.from == n
+            true -> Option.Some(a.to)
+            false -> aliasOf(rest, n)
+
+verify forwardTo
+    forwardTo("w0_3(x, Rt.st(s), d, rs, q0)", ["q0"], "w0_5") => Option.Some("w0_3")
+    forwardTo("w0_3(x, Rt.st(s), d, rs, q1)", ["q0"], "w0_5") => Option.None
+    forwardTo("w0_5(x, Rt.st(s), d, rs, q0)", ["q0"], "w0_5") => Option.None
+
+verify forwardName
+    forwardName("match c\n    true -> f", "g") => Option.None
+
+verify unaliased
+    unaliased("a(x) b(y)", [Alias(from = "a", to = "b"), Alias(from = "b", to = "c")], [Alias(from = "a", to = "b"), Alias(from = "b", to = "c")]) => "c(x) c(y)"
+
+verify finalOf
+    finalOf([Alias(from = "a", to = "b")], "a", 64) => "b"
+
+verify aliasOf
+    aliasOf([], "a") => Option.None
+
+fn loop(cx: Cx, pc: Int, sg: Sig, st: St, labs: List<Lab>, g: Gl) -> Out
+    ? "loop: a function that branches to it call; the code after the loop goes on inside it."
+    l = Lab.update(labelFor(2, "{cx.pre}w{cx.fi}_{g.n}", sg.params, st, List.len(sg.params)), keep = liveAt(cx, pc + 1))
+    Out(t = jumpTo(st, l), g = joinFn(cx, pc + 1, l, List.prepend(l, labs), fresh(g)))
+
+fn ifThen(cx: Cx, pc: Int, els: Int, end: Int, sg: Sig, st: St, labs: List<Lab>, g: Gl) -> Out
+    ? "if: a match on the condition, each arm running to the function the end became."
+    c = pop1(st).c
+    rest = popped(st, 1)
+    ret = Bool.and(returnsAt(cx, end + 1, labs), List.len(rest.stk) == List.len(sg.params))
+    l = ifLabel(ret, Lab.update(labelFor(1, "{cx.pre}w{cx.fi}_{g.n}", sg.results, rest, List.len(sg.params)), keep = liveAt(cx, end + 1)))
+    inner = St.update(rest, top = false, ind = st.ind + 8)
+    thenO = seq(cx, pc + 1, inner, List.prepend(l, labs), fresh(g))
+    elseO = elseArm(cx, els, end, inner, List.prepend(l, labs), thenO.g)
+    after = joinUnless(ret, cx, end + 1, l, labs, elseO.g)
+    Out(t = "match {cond(c)}\n{sp(st.ind + 4)}true -> " + thenO.t + "\n{sp(st.ind + 4)}false -> " + elseO.t, g = after)
+
+fn ifLabel(ret: Bool, l: Lab) -> Lab
+    ? "An if whose end only returns has the function's own label."
+    match ret
+        true -> Lab.update(l, kind = 3)
+        false -> l
+
+fn joinUnless(ret: Bool, cx: Cx, from: Int, l: Lab, labs: List<Lab>, g: Gl) -> Gl
+    ? "The function for an if's end, unless the end only returns."
+    match ret
+        true -> g
+        false -> joinFn(cx, from, l, labs, g)
+
+fn elseArm(cx: Cx, els: Int, end: Int, st: St, labs: List<Lab>, g: Gl) -> Out
+    ? "The else arm, or straight to the end's function when there is none."
+    match els == end
+        true -> Out(t = fallOut(cx, st, labs), g = g)
+        false -> seq(cx, els + 1, st, labs, g)
+
+fn targeted(is: List<Instr>, k: Int, end: Int, depth: Int) -> Bool
+    ? "Whether a branch between instructions k and end goes to the block that ends at end, depth constructs deeper."
+    match List.drop(is, k)
+        [] -> false
+        [i, .._] -> match k >= end
+            true -> false
+            false -> match branchesTo(i, depth)
+                true -> true
+                false -> targeted(is, k + 1, end, depth + nesting(i))
+
+fn branchesTo(i: Instr, depth: Int) -> Bool
+    ? "Whether an instruction branches depth labels out."
+    match i
+        Instr.Br(d) -> d == depth
+        Instr.BrIf(d) -> d == depth
+        Instr.BrOnNull(d) -> d == depth
+        Instr.BrOnNonNull(d) -> d == depth
+        Instr.BrOnCast(d, _, _, _) -> d == depth
+        Instr.BrOnCastFail(d, _, _, _) -> d == depth
+        Instr.BrTable(ls, d) -> Bool.or(d == depth, List.contains(List.fromVector(ls), depth))
+        _ -> false
+
+fn nesting(i: Instr) -> Int
+    ? "How an instruction changes the depth of constructs."
+    match i
+        Instr.Block(_, _, _, _) -> 1
+        Instr.Loop(_, _) -> 1
+        Instr.If(_, _, _, _, _) -> 1
+        Instr.TryTable(_, _, _, _, _) -> 1
+        Instr.End -> -1
+        _ -> 0
+
+verify endOf
+    endOf(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, St(ls = [], stk = [], s = "s", top = true, ind = 4), [], Gl(n = 0, fns = [], alias = [])).t => "R.V0(s)"
+
+verify block
+    String.len(block(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.Block(0, 0, 2, Sig(params = [], results = [], ty = -1)), Instr.Br(0), Instr.End, Instr.End]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, 2, Sig(params = [], results = [], ty = -1), St(ls = [], stk = [], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [], below = [], keep = [])], Gl(n = 0, fns = [], alias = [])).t) > 0 => true
+
+verify joined
+    joined(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.Block(0, 0, 2, Sig(params = [], results = [], ty = -1)), Instr.Br(0), Instr.End, Instr.End]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, 2, Sig(params = [], results = [], ty = -1), St(ls = [], stk = [], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [], below = [], keep = [])], Gl(n = 0, fns = [], alias = []), "w0_0", 1).t => "R.V0(s)"
+
+verify joinedFn
+    joinedFn(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.Block(0, 0, 2, Sig(params = [], results = [], ty = -1)), Instr.Br(0), Instr.End, Instr.Nop, Instr.End]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, 2, Sig(params = [], results = [], ty = -1), St(ls = [], stk = [], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [], below = [], keep = [])], Gl(n = 0, fns = [], alias = []), "w0_0", 1).t => "w0_0(x, Rt.st(s), d, rs)"
+
+verify returnsAt
+    returnsAt(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.End, Instr.End]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, [Lab(kind = 0, name = "", tys = [], below = [], keep = []), Lab(kind = 3, name = "", tys = [], below = [], keep = [])]) => true
+    returnsAt(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.Nop, Instr.End]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, []) => false
+
+verify ifLabel
+    ifLabel(true, Lab(kind = 1, name = "a", tys = [], below = [], keep = [])).kind => 3
+
+verify joinUnless
+    joinUnless(true, Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, Lab(kind = 1, name = "a", tys = [], below = [], keep = []), [], Gl(n = 0, fns = [], alias = [])).n => 0
+
+verify labelFor
+    labelFor(1, "f", [], St(ls = [], stk = [E(c = "p", t = ValType.I64), E(c = "u", t = ValType.F64)], s = "s", top = true, ind = 4), 1).below => [ValType.F64]
+
+verify typesOf
+    typesOf([E(c = "a", t = ValType.F32)]) => [ValType.F32]
+
+verify joinFn
+    List.len(joinFn(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.End]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, Lab(kind = 1, name = "w0_0", tys = [], below = [], keep = []), [Lab(kind = 3, name = "", tys = [], below = [], keep = [])], Gl(n = 0, fns = [], alias = [])).fns) => 1
+
+verify loop
+    String.len(loop(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.Loop(0, Sig(params = [], results = [], ty = -1)), Instr.End, Instr.End]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, Sig(params = [], results = [], ty = -1), St(ls = [], stk = [], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [], below = [], keep = [])], Gl(n = 0, fns = [], alias = [])).t) > 0 => true
+
+verify ifThen
+    String.len(ifThen(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.If(0, 0, 1, 1, Sig(params = [], results = [], ty = -1)), Instr.End, Instr.End]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, 1, 1, Sig(params = [], results = [], ty = -1), St(ls = [], stk = [E(c = "c", t = ValType.I32)], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [], below = [], keep = [])], Gl(n = 0, fns = [], alias = [])).t) > 0 => true
+
+verify elseArm
+    elseArm(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 1, 1, St(ls = [], stk = [], s = "s", top = true, ind = 4), [], Gl(n = 0, fns = [], alias = [])).t => "R.V0(s)"
+
+verify targeted
+    targeted([Instr.Block(0, 0, 2, Sig(params = [], results = [], ty = -1)), Instr.Br(0), Instr.End], 1, 2, 0) => true
+    targeted([Instr.Block(0, 0, 2, Sig(params = [], results = [], ty = -1)), Instr.Nop, Instr.End], 1, 2, 0) => false
+
+verify branchesTo
+    branchesTo(Instr.Br(1), 1) => true
+
+verify nesting
+    nesting(Instr.End) => -1

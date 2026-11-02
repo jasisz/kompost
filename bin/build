@@ -7,5 +7,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 [ -x "$root/.aver-tool/bin/aver" ] && PATH="$root/.aver-tool/bin:$PATH"
 export AVER_RUNTIME_PATH="${AVER_RUNTIME_PATH:-$root/.aver-rt/aver-rt}"
 aver compile "$root/src/main.av" --module-root "$root/src" -o "$root/.build" --name kompost >/dev/null
+# The binary declares every module itself; src/lib.rs would compile them all a second time.
+rm -f "$root/.build/src/lib.rs"
 cd "$root/.build" && cargo build --release -j "${JOBS:-4}" --quiet
 echo "$root/.build/target/release/kompost"

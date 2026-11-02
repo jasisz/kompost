@@ -7,7 +7,7 @@ module Valid
         "unreachable code, and a stack of control frames. Reference types follow"
         "the GC proposal's subtyping, with concrete types compared through their"
         "declared supertypes and iso-recursive canonicalization."
-    exposes [validate, valSub, heapSub]
+    exposes [validate, valSub, heapSub, numType, NT]
     depends [Ast, Simd]
     effects []
 

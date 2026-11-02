@@ -12,7 +12,7 @@ module Exec
         "return_call simply replaces the frame. Running is pure: a call to an"
         "imported function stops the machine with an Outcome.Host that holds"
         "everything needed to resume once the host has answered."
-    exposes [Inst, Store, Frame, Machine, Outcome, Obj, Heap, Placed, Fn, MemState, Settled, Links, instantiate, prepare, prepareIn, blankStore, noLinks, gaddr, taddr, maddr, swapTo, settle, settlePart, invoke, resume, resumeThrow, tagId, exportFunc, Ready, writeMem, machineRoots, memState, putMemState, table, setTable]
+    exposes [Inst, Store, Frame, Machine, Outcome, Next, heldRoots, suspended, idx, isSub, fnType, matches, loadSize, loadVal, storeSize, storeBits, memBytes, Obj, Heap, Placed, Fn, MemState, Settled, Links, emptyInst, exec, bare, pushAll, top, pack, unpack, composted, newRefs, flat, vget, vset, maxArray, bitsOf, arrLen, instantiate, prepare, prepareIn, blankStore, noLinks, gaddr, taddr, maddr, swapTo, settle, settlePart, invoke, resume, resumeThrow, tagId, exportFunc, Ready, writeMem, machineRoots, memState, putMemState, table, setTable]
     depends [Ast, Value, Num, Mem, Bin, Kompost, Arr, Simd, Types]
     effects []
 
@@ -44,6 +44,7 @@ record Store
     datas: Vector<Vector<Int>>
     gcAt: Int
     pinned: List<Val>
+    held: List<List<Frame>>
     steps: Int
     mods: Map<Int, Module>
 
@@ -96,6 +97,13 @@ record Ready
     s: Store
 
 // ---- small helpers ----
+
+fn emptyInst() -> Inst
+    ? "An instance of the empty module, alone in its store."
+    Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true)
+
+verify emptyInst
+    emptyInst().base => 0
 
 // ---- addresses ----
 
@@ -302,8 +310,8 @@ fn loop(x: Inst, f: Frame, calls: List<Frame>, s: Store, n: Int) -> Outcome
                 false -> stamp(Outcome.Trap("cast failure", s), n + 1)
             Instr.I32Const(c) -> loop(x, push(f, Val.I32(c)), calls, s, n + 1)
             Instr.I64Const(c) -> loop(x, push(f, Val.I64(c)), calls, s, n + 1)
-            Instr.LocalSet(k) -> loop(x, Frame.update(f, pc = f.pc + 1, sp = f.sp - 1, locals = vset(f.locals, k, at(f, 0))), calls, s, n + 1)
-            Instr.LocalTee(k) -> loop(x, Frame.update(f, pc = f.pc + 1, locals = vset(f.locals, k, at(f, 0))), calls, s, n + 1)
+            Instr.LocalSet(k) -> loop(x, setTop(f, k, 1), calls, s, n + 1)
+            Instr.LocalTee(k) -> loop(x, setTop(f, k, 0), calls, s, n + 1)
             Instr.Drop -> loop(x, putN(f, 1), calls, s, n + 1)
             Instr.GlobalGet(k) -> loop(x, push(f, vget(s.globals, gaddr(x, k))), calls, s, n + 1)
             Instr.RefNull(_) -> loop(x, push(f, Val.Null), calls, s, n + 1)
@@ -444,7 +452,7 @@ verify getGet
 fn setGet(f: Frame, a: Int, b: Int) -> Frame
     ? "local.set a then local.get b, as one step; b is read before a is written, so the locals stay unshared."
     v = getAfterSet(f, a, b)
-    push(Frame.update(f, pc = f.pc + 1, sp = f.sp - 1, locals = vset(f.locals, a, at(f, 0))), v)
+    push(setTop(f, a, 1), v)
 
 fn getAfterSet(f: Frame, a: Int, b: Int) -> Val
     ? "What local b holds once local a is set to the top of the stack."
@@ -1267,11 +1275,20 @@ verify pick
 
 fn localSet(x: Inst, f: Frame, k: Int, calls: List<Frame>, s: Store) -> Next
     ? "local.set."
-    go(x, Frame.update(f, pc = f.pc + 1, sp = f.sp - 1, locals = vset(f.locals, k, at(f, 0))), calls, s)
+    go(x, setTop(f, k, 1), calls, s)
 
 fn localTee(x: Inst, f: Frame, k: Int, calls: List<Frame>, s: Store) -> Next
     ? "local.tee."
-    go(x, Frame.update(f, pc = f.pc + 1, locals = vset(f.locals, k, at(f, 0))), calls, s)
+    go(x, setTop(f, k, 0), calls, s)
+
+fn setTop(f: Frame, k: Int, pop: Int) -> Frame
+    ? "Local k set to the value on top, which pop says whether to take off (local.set) or leave (local.tee). The value is read first, so the frame's locals move out of it and are written in place instead of copied."
+    v = at(f, 0)
+    Frame.update(f, pc = f.pc + 1, sp = f.sp - pop, locals = vset(f.locals, k, v))
+
+verify setTop
+    setTop(pushAll(bare(Vector.fromList([Val.I32(0)]), 2, 0), [Val.I32(5)]), 0, 1).locals => Vector.fromList([Val.I32(5)])
+    setTop(pushAll(bare(Vector.fromList([Val.I32(0)]), 2, 0), [Val.I32(5)]), 0, 0).sp => 1
 
 fn globalSet(x: Inst, f: Frame, k: Int, calls: List<Frame>, s: Store) -> Next
     ? "global.set."
@@ -1594,7 +1611,7 @@ fn rethreshold(s: Store) -> Store
 
 fn roots(f: Frame, popped: Int, o: Obj, arr: Option<Arr>, calls: List<Frame>, s: Store) -> List<Val>
     ? "Every value the program can still reach without the heap: the current frame's locals and live stack, the new object's fields or elements, every suspended frame, the values the host pinned (a machine suspended while the host calls back into the guest), the globals, tables and element segments."
-    own = List.concat(s.pinned, List.concat(List.fromVector(f.locals), List.concat(stackVals(f, popped), newRefs(o, arr))))
+    own = List.concat(s.pinned, List.concat(heldRoots(s.held, []), List.concat(List.fromVector(f.locals), List.concat(stackVals(f, popped), newRefs(o, arr)))))
     List.concat(own, List.concat(frameRoots(calls, []), List.concat(List.fromVector(s.globals), List.concat(flat(List.fromVector(s.tables), []), flat(List.fromVector(s.elems), [])))))
 
 fn newRefs(o: Obj, arr: Option<Arr>) -> List<Val>
@@ -1626,7 +1643,7 @@ verify flat
     flat([Vector.fromList([Val.Null]), Vector.fromList([Val.I32(1)])], []) => [Val.I32(1), Val.Null]
 
 verify composted
-    composted([], Store(globals = Vector.fromList([]), heap = Kompost.empty(), mem = {}, pages = 0, maxPages = 0, memAt = -1, others = {}, tables = Vector.fromList([]), elems = Vector.fromList([]), datas = Vector.fromList([]), gcAt = 0, pinned = [], steps = 0, mods = {})).gcAt => 65536
+    composted([], Store(globals = Vector.fromList([]), heap = Kompost.empty(), mem = {}, pages = 0, maxPages = 0, memAt = -1, others = {}, tables = Vector.fromList([]), elems = Vector.fromList([]), datas = Vector.fromList([]), gcAt = 0, pinned = [], held = [], steps = 0, mods = {})).gcAt => 65536
 
 fn structNew(x: Inst, f: Frame, t: Int, dflt: Bool, calls: List<Frame>, s: Store) -> Next
     ? "struct.new and struct.new_default."
@@ -2915,7 +2932,7 @@ verify firstShape
 
 fn emptyStore(m: Module) -> Store
     ? "The store before globals, tables and segments are set up."
-    Store(globals = Vector.fromList([]), heap = Kompost.empty(), mem = {}, pages = m.memMin, maxPages = Int.min(m.memMax, pageCap(m, 0)), memAt = memAtOf(m), others = othersOf(m, m.moreMems, 1, {}), tables = Vector.fromList(tablesOf(m.tables, m.tableMins, [])), elems = Vector.fromList([]), datas = Vector.fromList(dataBytes(List.fromVector(m.datas), [])), gcAt = 65536, pinned = [], steps = 0, mods = {})
+    Store(globals = Vector.fromList([]), heap = Kompost.empty(), mem = {}, pages = m.memMin, maxPages = Int.min(m.memMax, pageCap(m, 0)), memAt = memAtOf(m), others = othersOf(m, m.moreMems, 1, {}), tables = Vector.fromList(tablesOf(m.tables, m.tableMins, [])), elems = Vector.fromList([]), datas = Vector.fromList(dataBytes(List.fromVector(m.datas), [])), gcAt = 65536, pinned = [], held = [], steps = 0, mods = {})
 
 fn othersOf(m: Module, ms: List<MemType>, k: Int, acc: Map<Int, MemState>) -> Map<Int, MemState>
     ? "Memories 1 and up, each empty at its minimum size."
@@ -2988,7 +3005,7 @@ fn noLinks() -> Links
 
 fn blankStore() -> Store
     ? "A store with nothing in it yet."
-    Store(globals = Vector.fromList([]), heap = Kompost.empty(), mem = {}, pages = 0, maxPages = 0, memAt = -1, others = {}, tables = Vector.fromList([]), elems = Vector.fromList([]), datas = Vector.fromList([]), gcAt = 65536, pinned = [], steps = 0, mods = {})
+    Store(globals = Vector.fromList([]), heap = Kompost.empty(), mem = {}, pages = 0, maxPages = 0, memAt = -1, others = {}, tables = Vector.fromList([]), elems = Vector.fromList([]), datas = Vector.fromList([]), gcAt = 65536, pinned = [], held = [], steps = 0, mods = {})
 
 fn prepareIn(s0: Store, m: Module, hostGlobals: Map<String, Val>, shapes: Vector<Shape>, id: Int, links: Links) -> Result<Ready, String>
     ? "The first half of instantiating m as instance id into a store other instances may share: its own globals, tables and segments get the next addresses, its own memories the addresses id * 65536 + k, what it imports from another instance (links) that instance's addresses; functions built, globals and tables initialized, segments evaluated but not placed. Memory 0 of the instance ends up on top of the store."
@@ -3304,6 +3321,22 @@ fn writeMem(mem: Map<Int, Vector<Int>>, ea: Int, bs: List<Int>) -> Map<Int, Vect
 
 verify writeMem
     Map.len(writeMem({}, 0, [1])) => 1
+
+fn heldRoots(hs: List<List<Frame>>, acc: List<Val>) -> List<Val>
+    ? "What the frames of machines suspended while the host runs hold: roots only when a collection comes, so suspending costs nothing."
+    match hs
+        [] -> acc
+        [fs, ..rest] -> heldRoots(rest, frameRoots(fs, acc))
+
+fn suspended(s: Store, mach: Machine, args: List<Val>) -> Store
+    ? "The store a suspended machine's host call works on: the machine's frames held and the call's arguments pinned, so the collector keeps what they hold if the guest runs again."
+    Store.update(s, pinned = List.concat(args, s.pinned), held = List.prepend(List.prepend(mach.frame, mach.calls), s.held))
+
+verify heldRoots
+    heldRoots([], []) => []
+
+verify suspended
+    suspended(blankStore(), Machine(frame = bare(Vector.fromList([Val.Ref(1)]), 1, 0), calls = [], store = blankStore()), [Val.I32(2)]).pinned => [Val.I32(2)]
 
 fn machineRoots(mach: Machine) -> List<Val>
     ? "The values a suspended machine holds outside the heap, for the host to pin while it calls back into the guest."

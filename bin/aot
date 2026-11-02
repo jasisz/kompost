@@ -1,0 +1,35 @@
+#!/bin/sh
+# Builds a Kompost with the functions of one wasm module compiled ahead of time
+# (see src/aot.av): kompost --compile writes the Native module, which replaces
+# src/native.av in a copy of the sources. The binary it prints runs that module
+# with the compiled functions native and everything else interpreted; any
+# other module it runs is interpreted, as Native checks the module's octets.
+# usage: bin/aot FILE.wasm...   (AOT_NAME names the build, by default after
+#        the first file; KOMPOST names the Kompost that compiles, by default
+#        Aver's VM runs src/main.av)
+set -e
+root=$(cd "$(dirname "$0")/.." && pwd)
+[ -x "$root/.aver-tool/bin/aver" ] && PATH="$root/.aver-tool/bin:$PATH"
+export AVER_RUNTIME_PATH="${AVER_RUNTIME_PATH:-$root/.aver-rt/aver-rt}"
+name=${AOT_NAME:-$(basename "$1" .wasm)}
+work="$root/.build/aot/$name"
+rm -rf "$work/src" && mkdir -p "$work/src"
+cp "$root"/src/*.av "$root/src/aver.toml" "$work/src/"
+if [ -n "$KOMPOST" ]; then
+  "$KOMPOST" --compile "$@" > "$work/src/native.av"
+else
+  aver run "$root/src/main.av" --module-root "$root/src" -- --compile "$@" > "$work/src/native.av"
+fi
+aver compile "$work/src/main.av" --module-root "$work/src" -o "$work/out" --name kompost >/dev/null
+# The binary declares every module itself; src/lib.rs would compile them all a second time.
+rm -f "$work/out/src/lib.rs"
+# Aver forces inlining of every thin function; the compiled module has thousands,
+# each called from many branches, and forcing them all in makes rustc run out
+# of memory. Without it LLVM inlines what pays.
+perl -i -ne 'print unless /^#\[inline\(always\)\]$/' "$work/out/src/aver_generated/native/mod.rs"
+# Compiled calls nest on the thread's stack, several Rust frames per wasm call;
+# Kompost allows 200 000 calls, as the interpreter does, so the thread gets
+# room for them (reserved, not used until a program goes that deep).
+perl -i -pe 's/\.stack_size\(aver_rt::THREAD_STACK_BYTES\)/.stack_size(8usize << 30)/' "$work/out/src/main.rs"
+(cd "$work/out" && cargo build --release -j "${JOBS:-2}" --quiet)
+echo "$work/out/target/release/kompost"

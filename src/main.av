@@ -12,7 +12,7 @@ module Main
         "module's calls to the host, the one Aver's wasm-gc output imports:"
         "strings leave as references to arrays of octets on Kompost's heap, and"
         "come in through the module's own __rt_string_from_lm."
-    depends [Ast, Value, Num, Decode, Valid, Exec, Kompost, Arr, Mem, Bytes, Link]
+    depends [Ast, Value, Num, Decode, Valid, Exec, Kompost, Arr, Mem, Bytes, Link, Rt, Native, Aot]
     effects [Args.get, Console.print, Console.error, Disk.readBytes, Disk.readBytesAt, Disk.readText]
 
 fn main() -> Int
@@ -20,6 +20,7 @@ fn main() -> Int
     ! [Args.get, Console.print, Console.error, Disk.readBytes, Disk.readBytesAt, Disk.readText]
     match Args.get()
         ["--validate", path] -> report(checkFile(path))
+        ["--compile", ..paths] -> report(compileFiles(paths))
         ["--script", script] -> report(runScript(script))
         ["--stats", path, ..rest] -> report(statsOf(runFileStore(path, "_start", [], rest)))
         ["--invoke", entry, path, ..rest] -> report(runFile(path, entry, rest, []))
@@ -76,13 +77,42 @@ verify show
     show(Val.I64(-3)) => "-3"
     show(Val.Ref(2)) => ""
 
+fn compileFiles(paths: List<String>) -> Result<List<Val>, String>
+    ? "Prints the Native module compiled from wasm files (see bin/aot); a file that does not load is left out."
+    ! [Console.print, Disk.readBytes]
+    Console.print(Aot.compile(loadedAll(paths, [])))
+    Result.Ok([])
+
+fn loadedAll(paths: List<String>, acc: List<Mod>) -> List<Mod>
+    ? "The modules that decode and validate, with their size and checksum."
+    ! [Disk.readBytes]
+    match paths
+        [] -> List.reverse(acc)
+        [p, ..rest] -> loadedAll(rest, keepLoaded(compiledOf(p), acc))
+
+fn keepLoaded(r: Result<Mod, String>, acc: List<Mod>) -> List<Mod>
+    ? "Adds a module that loaded."
+    match r
+        Result.Ok(d) -> List.prepend(d, acc)
+        Result.Err(_) -> acc
+
+fn compiledOf(path: String) -> Result<Mod, String>
+    ? "A module to compile."
+    ! [Disk.readBytes]
+    b = Disk.readBytes(path)?
+    octs = Bytes.octets(b)
+    m = Decode.decode(Vector.fromList(octs))?
+    _ = invalid(Valid.validate(m))?
+    Result.Ok(Mod(m = m, size = List.len(octs), sum = checksum(octs, 0, 0)))
+
 fn runFile(path: String, entry: String, args: List<String>, pargs: List<String>) -> Result<List<Val>, String>
     ? "Reads, decodes, instantiates and runs; pargs are the program's own arguments."
     ! [Console.print, Disk.readBytes, Disk.readBytesAt]
     b = Disk.readBytes(path)?
     m = Decode.decode(Vector.fromList(Bytes.octets(b)))?
     shapes = invalid(Valid.validate(m))?
-    ready = Exec.instantiate(m, spectestGlobals(), shapes)?
+    ready0 = Exec.instantiate(m, spectestGlobals(), shapes)?
+    ready = Ready.update(ready0, x = Link.compiled(ready0.x, keyOfOctets(Bytes.octets(b))))
     s = runStart(ready, m.start, pargs)?
     fi = Result.fromOption(Exec.exportFunc(m, entry), "no exported function {entry}")?
     _ = arityOk(List.len(args), List.len(paramsOf(ready.x, fi)), entry)?
@@ -115,21 +145,23 @@ fn scriptLine(w: Link.World, ws: List<String>) -> Link.World
 record Loaded
     m: Module
     shapes: Vector<Shape>
+    key: Int
 
 fn loadModule(path: String) -> Result<Loaded, String>
     ? "A module read, decoded and validated."
     ! [Disk.readBytes]
     b = Disk.readBytes(path)?
-    m = Decode.decode(Vector.fromList(Bytes.octets(b)))?
+    octs = Bytes.octets(b)
+    m = Decode.decode(Vector.fromList(octs))?
     shapes = invalid(Valid.validate(m))?
-    Result.Ok(Loaded(m = m, shapes = shapes))
+    Result.Ok(Loaded(m = m, shapes = shapes, key = keyOfOctets(octs)))
 
 fn moduleLine(w: Link.World, id: Int, l: Result<Loaded, String>) -> Link.World
     ? "Instantiates a loaded module, or says why it could not be loaded."
     ! [Console.print]
     match l
         Result.Err(e) -> scriptSays("error\t{e}", w)
-        Result.Ok(ld) -> said(Link.add(w, id, ld.m, ld.shapes, spectestGlobals()))
+        Result.Ok(ld) -> said(Link.add(w, id, ld.m, ld.shapes, spectestGlobals(), ld.key))
 
 fn invokeLine(w: Link.World, id: Int, name: String, args: List<Val>) -> Link.World
     ? "Calls an export of instance id."
@@ -300,23 +332,57 @@ fn drive(x: Inst, out: Outcome, pargs: List<String>) -> Result<Ran, String>
         Outcome.Done(vs, s) -> Result.Ok(Ran(vs = vs, s = s))
         Outcome.Trap(e, _) -> Result.Err("trap: {e}")
         Outcome.Thrown(_, _, _) -> Result.Err("trap: uncaught exception")
-        Outcome.Host(fi, args, tail, mach) -> answered(x, mach, tail, host(x, fi, args, pin(mach, args), pargs)?, pargs)
+        Outcome.Host(fi, args, tail, mach) -> hosted(x, fi, args, tail, mach, pargs)
 
-fn answered(x: Inst, mach: Machine, tail: Bool, a: Ran, pargs: List<String>) -> Result<Ran, String>
-    ? "Resumes the machine with the host's answer and the store the host left, unpinning what the call pinned."
+fn hosted(x: Inst, fi: Int, args: List<Val>, tail: Bool, mach: Machine, pargs: List<String>) -> Result<Ran, String>
+    ? "Answers a call to the host, then resumes the machine with the answer and the store the host left, unpinning what the call pinned. While the host works, the machine holds no store, so the store it works on is the only one and writes stay in place."
     ! [Console.print, Disk.readBytesAt]
-    drive(x, Exec.resume(x, Machine.update(mach, store = Store.update(a.s, pinned = mach.store.pinned)), a.vs, tail), pargs)
-
-fn pin(mach: Machine, args: List<Val>) -> Store
-    ? "The store the host works on: everything the suspended machine and the call's arguments hold stays alive if the host runs the guest again."
-    Store.update(mach.store, pinned = List.concat(args, List.concat(Exec.machineRoots(mach), mach.store.pinned)))
+    pinnedBefore = mach.store.pinned
+    heldBefore = mach.store.held
+    s = Exec.suspended(mach.store, mach, args)
+    bare = Machine.update(mach, store = Exec.blankStore())
+    a = host(x, fi, args, s, pargs)?
+    drive(x, Exec.resume(x, Machine.update(bare, store = Store.update(a.s, pinned = pinnedBefore, held = heldBefore)), a.vs, tail), pargs)
 
 fn host(x: Inst, fi: Int, args: List<Val>, s: Store, pargs: List<String>) -> Result<Ran, String>
     ? "Answers one call to an imported function."
     ! [Console.print, Disk.readBytesAt]
     match Vector.get(x.fns, fi)
-        Option.Some(g) -> hostCall(x, g.mod, g.name, args, s, pargs)
+        Option.Some(g) -> match g.mod == "*native"
+            true -> nativeCall(x, Result.withDefault(Int.fromString(g.name), -1), fi, args, s)
+            false -> hostCall(x, g.mod, g.name, args, s, pargs)
         Option.None -> Result.Err("call to undefined import {fi}")
+
+fn nativeCall(x: Inst, key: Int, fi: Int, args: List<Val>, s: Store) -> Result<Ran, String>
+    ? "Runs a compiled function the interpreter stopped at."
+    match Native.call(key, x, s, 0, fi, args)
+        R.V0(s2) -> Result.Ok(Ran(vs = [], s = s2))
+        R.V1(a, s2) -> Result.Ok(Ran(vs = [a], s = s2))
+        R.V2(a, c, s2) -> Result.Ok(Ran(vs = [a, c], s = s2))
+        R.VN(vs, s2) -> Result.Ok(Ran(vs = vs, s = s2))
+        R.Tail(_, _, _) -> Result.Err("trap: unresolved tail call")
+        R.Trap(e, _) -> Result.Err("trap: {e}")
+
+verify nativeCall
+    nativeCall(Exec.emptyInst(), -1, 0, [], Exec.blankStore()) => Result.Err("trap: module is not compiled")
+
+// ---- compiled functions ----
+
+fn keyOfOctets(octs: List<Int>) -> Int
+    ? "The key Native knows a module's octets by, or -1."
+    Native.keyOf(List.len(octs), checksum(octs, 0, 0))
+
+fn checksum(octs: List<Int>, k: Int, acc: Int) -> Int
+    ? "A checksum of a module's octets, to tell the modules Native was compiled from."
+    match octs
+        [] -> acc
+        [o, ..rest] -> checksum(rest, k + 1, Int.mod(acc * 31 + o + k, 2147483647))
+
+verify keyOfOctets
+    keyOfOctets([1]) => -1
+
+verify checksum
+    checksum([1, 2], 0, 0) => 34
 
 fn hostCall(x: Inst, md: String, nm: String, args: List<Val>, s: Store, pargs: List<String>) -> Result<Ran, String>
     ? "The host functions Kompost provides, all from the aver module."

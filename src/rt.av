@@ -1,0 +1,992 @@
+module Rt
+    intent =
+        "What compiled functions (see Native) call at run time. A compiled"
+        "function keeps i32 and i64 values as plain Ints and every other value"
+        "as a Val, threads the store through, and returns an R: its results"
+        "with the store, or a trap with the store. The instructions it does not"
+        "do itself go to the interpreter one at a time (via), on a frame that"
+        "holds just their operands, so their meaning is written once. The"
+        "roots a compiled function hands on (rs) are the references its callers"
+        "still hold; a collection also keeps what the store pins."
+    exposes [R, Mk, noRoots, via, viaRooted, results, b, field, fieldPacked, setField, structNew, arrayNewDefault, arrayNew, arrayGet, arraySet, arrayLen, global, setGlobal, keep, keepAll, nth, st, callRef, callIndirect, tailRef, tailIndirect, resolve, interp, deep, refTest, refCast, nonNull, load, store, pickV, binV, unV, boxResult, from32, w32, zero32, of32, val32, res32, eqz32, and32, or32, xor32, eq32, ne32, lt32, gt32, le32, ge32, ltu32, gtu32, leu32, geu32, pick32, add32, sub32, mul32, from64, w64, zero64, of64, val64, res64, eqz64, and64, or64, xor64, eq64, ne64, lt64, gt64, le64, ge64, ltu64, gtu64, leu64, geu64, pick64, add64, sub64, mul64, nz32, i32v, pack8, pack16, u32of]
+    exposes opaque [W32, W64]
+    depends [Ast, Value, Num, Kompost, Arr, Exec, Mem]
+    effects []
+
+type R
+    V0(Store)
+    V1(Val, Store)
+    V2(Val, Val, Store)
+    VN(List<Val>, Store)
+    Trap(String, Store)
+    Tail(Int, List<Val>, Store)
+
+record Mk
+    v: Val
+    s: Store
+
+fn noRoots() -> List<Val>
+    ? "No roots: what an entry from the interpreter starts with (the store pins what the interpreter holds)."
+    []
+
+verify noRoots
+    noRoots() => []
+
+// ---- through the interpreter ----
+
+fn via(x: Inst, s: Store, i: Instr, args: List<Val>, n: Int) -> R
+    ? "Instruction i run by the interpreter on a frame holding args, the last on top; its n results come back in order."
+    viaOut(Exec.exec(x, i, Exec.pushAll(Exec.bare(Vector.fromList([]), List.len(args) + n + 1, n), args), [], s), n)
+
+fn viaRooted(x: Inst, s: Store, rs: List<Val>, i: Instr, args: List<Val>, n: Int) -> R
+    ? "via for an instruction that may allocate: what the compiled callers hold is pinned while it runs."
+    p = s.pinned
+    r = via(x, Store.update(s, pinned = List.concat(rs, p)), i, args, n)
+    unpinned(r, p)
+
+fn unpinned(r: R, p: List<Val>) -> R
+    ? "The result with the store's pins back as they were."
+    match r
+        R.V0(s) -> R.V0(Store.update(s, pinned = p))
+        R.V1(a, s) -> R.V1(a, Store.update(s, pinned = p))
+        R.V2(a, c, s) -> R.V2(a, c, Store.update(s, pinned = p))
+        R.VN(vs, s) -> R.VN(vs, Store.update(s, pinned = p))
+        R.Tail(fi, vs, s) -> R.Tail(fi, vs, Store.update(s, pinned = p))
+        R.Trap(e, s) -> R.Trap(e, Store.update(s, pinned = p))
+
+fn viaOut(nx: Next, n: Int) -> R
+    ? "What the interpreter's step left."
+    match nx
+        Next.Go(f, _, s) -> results(List.reverse(Exec.top(f, n)), s)
+        Next.Out(o) -> outcomeR(o)
+
+fn outcomeR(o: Outcome) -> R
+    ? "A step that stopped: a trap, or something a lone instruction cannot do."
+    match o
+        Outcome.Trap(e, s) -> R.Trap(e, s)
+        Outcome.Done(vs, s) -> results(vs, s)
+        Outcome.Thrown(_, _, s) -> R.Trap("exception in compiled code", s)
+        Outcome.Host(_, _, _, m) -> R.Trap("host call in compiled code", m.store)
+
+fn results(vs: List<Val>, s: Store) -> R
+    ? "Results in order with the store."
+    match vs
+        [] -> R.V0(s)
+        [a] -> R.V1(a, s)
+        [a, c] -> R.V2(a, c, s)
+        _ -> R.VN(vs, s)
+
+verify results
+    results([], Exec.blankStore()) => R.V0(Exec.blankStore())
+    results([Val.I32(1)], Exec.blankStore()) => R.V1(Val.I32(1), Exec.blankStore())
+
+verify via
+    via(Exec.emptyInst(), Exec.blankStore(), Instr.Bin(106), [Val.I32(2), Val.I32(3)], 1) => R.V1(Val.I32(5), Exec.blankStore())
+    via(Exec.emptyInst(), Exec.blankStore(), Instr.Bin(109), [Val.I32(2), Val.I32(0)], 1) => R.Trap("integer divide by zero", Exec.blankStore())
+
+verify viaRooted
+    viaRooted(Exec.emptyInst(), Exec.blankStore(), [Val.Ref(1)], Instr.Drop, [Val.I32(2)], 0) => R.V0(Exec.blankStore())
+
+verify unpinned
+    unpinned(R.Trap("x", Exec.blankStore()), []) => R.Trap("x", Exec.blankStore())
+
+verify viaOut
+    viaOut(Next.Out(Outcome.Trap("x", Exec.blankStore())), 0) => R.Trap("x", Exec.blankStore())
+
+verify outcomeR
+    outcomeR(Outcome.Done([], Exec.blankStore())) => R.V0(Exec.blankStore())
+
+// ---- numbers ----
+
+fn b(c: Bool) -> W32
+    ? "A condition as an i32."
+    match c
+        true -> W32(value = 1)
+        false -> W32(value = 0)
+
+verify b
+    b(true) => w32(1)
+    b(false) => zero32()
+
+fn bin32(op: Int, x: Int, y: Int) -> Result<Int, String>
+    ? "A binary i32 operation the compiled code does not write out."
+    unboxed(Num.binary(op, Val.I32(x), Val.I32(y)))
+
+fn bin64(op: Int, x: Int, y: Int) -> Result<Int, String>
+    ? "A binary i64 operation, or an i64 comparison."
+    unboxed(Num.binary(op, Val.I64(x), Val.I64(y)))
+
+fn un32(op: Int, x: Int) -> Result<Int, String>
+    ? "A unary operation on an i32 with an integer result."
+    unboxed(Num.unary(op, Val.I32(x)))
+
+fn un64(op: Int, x: Int) -> Result<Int, String>
+    ? "A unary operation on an i64 with an integer result."
+    unboxed(Num.unary(op, Val.I64(x)))
+
+fn unboxed(r: Result<Val, String>) -> Result<Int, String>
+    ? "An integer result as an Int."
+    match r
+        Result.Ok(v) -> Result.Ok(Value.i32(v))
+        Result.Err(e) -> Result.Err(e)
+
+fn asInt(r: Result<Val, String>) -> Result<Int, String>
+    ? "A Result of an integer value as one of an Int."
+    unboxed(r)
+
+verify asInt
+    asInt(Result.Ok(Val.I32(3))) => Result.Ok(3)
+
+fn binV(op: Int, x: Val, y: Val) -> Result<Val, String>
+    ? "Any other binary numeric operation, on values."
+    Num.binary(op, x, y)
+
+fn unV(op: Int, x: Val) -> Result<Val, String>
+    ? "Any other unary numeric operation, on values."
+    Num.unary(op, x)
+
+verify bin32
+    bin32(108, 65536, 65536) => Result.Ok(0)
+    bin32(109, 1, 0) => Result.Err("integer divide by zero")
+
+verify bin64
+    bin64(134, 1, 63) => Result.Ok(-9223372036854775808)
+
+verify un32
+    un32(103, 1) => Result.Ok(31)
+
+verify un64
+    un64(167, 4294967296) => Result.Ok(0)
+
+verify unboxed
+    unboxed(Result.Err("x")) => Result.Err("x")
+
+verify binV
+    binV(160, Val.F64(1.5), Val.F64(2.0)) => Result.Ok(Val.F64(3.5))
+
+verify unV
+    unV(153, Val.F64(-2.0)) => Result.Ok(Val.F64(2.0))
+
+fn pickV(c: W32, x: Val, y: Val) -> Val
+    ? "select on values."
+    match c.value != 0
+        true -> x
+        false -> y
+
+verify pickV
+    pickV(w32(1), Val.Null, Val.I32(2)) => Val.Null
+
+fn boxResult(v: Val) -> Val
+    ? "A result handed back as it is; compiled code boxes Ints before."
+    v
+
+verify boxResult
+    boxResult(Val.Null) => Val.Null
+
+// ---- i32 and i64 as machine words ----
+
+record W32
+    value: Int
+
+record W64
+    value: Int
+fn from32(n: Int) -> Result<W32, String>
+    ? "An i32 value as a machine word: the smart constructor, which bounds it to the i32 range so that compiled Aver holds a W32 as one i64."
+    match Bool.and(n >= -2147483648, n <= 2147483647)
+        true -> Result.Ok(W32(value = n))
+        false -> Result.Err("not an i32")
+
+fn w32(n: Int) -> W32
+    ? "An Int already in the i32 range as a word (compiled code builds its constants with it)."
+    match from32(n)
+        Result.Ok(r) -> r
+        Result.Err(_) -> W32(value = 0)
+
+fn zero32() -> W32
+    ? "i32 zero."
+    W32(value = 0)
+
+fn of32(v: Val) -> W32
+    ? "An i32 value out of a Val."
+    match v
+        Val.I32(n) -> w32(n)
+        _ -> W32(value = 0)
+
+fn val32(a: W32) -> Val
+    ? "A word as a Val."
+    Val.I32(a.value)
+
+fn res32(r: Result<Val, String>) -> Result<W32, String>
+    ? "A Result of an i32 value as one of a word."
+    match r
+        Result.Ok(v) -> Result.Ok(of32(v))
+        Result.Err(e) -> Result.Err(e)
+
+fn eqz32(a: W32) -> Bool
+    ? "i32.eqz."
+    a.value == 0
+
+fn and32(a: W32, c: W32) -> W32
+    ? "i32.and on the words."
+    match from32(Bits.and(a.value, c.value))
+        Result.Ok(r) -> r
+        Result.Err(_) -> W32(value = 0)
+
+fn or32(a: W32, c: W32) -> W32
+    ? "i32.or on the words."
+    match from32(Bits.or(a.value, c.value))
+        Result.Ok(r) -> r
+        Result.Err(_) -> W32(value = 0)
+
+fn xor32(a: W32, c: W32) -> W32
+    ? "i32.xor on the words."
+    match from32(Bits.xor(a.value, c.value))
+        Result.Ok(r) -> r
+        Result.Err(_) -> W32(value = 0)
+
+fn eq32(a: W32, c: W32) -> Bool
+    ? "i32.eq."
+    a.value == c.value
+
+fn ne32(a: W32, c: W32) -> Bool
+    ? "i32.ne."
+    a.value != c.value
+
+fn lt32(a: W32, c: W32) -> Bool
+    ? "i32.lt_s."
+    a.value < c.value
+
+fn gt32(a: W32, c: W32) -> Bool
+    ? "i32.gt_s."
+    a.value > c.value
+
+fn le32(a: W32, c: W32) -> Bool
+    ? "i32.le_s."
+    a.value <= c.value
+
+fn ge32(a: W32, c: W32) -> Bool
+    ? "i32.ge_s."
+    a.value >= c.value
+
+fn ltu32(a: W32, c: W32) -> Bool
+    ? "i32.lt_u: as signed when the signs agree; a negative one is the larger unsigned."
+    match (a.value < 0) == (c.value < 0)
+        true -> a.value < c.value
+        false -> c.value < 0
+
+fn gtu32(a: W32, c: W32) -> Bool
+    ? "i32.gt_u."
+    ltu32(c, a)
+
+fn leu32(a: W32, c: W32) -> Bool
+    ? "i32.le_u."
+    ltu32(c, a) == false
+
+fn geu32(a: W32, c: W32) -> Bool
+    ? "i32.ge_u."
+    ltu32(a, c) == false
+
+fn pick32(k: W32, a: W32, c: W32) -> W32
+    ? "select on i32 words."
+    match k.value != 0
+        true -> a
+        false -> c
+fn from64(n: Int) -> Result<W64, String>
+    ? "An i64 value as a machine word: the smart constructor, which bounds it to the i64 range so that compiled Aver holds a W64 as one i64."
+    match Bool.and(n >= -9223372036854775808, n <= 9223372036854775807)
+        true -> Result.Ok(W64(value = n))
+        false -> Result.Err("not an i64")
+
+fn w64(n: Int) -> W64
+    ? "An Int already in the i64 range as a word (compiled code builds its constants with it)."
+    match from64(n)
+        Result.Ok(r) -> r
+        Result.Err(_) -> W64(value = 0)
+
+fn zero64() -> W64
+    ? "i64 zero."
+    W64(value = 0)
+
+fn of64(v: Val) -> W64
+    ? "An i64 value out of a Val."
+    match v
+        Val.I64(n) -> w64(n)
+        _ -> W64(value = 0)
+
+fn val64(a: W64) -> Val
+    ? "A word as a Val."
+    Val.I64(a.value)
+
+fn res64(r: Result<Val, String>) -> Result<W64, String>
+    ? "A Result of an i64 value as one of a word."
+    match r
+        Result.Ok(v) -> Result.Ok(of64(v))
+        Result.Err(e) -> Result.Err(e)
+
+fn eqz64(a: W64) -> Bool
+    ? "i64.eqz."
+    a.value == 0
+
+fn and64(a: W64, c: W64) -> W64
+    ? "i64.and on the words."
+    match from64(Bits.and(a.value, c.value))
+        Result.Ok(r) -> r
+        Result.Err(_) -> W64(value = 0)
+
+fn or64(a: W64, c: W64) -> W64
+    ? "i64.or on the words."
+    match from64(Bits.or(a.value, c.value))
+        Result.Ok(r) -> r
+        Result.Err(_) -> W64(value = 0)
+
+fn xor64(a: W64, c: W64) -> W64
+    ? "i64.xor on the words."
+    match from64(Bits.xor(a.value, c.value))
+        Result.Ok(r) -> r
+        Result.Err(_) -> W64(value = 0)
+
+fn eq64(a: W64, c: W64) -> Bool
+    ? "i64.eq."
+    a.value == c.value
+
+fn ne64(a: W64, c: W64) -> Bool
+    ? "i64.ne."
+    a.value != c.value
+
+fn lt64(a: W64, c: W64) -> Bool
+    ? "i64.lt_s."
+    a.value < c.value
+
+fn gt64(a: W64, c: W64) -> Bool
+    ? "i64.gt_s."
+    a.value > c.value
+
+fn le64(a: W64, c: W64) -> Bool
+    ? "i64.le_s."
+    a.value <= c.value
+
+fn ge64(a: W64, c: W64) -> Bool
+    ? "i64.ge_s."
+    a.value >= c.value
+
+fn ltu64(a: W64, c: W64) -> Bool
+    ? "i64.lt_u: as signed when the signs agree; a negative one is the larger unsigned."
+    match (a.value < 0) == (c.value < 0)
+        true -> a.value < c.value
+        false -> c.value < 0
+
+fn gtu64(a: W64, c: W64) -> Bool
+    ? "i64.gt_u."
+    ltu64(c, a)
+
+fn leu64(a: W64, c: W64) -> Bool
+    ? "i64.le_u."
+    ltu64(c, a) == false
+
+fn geu64(a: W64, c: W64) -> Bool
+    ? "i64.ge_u."
+    ltu64(a, c) == false
+
+fn pick64(k: W32, a: W64, c: W64) -> W64
+    ? "select on i64 words."
+    match k.value != 0
+        true -> a
+        false -> c
+fn add32(a: W32, c: W32) -> W32
+    ? "i32.add on the words: the sum fits an i64, then wraps."
+    t = a.value + c.value
+    match t > 2147483647
+        true -> wrapped32(t - 4294967296)
+        false -> match t < -2147483648
+            true -> wrapped32(t + 4294967296)
+            false -> wrapped32(t)
+
+fn sub32(a: W32, c: W32) -> W32
+    ? "i32.sub on the words."
+    t = a.value - c.value
+    match t > 2147483647
+        true -> wrapped32(t - 4294967296)
+        false -> match t < -2147483648
+            true -> wrapped32(t + 4294967296)
+            false -> wrapped32(t)
+
+fn mul32(a: W32, c: W32) -> W32
+    ? "i32.mul on the words: the product fits an i64, its low 32 bits read signed."
+    t = Int.mod(a.value * c.value, 4294967296)
+    match t > 2147483647
+        true -> wrapped32(t - 4294967296)
+        false -> wrapped32(t)
+
+fn wrapped32(n: Int) -> W32
+    ? "A result already in range as a word."
+    match from32(n)
+        Result.Ok(r) -> r
+        Result.Err(_) -> W32(value = 0)
+
+fn add64(a: W64, c: W64) -> W64
+    ? "i64.add: the sum may leave the i64 range, so it is wrapped as an Int."
+    w64(Num.wrap64(a.value + c.value))
+
+fn sub64(a: W64, c: W64) -> W64
+    ? "i64.sub."
+    w64(Num.wrap64(a.value - c.value))
+
+fn mul64(a: W64, c: W64) -> W64
+    ? "i64.mul."
+    w64(Num.wrap64(a.value * c.value))
+
+fn nz32(k: W32) -> Bool
+    ? "An i32 condition."
+    k.value != 0
+
+fn i32v(k: W32) -> Int
+    ? "An i32 word as an Int."
+    k.value
+
+fn pack8(a: W32) -> Val
+    ? "An i32 stored into an i8 field or element."
+    Val.I32(Bits.and(a.value, 255))
+
+fn pack16(a: W32) -> Val
+    ? "An i32 stored into an i16 field or element."
+    Val.I32(Bits.and(a.value, 65535))
+
+fn u32of(k: W32) -> Int
+    ? "An i32 index read unsigned."
+    match k.value < 0
+        true -> k.value + 4294967296
+        false -> k.value
+
+verify add32
+    add32(w32(2147483647), w32(1)) => w32(-2147483648)
+    add32(w32(-2147483648), w32(-1)) => w32(2147483647)
+
+verify sub32
+    sub32(w32(-2147483648), w32(1)) => w32(2147483647)
+
+verify mul32
+    mul32(w32(65536), w32(65536)) => zero32()
+    mul32(w32(-3), w32(5)) => w32(-15)
+    mul32(w32(2147483647), w32(2)) => w32(-2)
+
+verify add64
+    add64(w64(9223372036854775807), w64(1)) => w64(-9223372036854775808)
+
+verify sub64
+    sub64(w64(-9223372036854775808), w64(1)) => w64(9223372036854775807)
+
+verify mul64
+    mul64(w64(4294967296), w64(4294967296)) => zero64()
+
+verify ltu32
+    ltu32(w32(-1), w32(1)) => false
+    ltu32(w32(1), w32(-1)) => true
+    ltu32(w32(2), w32(3)) => true
+
+verify ltu64
+    ltu64(w64(-1), w64(0)) => false
+
+verify geu32
+    geu32(w32(-1), w32(5)) => true
+
+verify xor32
+    xor32(w32(-1), w32(5)) => w32(-6)
+
+verify and64
+    and64(w64(-1), w64(9223372036854775807)) => w64(9223372036854775807)
+
+verify of32
+    of32(Val.I32(-7)) => w32(-7)
+    of32(Val.Null) => zero32()
+
+verify val64
+    val64(w64(-9223372036854775808)) => Val.I64(-9223372036854775808)
+
+verify from32
+    from32(2147483648) => Result.Err("not an i32")
+
+verify u32of
+    u32of(w32(-1)) => 4294967295
+
+verify pack8
+    pack8(w32(-1)) => Val.I32(255)
+
+verify pick32
+    pick32(zero32(), w32(1), w32(2)) => w32(2)
+
+// ---- calls ----
+
+fn deep(d: Int) -> Bool
+    ? "Whether a compiled call this deep must trap with call stack exhausted."
+    d >= 200000
+
+verify deep
+    deep(1) => false
+
+fn keep(v: Val, acc: List<Val>) -> List<Val>
+    ? "The values with v added when it refers to something on the heap."
+    match v
+        Val.Ref(_) -> List.prepend(v, acc)
+        _ -> acc
+
+fn keepAll(vs: List<Val>, rs: List<Val>) -> List<Val>
+    ? "The roots with every value of vs that refers to something on the heap added."
+    keptAll(vs, rs)
+
+fn keptAll(vs: List<Val>, acc: List<Val>) -> List<Val>
+    ? "Adds the references of vs to acc."
+    match vs
+        [] -> acc
+        [v, ..rest] -> keptAll(rest, keep(v, acc))
+
+verify keepAll
+    keepAll([Val.Ref(1), Val.Null, Val.Ref(2)], noRoots()) => [Val.Ref(2), Val.Ref(1)]
+
+verify keptAll
+    keptAll([Val.Null], []) => []
+
+fn nth(vs: List<Val>, k: Int) -> Val
+    ? "Result k of a call with three or more."
+    match List.drop(vs, k)
+        [v, .._] -> v
+        [] -> Val.Null
+
+verify nth
+    nth([Val.I32(1), Val.I32(2)], 1) => Val.I32(2)
+    nth([], 0) => Val.Null
+
+fn st(s: Store) -> Store
+    ? "The store as it is. Compiled code passes the store through this at every branch: a store every function of a mutually tail-calling group hands on unchanged would otherwise become a borrowed loop invariant, and the group would clone it, sharing the heap, wherever it allocates."
+    s
+
+verify st
+    st(Exec.blankStore()) => Exec.blankStore()
+
+verify keep
+    keep(Val.Null, []) => []
+    keep(Val.Ref(3), []) => [Val.Ref(3)]
+
+// ---- indirect calls ----
+
+fn callRef(x: Inst, s: Store, d: Int, rs: List<Val>, r: Val, args: List<Val>, nat: Fn(Inst, Store, Int, List<Val>, Int, List<Val>) -> R) -> R
+    ? "call_ref from compiled code: the module's dispatch (nat) runs the function, compiled or not."
+    match r
+        Val.Func(a) -> callLocal(x, s, d, rs, a, args, nat)
+        _ -> R.Trap("null function reference", s)
+
+fn callLocal(x: Inst, s: Store, d: Int, rs: List<Val>, a: Int, args: List<Val>, nat: Fn(Inst, Store, Int, List<Val>, Int, List<Val>) -> R) -> R
+    ? "A call to the function at address a, which compiled code only reaches in its own instance (Aot compiles indirect calls only where no other instance can hand it a reference)."
+    fi = a - x.base
+    match Bool.and(fi >= 0, fi < Vector.len(x.fns))
+        true -> nat(x, s, d, rs, fi, args)
+        false -> R.Trap("compiled code cannot call another instance's function", s)
+
+fn callIndirect(x: Inst, s: Store, d: Int, rs: List<Val>, t: Int, tb: Int, i: Val, args: List<Val>, nat: Fn(Inst, Store, Int, List<Val>, Int, List<Val>) -> R) -> R
+    ? "call_indirect from compiled code: the table entry at i, checked against type t as the interpreter checks it."
+    match Vector.get(Exec.table(s, Exec.taddr(x, tb)), Exec.idx(i))
+        Option.None -> R.Trap("undefined element", s)
+        Option.Some(Val.Func(a)) -> callTyped(x, s, d, rs, t, a, args, nat)
+        Option.Some(_) -> R.Trap("uninitialized element", s)
+
+fn callTyped(x: Inst, s: Store, d: Int, rs: List<Val>, t: Int, a: Int, args: List<Val>, nat: Fn(Inst, Store, Int, List<Val>, Int, List<Val>) -> R) -> R
+    ? "A table entry's function, when its type is t or a subtype."
+    fi = a - x.base
+    match Bool.and(fi >= 0, fi < Vector.len(x.fns))
+        false -> R.Trap("compiled code cannot call another instance's function", s)
+        true -> match Exec.isSub(x.m, Exec.fnType(x, fi), t, 64)
+            true -> nat(x, s, d, rs, fi, args)
+            false -> R.Trap("indirect call type mismatch", s)
+
+fn tailRef(x: Inst, s: Store, r: Val, args: List<Val>) -> R
+    ? "return_call_ref from compiled code: the function to call next, handed to whoever waits for the result (see resolve), so a chain of such calls runs in constant space."
+    match r
+        Val.Func(a) -> tailLocal(x, s, a, args)
+        _ -> R.Trap("null function reference", s)
+
+fn tailLocal(x: Inst, s: Store, a: Int, args: List<Val>) -> R
+    ? "A tail call to the function at address a of this instance."
+    fi = a - x.base
+    match Bool.and(fi >= 0, fi < Vector.len(x.fns))
+        true -> R.Tail(fi, args, s)
+        false -> R.Trap("compiled code cannot call another instance's function", s)
+
+fn tailIndirect(x: Inst, s: Store, t: Int, tb: Int, i: Val, args: List<Val>) -> R
+    ? "return_call_indirect from compiled code: the table entry checked, then handed on as tailRef does."
+    match Vector.get(Exec.table(s, Exec.taddr(x, tb)), Exec.idx(i))
+        Option.None -> R.Trap("undefined element", s)
+        Option.Some(Val.Func(a)) -> tailTyped(x, s, t, a, args)
+        Option.Some(_) -> R.Trap("uninitialized element", s)
+
+fn tailTyped(x: Inst, s: Store, t: Int, a: Int, args: List<Val>) -> R
+    ? "A table entry's function as the next call, when its type fits."
+    fi = a - x.base
+    match Bool.and(fi >= 0, fi < Vector.len(x.fns))
+        false -> R.Trap("compiled code cannot call another instance's function", s)
+        true -> match Exec.isSub(x.m, Exec.fnType(x, fi), t, 64)
+            true -> R.Tail(fi, args, s)
+            false -> R.Trap("indirect call type mismatch", s)
+
+fn resolve(r: R, x: Inst, d: Int, rs: List<Val>, nat: Fn(Inst, Store, Int, List<Val>, Int, List<Val>) -> R) -> R
+    ? "A call's outcome once every tail call it ended with has run, one after another."
+    match r
+        R.Tail(fi, args, s) -> resolve(nat(x, s, d, rs, fi, args), x, d, rs, nat)
+        _ -> r
+
+verify tailRef
+    tailRef(Exec.emptyInst(), Exec.blankStore(), Val.Null, []) => R.Trap("null function reference", Exec.blankStore())
+
+verify tailLocal
+    tailLocal(Exec.emptyInst(), Exec.blankStore(), 1, []) => R.Trap("compiled code cannot call another instance's function", Exec.blankStore())
+
+verify tailIndirect
+    tailIndirect(Exec.emptyInst(), Exec.blankStore(), 0, 0, Val.I32(0), []) => R.Trap("undefined element", Exec.blankStore())
+
+verify tailTyped
+    tailTyped(Exec.emptyInst(), Exec.blankStore(), 0, 1, []) => R.Trap("compiled code cannot call another instance's function", Exec.blankStore())
+
+verify resolve
+    resolve(R.Tail(4, [], Exec.blankStore()), Exec.emptyInst(), 0, [], noCall) => R.Trap("no function 4", Exec.blankStore())
+    resolve(R.V0(Exec.blankStore()), Exec.emptyInst(), 0, [], noCall) => R.V0(Exec.blankStore())
+
+fn interp(x: Inst, s: Store, d: Int, rs: List<Val>, fi: Int, args: List<Val>, nat: Fn(Inst, Store, Int, List<Val>, Int, List<Val>) -> R) -> R
+    ? "A function that is not compiled, called from compiled code: the interpreter runs it, what the compiled callers hold pinned; a compiled function it calls comes back through nat."
+    p = s.pinned
+    o = Exec.invoke(x, Store.update(s, pinned = List.concat(rs, p)), fi, args)
+    unpinned(interpOut(x, o, d, nat), p)
+
+fn interpOut(x: Inst, o: Outcome, d: Int, nat: Fn(Inst, Store, Int, List<Val>, Int, List<Val>) -> R) -> R
+    ? "Where the interpreter stopped."
+    match o
+        Outcome.Done(vs, s) -> results(vs, s)
+        Outcome.Trap(e, s) -> R.Trap(e, s)
+        Outcome.Thrown(_, _, s) -> R.Trap("exception in compiled code", s)
+        Outcome.Host(hfi, args, tail, mach) -> interpHost(x, hfi, args, tail, mach, d, nat)
+
+fn interpHost(x: Inst, hfi: Int, args: List<Val>, tail: Bool, mach: Machine, d: Int, nat: Fn(Inst, Store, Int, List<Val>, Int, List<Val>) -> R) -> R
+    ? "The interpreter stopped at a compiled function: nat runs it on the machine's store, the machine holding none meanwhile, then the machine resumes. Anything else a host would answer cannot happen here (Aot keeps such modules' indirect calls interpreted)."
+    match compiledAt(x, hfi)
+        false -> R.Trap("host call in compiled code", mach.store)
+        true -> interpNative(x, hfi, args, tail, mach, d, nat)
+
+fn interpNative(x: Inst, hfi: Int, args: List<Val>, tail: Bool, mach: Machine, d: Int, nat: Fn(Inst, Store, Int, List<Val>, Int, List<Val>) -> R) -> R
+    ? "Runs the compiled function and resumes the machine with its results."
+    p = mach.store.pinned
+    h = mach.store.held
+    s = Exec.suspended(mach.store, mach, [])
+    bare = Machine.update(mach, store = Exec.blankStore())
+    r = nat(x, s, d + 1, noRoots(), hfi, args)
+    interpBack(x, r, p, h, tail, bare, d, nat)
+
+fn interpBack(x: Inst, r: R, p: List<Val>, h: List<List<Frame>>, tail: Bool, bare: Machine, d: Int, nat: Fn(Inst, Store, Int, List<Val>, Int, List<Val>) -> R) -> R
+    ? "The machine resumed with what the compiled function returned."
+    match r
+        R.Trap(e, s) -> R.Trap(e, s)
+        R.V0(s) -> interpOut(x, Exec.resume(x, Machine.update(bare, store = Store.update(s, pinned = p, held = h)), [], tail), d, nat)
+        R.V1(a, s) -> interpOut(x, Exec.resume(x, Machine.update(bare, store = Store.update(s, pinned = p, held = h)), [a], tail), d, nat)
+        R.V2(a, c, s) -> interpOut(x, Exec.resume(x, Machine.update(bare, store = Store.update(s, pinned = p, held = h)), [a, c], tail), d, nat)
+        R.VN(vs, s) -> interpOut(x, Exec.resume(x, Machine.update(bare, store = Store.update(s, pinned = p, held = h)), vs, tail), d, nat)
+        R.Tail(_, _, s) -> R.Trap("unresolved tail call", s)
+
+fn compiledAt(x: Inst, fi: Int) -> Bool
+    ? "Whether function fi is one the interpreter hands to compiled code."
+    match Vector.get(x.fns, fi)
+        Option.Some(g) -> g.mod == "*native"
+        Option.None -> false
+
+fn noCall(x: Inst, s: Store, d: Int, rs: List<Val>, fi: Int, args: List<Val>) -> R
+    ? "A dispatch that has no function, for the examples."
+    R.Trap("no function {fi}", s)
+
+verify callRef
+    callRef(Exec.emptyInst(), Exec.blankStore(), 0, [], Val.Null, [], noCall) => R.Trap("null function reference", Exec.blankStore())
+
+verify callLocal
+    callLocal(Exec.emptyInst(), Exec.blankStore(), 0, [], 3, [], noCall) => R.Trap("compiled code cannot call another instance's function", Exec.blankStore())
+
+verify callIndirect
+    callIndirect(Exec.emptyInst(), Exec.blankStore(), 0, [], 0, 0, Val.I32(0), [], noCall) => R.Trap("undefined element", Exec.blankStore())
+
+verify callTyped
+    callTyped(Exec.emptyInst(), Exec.blankStore(), 0, [], 0, 5, [], noCall) => R.Trap("compiled code cannot call another instance's function", Exec.blankStore())
+
+verify interp
+    interp(Exec.emptyInst(), Exec.blankStore(), 0, [], 0, [], noCall) => R.Trap("call to undefined function 0", Exec.blankStore())
+
+verify interpOut
+    interpOut(Exec.emptyInst(), Outcome.Trap("x", Exec.blankStore()), 0, noCall) => R.Trap("x", Exec.blankStore())
+
+verify interpHost
+    interpHost(Exec.emptyInst(), 0, [], false, Machine(frame = Exec.bare(Vector.fromList([]), 1, 0), calls = [], store = Exec.blankStore()), 0, noCall) => R.Trap("host call in compiled code", Exec.blankStore())
+
+verify interpNative
+    interpNative(Exec.emptyInst(), 0, [], false, Machine(frame = Exec.bare(Vector.fromList([]), 1, 0), calls = [], store = Exec.blankStore()), 0, noCall) => R.Trap("no function 0", Store.update(Exec.blankStore(), held = [[Exec.bare(Vector.fromList([]), 1, 0)]]))
+
+verify interpBack
+    interpBack(Exec.emptyInst(), R.Trap("x", Exec.blankStore()), [], [], false, Machine(frame = Exec.bare(Vector.fromList([]), 1, 0), calls = [], store = Exec.blankStore()), 0, noCall) => R.Trap("x", Exec.blankStore())
+
+verify compiledAt
+    compiledAt(Exec.emptyInst(), 0) => false
+
+verify noCall
+    noCall(Exec.emptyInst(), Exec.blankStore(), 0, [], 1, []) => R.Trap("no function 1", Exec.blankStore())
+
+// ---- linear memory ----
+
+fn load(x: Inst, s: Store, op: Int, off: Int, k: Int, a: Val) -> R
+    ? "A load from memory k at a + off: memory 0 read directly while it is on top, as it is whenever this instance runs; any other through the interpreter."
+    match Bool.and(k == 0, s.memAt == Exec.maddr(x, 0))
+        true -> loadHere(s, op, Exec.idx(a) + off)
+        false -> via(x, s, Instr.Load(op, off, 0, k), [a], 1)
+
+fn loadHere(s: Store, op: Int, ea: Int) -> R
+    ? "A load from the memory on top, bounds checked as the interpreter checks them."
+    n = Exec.loadSize(op)
+    match ea + n > Exec.memBytes(s)
+        true -> R.Trap("out of bounds memory access", s)
+        false -> R.V1(Exec.loadVal(op, Mem.read(s.mem, ea, n)), s)
+
+fn store(x: Inst, s: Store, op: Int, off: Int, k: Int, a: Val, v: Val) -> R
+    ? "A store into memory k at a + off, as load reads."
+    match Bool.and(k == 0, s.memAt == Exec.maddr(x, 0))
+        true -> storeHere(s, op, Exec.idx(a) + off, v)
+        false -> via(x, s, Instr.Store(op, off, 0, k), [a, v], 0)
+
+fn storeHere(s: Store, op: Int, ea: Int, v: Val) -> R
+    ? "A store into the memory on top, written in place."
+    n = Exec.storeSize(op)
+    match ea + n > Exec.memBytes(s)
+        true -> R.Trap("out of bounds memory access", s)
+        false -> R.V0(Store.update(s, mem = Mem.write(s.mem, ea, n, Exec.storeBits(v))))
+
+verify load
+    load(Exec.emptyInst(), Exec.blankStore(), 40, 0, 0, Val.I32(0)) => R.Trap("out of bounds memory access", Exec.blankStore())
+
+verify loadHere
+    loadHere(Exec.blankStore(), 40, 0) => R.Trap("out of bounds memory access", Exec.blankStore())
+
+verify store
+    store(Exec.emptyInst(), Exec.blankStore(), 54, 0, 0, Val.I32(0), Val.I32(1)) => R.Trap("out of bounds memory access", Exec.blankStore())
+
+verify storeHere
+    storeHere(Store.update(Exec.blankStore(), pages = 1), 54, 70000, Val.I32(-1)) => R.Trap("out of bounds memory access", Store.update(Exec.blankStore(), pages = 1))
+
+// ---- reference tests ----
+
+fn refTest(x: Inst, s: Store, r: Val, nl: Bool, h: Int) -> W32
+    ? "ref.test."
+    b(Exec.matches(x, s, r, nl, h))
+
+fn refCast(x: Inst, s: Store, r: Val, nl: Bool, h: Int) -> Result<Val, String>
+    ? "ref.cast: the reference when it is of the type."
+    match Exec.matches(x, s, r, nl, h)
+        true -> Result.Ok(r)
+        false -> Result.Err("cast failure")
+
+fn nonNull(r: Val) -> Result<Val, String>
+    ? "ref.as_non_null."
+    match r
+        Val.Null -> Result.Err("null reference")
+        _ -> Result.Ok(r)
+
+verify refTest
+    refTest(Exec.emptyInst(), Exec.blankStore(), Val.Null, true, -18) => w32(1)
+    refTest(Exec.emptyInst(), Exec.blankStore(), Val.Null, false, -18) => zero32()
+
+verify refCast
+    refCast(Exec.emptyInst(), Exec.blankStore(), Val.Null, false, -18) => Result.Err("cast failure")
+
+verify nonNull
+    nonNull(Val.Null) => Result.Err("null reference")
+    nonNull(Val.I31(1)) => Result.Ok(Val.I31(1))
+
+// ---- globals ----
+
+fn global(x: Inst, s: Store, k: Int) -> Val
+    ? "global.get."
+    Exec.vget(s.globals, Exec.gaddr(x, k))
+
+fn setGlobal(x: Inst, s: Store, k: Int, v: Val) -> Store
+    ? "global.set."
+    Store.update(s, globals = Exec.vset(s.globals, Exec.gaddr(x, k), v))
+
+verify global
+    global(Exec.emptyInst(), Exec.blankStore(), 0) => Val.Null
+
+verify setGlobal
+    setGlobal(Exec.emptyInst(), Exec.blankStore(), 0, Val.I32(1)).globals => Vector.fromList([])
+
+// ---- structs ----
+
+fn field(s: Store, r: Val, k: Int) -> Result<Val, String>
+    ? "struct.get of a field that is not packed."
+    match r
+        Val.Ref(a) -> fieldIn(Kompost.get(s.heap, a), k)
+        _ -> Result.Err("null structure reference")
+
+fn fieldIn(o: Obj, k: Int) -> Result<Val, String>
+    ? "Field k of what the reference found."
+    match o
+        Obj.Free -> Result.Err("not a struct")
+        Obj.Array(_, _) -> Result.Err("not a struct")
+        _ -> Result.Ok(Kompost.fieldAt(o, k))
+
+fn fieldPacked(s: Store, r: Val, k: Int, t: ValType, e: Int) -> Result<Val, String>
+    ? "struct.get_s or struct.get_u of a packed field."
+    match field(s, r, k)
+        Result.Ok(v) -> Result.Ok(Exec.unpack(t, v, e))
+        Result.Err(m) -> Result.Err(m)
+
+fn setField(s: Store, r: Val, k: Int, v: Val) -> R
+    ? "struct.set of a value already packed for its field."
+    match r
+        Val.Ref(a) -> setFieldIn(s, a, Kompost.get(s.heap, a), k, v)
+        _ -> R.Trap("null structure reference", s)
+
+fn setFieldIn(s: Store, a: Int, o: Obj, k: Int, v: Val) -> R
+    ? "Writes the field into the struct at a."
+    match o
+        Obj.Free -> R.Trap("not a struct", s)
+        Obj.Array(_, _) -> R.Trap("not a struct", s)
+        _ -> R.V0(Store.update(s, heap = Kompost.put(s.heap, a, Kompost.withField(o, k, v))))
+
+verify field
+    field(Exec.blankStore(), Val.Null, 0) => Result.Err("null structure reference")
+
+verify fieldIn
+    fieldIn(Obj.S1(0, Val.I32(4)), 0) => Result.Ok(Val.I32(4))
+    fieldIn(Obj.Free, 0) => Result.Err("not a struct")
+
+verify fieldPacked
+    fieldPacked(Exec.blankStore(), Val.Null, 0, ValType.I8, 1) => Result.Err("null structure reference")
+
+verify setField
+    setField(Exec.blankStore(), Val.Null, 0, Val.I32(1)) => R.Trap("null structure reference", Exec.blankStore())
+
+verify setFieldIn
+    setFieldIn(Exec.blankStore(), 0, Obj.Free, 0, Val.I32(1)) => R.Trap("not a struct", Exec.blankStore())
+
+fn structNew(x: Inst, s: Store, rs: List<Val>, t: Int, vs: List<Val>) -> R
+    ? "struct.new of type t with its fields packed already."
+    made(alloc(s, rs, Kompost.mkStruct(x.base + t, vs), Option.None))
+
+fn made(k: Mk) -> R
+    ? "A new object's reference with the store."
+    R.V1(k.v, k.s)
+
+verify structNew
+    structNew(Exec.emptyInst(), Exec.blankStore(), noRoots(), 0, []) => R.V1(Val.Ref(0), Store.update(Exec.blankStore(), heap = Kompost.allocAt(Kompost.empty(), 0, Obj.S0(0), Option.None)))
+
+verify made
+    made(Mk(v = Val.Null, s = Exec.blankStore())) => R.V1(Val.Null, Exec.blankStore())
+
+// ---- allocation ----
+
+fn alloc(s: Store, rs: List<Val>, o: Obj, arr: Option<Arr>) -> Mk
+    ? "A new object on the heap, composting first when the heap has grown past its threshold: the roots are the compiled callers', the store's own and the new object's."
+    match s.heap.live >= s.gcAt
+        true -> place(Exec.composted(List.concat(rs, storeRoots(s, o, arr)), s), o, arr)
+        false -> place(s, o, arr)
+
+fn storeRoots(s: Store, o: Obj, arr: Option<Arr>) -> List<Val>
+    ? "What the store holds on to: its pins, globals, tables and element segments, and the new object."
+    List.concat(s.pinned, List.concat(Exec.heldRoots(s.held, []), List.concat(Exec.newRefs(o, arr), List.concat(List.fromVector(s.globals), List.concat(Exec.flat(List.fromVector(s.tables), []), Exec.flat(List.fromVector(s.elems), []))))))
+
+fn place(s: Store, o: Obj, arr: Option<Arr>) -> Mk
+    ? "The object at the next free address."
+    a = Kompost.nextAddr(s.heap)
+    Mk(v = Val.Ref(a), s = Store.update(s, heap = Kompost.allocAt(s.heap, a, o, arr)))
+
+verify alloc
+    alloc(Exec.blankStore(), noRoots(), Obj.S0(0), Option.None).v => Val.Ref(0)
+
+verify storeRoots
+    storeRoots(Exec.blankStore(), Obj.S1(0, Val.Ref(2)), Option.None) => [Val.Ref(2)]
+
+verify place
+    place(Exec.blankStore(), Obj.S0(0), Option.None).s.heap.live => 1
+
+// ---- arrays ----
+
+fn arrayNewDefault(x: Inst, s: Store, rs: List<Val>, t: Int, n: W32) -> R
+    ? "array.new_default of type t with n (an i32) elements."
+    et = Ast.arrayElem(x.m, t)
+    arrayNew(x, s, rs, t, n, Value.defaultOf(et))
+
+fn arrayNew(x: Inst, s: Store, rs: List<Val>, t: Int, n: W32, v: Val) -> R
+    ? "array.new: n (an i32) copies of v."
+    et = Ast.arrayElem(x.m, t)
+    k = u32of(n)
+    match k > Exec.maxArray()
+        true -> R.Trap("allocation too large", s)
+        false -> arrayMade(x, s, rs, t, Arr.make(k, Exec.pack(et, v), Exec.bitsOf(et)))
+
+fn arrayMade(x: Inst, s: Store, rs: List<Val>, t: Int, r: Result<Arr, String>) -> R
+    ? "Allocates the array once its elements are made."
+    match r
+        Result.Ok(arr) -> made(alloc(s, rs, Obj.Array(x.base + t, Arr.len(arr)), Option.Some(arr)))
+        Result.Err(e) -> R.Trap(e, s)
+
+fn arrayGet(s: Store, r: Val, k: W32, et: ValType, e: Int) -> Result<Val, String>
+    ? "array.get of element k (an i32) of an array of storage type et."
+    match r
+        Val.Ref(a) -> elemAt(Kompost.arr(s.heap, a), u32of(k), et, e)
+        _ -> Result.Err("null array reference")
+
+fn elemAt(o: Option<Arr>, k: Int, et: ValType, e: Int) -> Result<Val, String>
+    ? "Element k, unpacked."
+    match o
+        Option.None -> Result.Err("not an array")
+        Option.Some(arr) -> elemFound(Arr.get(arr, k), et, e)
+
+fn elemFound(v: Option<Val>, et: ValType, e: Int) -> Result<Val, String>
+    ? "An element in bounds, or the trap."
+    match v
+        Option.Some(a) -> Result.Ok(Exec.unpack(et, a, e))
+        Option.None -> Result.Err("out of bounds array access")
+
+fn arraySet(s: Store, r: Val, k: W32, v: Val) -> R
+    ? "array.set of element k (an i32) to v, already packed."
+    match r
+        Val.Ref(a) -> arraySetAt(s, a, u32of(k), v)
+        _ -> R.Trap("null array reference", s)
+
+fn arraySetAt(s: Store, a: Int, k: Int, v: Val) -> R
+    ? "Writes element k in place when it is in bounds."
+    match k < Exec.arrLen(s, a)
+        true -> R.V0(Store.update(s, heap = Kompost.setElem(s.heap, a, k, v)))
+        false -> R.Trap("out of bounds array access", s)
+
+fn arrayLen(s: Store, r: Val) -> Result<Val, String>
+    ? "array.len."
+    match r
+        Val.Ref(a) -> Result.Ok(Val.I32(Exec.arrLen(s, a)))
+        _ -> Result.Err("null array reference")
+
+verify arrayNewDefault
+    arrayNewDefault(Exec.emptyInst(), Exec.blankStore(), noRoots(), 0, w32(-1)) => R.Trap("allocation too large", Exec.blankStore())
+
+verify arrayNew
+    arrayNew(Exec.emptyInst(), Exec.blankStore(), noRoots(), 0, w32(-1), Val.I32(0)) => R.Trap("allocation too large", Exec.blankStore())
+
+verify arrayMade
+    arrayMade(Exec.emptyInst(), Exec.blankStore(), noRoots(), 0, Result.Err("x")) => R.Trap("x", Exec.blankStore())
+
+verify arrayGet
+    arrayGet(Exec.blankStore(), Val.Null, zero32(), ValType.I32, 0) => Result.Err("null array reference")
+
+verify elemAt
+    elemAt(Option.None, 0, ValType.I32, 0) => Result.Err("not an array")
+    elemAt(Option.Some(Arr.Flat(Vector.fromList([Val.I32(7)]))), 0, ValType.I32, 0) => Result.Ok(Val.I32(7))
+    elemAt(Option.Some(Arr.Flat(Vector.fromList([Val.I32(7)]))), 1, ValType.I32, 0) => Result.Err("out of bounds array access")
+
+verify elemFound
+    elemFound(Option.Some(Val.I32(255)), ValType.I8, 1) => Result.Ok(Val.I32(-1))
+
+verify arraySet
+    arraySet(Exec.blankStore(), Val.Null, zero32(), Val.I32(0)) => R.Trap("null array reference", Exec.blankStore())
+
+verify arraySetAt
+    arraySetAt(Exec.blankStore(), 0, 0, Val.I32(0)) => R.Trap("out of bounds array access", Exec.blankStore())
+
+verify arrayLen
+    arrayLen(Exec.blankStore(), Val.Null) => Result.Err("null array reference")

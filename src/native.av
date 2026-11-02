@@ -1,0 +1,29 @@
+module Native
+    intent =
+        "Functions compiled ahead of time from wasm modules (see bin/aot),"
+        "which replaces this module with the compiled one. This copy has none:"
+        "it knows no module, so everything is interpreted."
+    exposes [keyOf, has, call]
+    depends [Value, Exec, Rt]
+    effects []
+
+fn keyOf(size: Int, sum: Int) -> Int
+    ? "The key of the compiled module with this size and checksum (see Main.checksum), or -1."
+    -1
+
+fn has(key: Int, fi: Int) -> Bool
+    ? "Whether function fi of module key is compiled."
+    key > fi + 1000000000000
+
+fn call(key: Int, x: Inst, s: Store, d: Int, fi: Int, args: List<Val>) -> R
+    ? "Runs compiled function fi of module key, d calls deep, with its arguments in order."
+    R.Trap("module is not compiled", s)
+
+verify keyOf
+    keyOf(1, 2) => -1
+
+verify has
+    has(0, 0) => false
+
+verify call
+    call(0, Exec.emptyInst(), Exec.blankStore(), 0, 0, []) => R.Trap("module is not compiled", Exec.blankStore())
