@@ -1,0 +1,204 @@
+module Types
+    intent =
+        "Types compared across two modules, for linking and for values that"
+        "cross instances: a concrete type is identified, iso-recursively, by its"
+        "rec group's shape and its place in it, so two modules' types are the"
+        "same when their groups have the same size, the types sit at the same"
+        "place, and the members agree: finality, declared supertypes, and"
+        "structure, where a reference into the group must be one into the other"
+        "group at the same place and a reference outside is compared as a type"
+        "of its own. fuel bounds the recursion of recursive types. Subtyping"
+        "walks declared supertypes; abstract types follow the validator's"
+        "hierarchy."
+    exposes [valEq, heapEq, compEq, subX, valSubX, heapSubX]
+    depends [Ast, Valid]
+    effects []
+
+fn valSubX(ma: Module, a: ValType, mb: Module, b: ValType) -> Bool
+    ? "Whether type a of module ma is a subtype of type b of module mb: concrete types across modules count as equal when their structure is; abstract ones follow the hierarchy."
+    match a
+        ValType.Ref(na, ha) -> match b
+            ValType.Ref(nb, hb) -> Bool.and(Bool.or(nb, Bool.not(na)), heapSubX(ma, ha, mb, hb))
+            _ -> false
+        _ -> a == b
+
+fn heapSubX(ma: Module, a: Int, mb: Module, b: Int) -> Bool
+    ? "Heap subtyping across two modules."
+    match Bool.and(a >= 0, b >= 0)
+        true -> compEq(ma, a, mb, b, 8)
+        false -> match b < 0
+            true -> Valid.heapSub(ma, a, b)
+            false -> Valid.heapSub(mb, a, b)
+
+verify valSubX
+    valSubX(Ast.emptyModule(), ValType.Ref(false, -16), Ast.emptyModule(), ValType.Ref(true, -16)) => true
+    valSubX(Ast.emptyModule(), ValType.Ref(true, -16), Ast.emptyModule(), ValType.Ref(false, -16)) => false
+
+verify heapSubX
+    heapSubX(Ast.emptyModule(), -13, Ast.emptyModule(), -16) => true
+
+fn valEq(ma: Module, a: ValType, mb: Module, b: ValType, fuel: Int) -> Bool
+    ? "valEq outside any rec group."
+    valIn(ma, [], a, mb, [], b, fuel)
+
+fn valIn(ma: Module, ga: List<Int>, a: ValType, mb: Module, gb: List<Int>, b: ValType, fuel: Int) -> Bool
+    ? "Whether two value types from two modules are the same, comparing concrete types by their structure (fuel bounds recursive types)."
+    match a
+        ValType.Ref(na, ha) -> match b
+            ValType.Ref(nb, hb) -> Bool.and(na == nb, heapIn(ma, ga, ha, mb, gb, hb, fuel))
+            _ -> false
+        _ -> a == b
+
+fn heapEq(ma: Module, a: Int, mb: Module, b: Int, fuel: Int) -> Bool
+    ? "Abstract heap types by code, concrete ones by structure."
+    heapIn(ma, [], a, mb, [], b, fuel)
+
+fn heapIn(ma: Module, ga: List<Int>, a: Int, mb: Module, gb: List<Int>, b: Int, fuel: Int) -> Bool
+    ? "Heap types inside rec groups ga and gb being compared: a reference into its own group must be one into the other at the same place; one outside is compared as a type of its own."
+    match Bool.and(a >= 0, b >= 0)
+        false -> a == b
+        true -> match Bool.or(List.contains(ga, a), List.contains(gb, b))
+            true -> placeIn(ga, a, 0) == placeIn(gb, b, 0)
+            false -> compEq(ma, a, mb, b, fuel)
+
+fn compEq(ma: Module, a: Int, mb: Module, b: Int, fuel: Int) -> Bool
+    ? "Two concrete types are the same when they sit at the same place in rec groups of the same size whose members have equal structure (types are iso-recursive); fuel bounds the recursion."
+    match fuel <= 0
+        true -> true
+        false -> groupsEq(ma, groupOf(ma, a), a, mb, groupOf(mb, b), b, fuel - 1)
+
+fn groupOf(m: Module, t: Int) -> List<Int>
+    ? "The indices of the types in t's rec group, in order."
+    match Vector.get(m.types, t)
+        Option.None -> [t]
+        Option.Some(st) -> sameGroup(m, st.group, 0, [])
+
+fn sameGroup(m: Module, g: Int, k: Int, acc: List<Int>) -> List<Int>
+    ? "Every type index from k on whose group is g."
+    match Vector.get(m.types, k)
+        Option.None -> List.reverse(acc)
+        Option.Some(st) -> match st.group == g
+            true -> sameGroup(m, g, k + 1, List.prepend(k, acc))
+            false -> sameGroup(m, g, k + 1, acc)
+
+fn groupsEq(ma: Module, ga: List<Int>, a: Int, mb: Module, gb: List<Int>, b: Int, fuel: Int) -> Bool
+    ? "Groups of the same size, a and b at the same place, members equal one by one."
+    Bool.and(Bool.and(List.len(ga) == List.len(gb), placeIn(ga, a, 0) == placeIn(gb, b, 0)), membersEq(ma, ga, ga, mb, gb, gb, fuel))
+
+fn placeIn(g: List<Int>, t: Int, k: Int) -> Int
+    ? "Where t sits in its group."
+    match g
+        [] -> -1
+        [x, ..rest] -> match x == t
+            true -> k
+            false -> placeIn(rest, t, k + 1)
+
+fn membersEq(ma: Module, ga: List<Int>, rest: List<Int>, mb: Module, gb: List<Int>, restB: List<Int>, fuel: Int) -> Bool
+    ? "The members of two groups (ga and gb whole, rest and restB still to compare), pairwise: same finality, supertypes and structure."
+    match rest
+        [] -> true
+        [x, ..xs] -> match restB
+            [] -> false
+            [y, ..ys] -> Bool.and(memberEq(ma, ga, x, mb, gb, y, fuel), membersEq(ma, ga, xs, mb, gb, ys, fuel))
+
+fn memberEq(ma: Module, ga: List<Int>, x: Int, mb: Module, gb: List<Int>, y: Int, fuel: Int) -> Bool
+    ? "One pair of group members."
+    match Vector.get(ma.types, x)
+        Option.None -> false
+        Option.Some(sa) -> match Vector.get(mb.types, y)
+            Option.None -> false
+            Option.Some(sb) -> Bool.and(Bool.and(sa.final == sb.final, supersEq(ma, ga, sa.supers, mb, gb, sb.supers, fuel)), compsEq(ma, ga, sa.comp, mb, gb, sb.comp, fuel))
+
+fn supersEq(ma: Module, ga: List<Int>, a: List<Int>, mb: Module, gb: List<Int>, b: List<Int>, fuel: Int) -> Bool
+    ? "Declared supertypes: none on both sides, or the same type on both."
+    match a
+        [] -> List.len(b) == 0
+        [x, .._] -> match b
+            [] -> false
+            [y, .._] -> heapIn(ma, ga, x, mb, gb, y, fuel)
+
+fn subX(ma: Module, a: Int, mb: Module, b: Int, fuel: Int) -> Bool
+    ? "Whether concrete type a of ma is b of mb or reaches it through its declared supertypes."
+    match compEq(ma, a, mb, b, fuel)
+        true -> true
+        false -> match Bool.and(fuel > 0, superOf(ma, a) >= 0)
+            true -> subX(ma, superOf(ma, a), mb, b, fuel - 1)
+            false -> false
+
+fn superOf(m: Module, t: Int) -> Int
+    ? "The declared supertype of t, or -1."
+    match Vector.get(m.types, t)
+        Option.Some(st) -> match st.supers
+            [x, .._] -> x
+            [] -> -1
+        Option.None -> -1
+
+verify supersEq
+    supersEq(Ast.emptyModule(), [], [], Ast.emptyModule(), [], [0], 4) => false
+
+verify subX
+    subX(Ast.emptyModule(), 0, Ast.emptyModule(), 0, 0) => true
+
+verify superOf
+    superOf(Ast.emptyModule(), 0) => -1
+
+verify groupOf
+    groupOf(Ast.emptyModule(), 3) => [3]
+
+verify sameGroup
+    sameGroup(Ast.emptyModule(), 0, 0, []) => []
+
+verify groupsEq
+    groupsEq(Ast.emptyModule(), [0, 1], 0, Ast.emptyModule(), [0], 0, 4) => false
+
+verify placeIn
+    placeIn([4, 5], 5, 0) => 1
+
+verify membersEq
+    membersEq(Ast.emptyModule(), [], [], Ast.emptyModule(), [1], [1], 4) => true
+
+verify memberEq
+    memberEq(Ast.emptyModule(), [], 0, Ast.emptyModule(), [], 0, 4) => false
+
+fn compsEq(ma: Module, ga: List<Int>, a: Comp, mb: Module, gb: List<Int>, b: Comp, fuel: Int) -> Bool
+    ? "Composite types of the same shape with equal parts."
+    match a
+        Comp.FuncT(pa, ra) -> match b
+            Comp.FuncT(pb, rb) -> Bool.and(valsEq(ma, ga, pa, mb, gb, pb, fuel), valsEq(ma, ga, ra, mb, gb, rb, fuel))
+            _ -> false
+        Comp.StructT(fa) -> match b
+            Comp.StructT(fb) -> valsEq(ma, ga, List.fromVector(fa), mb, gb, List.fromVector(fb), fuel)
+            _ -> false
+        Comp.ArrayT(ea) -> match b
+            Comp.ArrayT(eb) -> valIn(ma, ga, ea, mb, gb, eb, fuel)
+            _ -> false
+
+fn valsEq(ma: Module, ga: List<Int>, a: List<ValType>, mb: Module, gb: List<Int>, b: List<ValType>, fuel: Int) -> Bool
+    ? "Two lists of value types, pairwise."
+    match a
+        [] -> List.len(b) == 0
+        [x, ..xs] -> match b
+            [] -> false
+            [y, ..ys] -> Bool.and(valIn(ma, ga, x, mb, gb, y, fuel), valsEq(ma, ga, xs, mb, gb, ys, fuel))
+
+verify valEq
+    valEq(Ast.emptyModule(), ValType.Ref(true, -16), Ast.emptyModule(), ValType.Ref(false, -16), 8) => false
+    valEq(Ast.emptyModule(), ValType.I32, Ast.emptyModule(), ValType.I32, 8) => true
+
+verify valIn
+    valIn(Ast.emptyModule(), [0], ValType.Ref(false, 0), Ast.emptyModule(), [], ValType.Ref(false, 0), 4) => false
+
+verify heapIn
+    heapIn(Ast.emptyModule(), [3], 3, Ast.emptyModule(), [5, 3], 3, 4) => false
+
+verify heapEq
+    heapEq(Ast.emptyModule(), -16, Ast.emptyModule(), -17, 8) => false
+
+verify compEq
+    compEq(Ast.emptyModule(), 0, Ast.emptyModule(), 0, 0) => true
+
+verify compsEq
+    compsEq(Ast.emptyModule(), [], Comp.FuncT([], []), Ast.emptyModule(), [], Comp.ArrayT(ValType.I32), 4) => false
+
+verify valsEq
+    valsEq(Ast.emptyModule(), [], [ValType.I32], Ast.emptyModule(), [], [], 4) => false

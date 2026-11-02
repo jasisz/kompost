@@ -21,22 +21,20 @@ crash, a timeout or a killed process as an error, never as a pass:
 
 | | passed | failed |
 |---|---|---|
-| core and GC testsuite (114 files) and `tests/wast/review.wast` | 20 070 | 3 |
+| core and GC testsuite (114 files) and Kompost's own `tests/wast` | 20 081 | 0 |
 | SIMD and relaxed SIMD (66 files) | 25 073 | 0 |
-| memory64, multi-memory, exceptions, bulk, linking, … (the other 94 files) | 17 188 | 0 |
+| memory64, multi-memory, exceptions, bulk, linking, … (the other 94 files) | 17 186 | 0 |
 
-The 3 failures are one known limitation: a module that imports the same
-global, table or memory twice, under two names, gets two copies, so a write
-through one name is not seen through the other.
+Linking works the way the specification defines it: every instance lives in
+one store, and an instance maps its own indices to store addresses, so an
+import is the exporting instance's very object. GC objects, function
+references and exceptions cross instances, casts compare types across
+modules iso-recursively, and an instance can be called back into while it
+waits on a call it made. A call into another instance stops the machine like
+a call to the host and runs the callee on the same store.
 
-Linking runs each instance on its own store. A call into another instance
-stops the machine like a call to the host and runs the callee there; shared
-memories, tables and globals belong to the instance that defines them and
-are handed over when control passes between instances. Also not supported:
-GC objects (structs, arrays) passed between instances, since each instance
-has its own heap; calling back into an instance that is itself waiting on a
-call it made; threads and atomics (not part of 3.0); the legacy exception
-instructions; Aver host imports beyond console, arguments and reading files.
+Not supported: threads and atomics (not part of 3.0), the legacy exception
+instructions, Aver host imports beyond console, arguments and reading files.
 
 **Speed.** Kompost resolves control flow before running and fuses frequent
 instruction sequences, but it is an interpreter written in a language
@@ -77,7 +75,8 @@ The same runs on Aver's VM: `aver run src/main.av --module-root src -- FILE.wasm
   as one script in one Kompost process, modules linked as the file registers
   them, and every value is compared exactly; `assert_invalid` and
   `assert_malformed` modules must be refused by Kompost itself, not by a
-  crash. `tests/wast/review.wast` holds regressions from an outside review.
+  crash. `tests/wast/review.wast` holds regressions from an outside review,
+  `tests/wast/linking.wast` what linking in one store has to get right.
 - `bin/wattest` — hand-written `tests/wat/*.wat` against Wasmtime.
 - `bin/difftest` — `tests/av/*.av` compiled to wasm-gc, run by Wasmtime and by
   Kompost; output must match.
@@ -107,7 +106,8 @@ The same runs on Aver's VM: `aver run src/main.av --module-root src -- FILE.wasm
 | `src/arr.av` | GC array storage, packed for i8 and i16 elements |
 | `src/exec.av` | resolution of control flow, instruction fusion and the machine |
 | `src/kompost.av` | the heap and its garbage collector |
-| `src/link.av` | several instances linked: imports checked, calls and exceptions between instances, shared objects |
+| `src/link.av` | several instances in one store: imports checked and linked, calls and exceptions between instances |
+| `src/types.av` | types compared across modules (iso-recursive identity, subtyping) |
 | `src/main.av` | command line and host imports |
 
 ## License

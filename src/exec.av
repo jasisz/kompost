@@ -12,8 +12,8 @@ module Exec
         "return_call simply replaces the frame. Running is pure: a call to an"
         "imported function stops the machine with an Outcome.Host that holds"
         "everything needed to resume once the host has answered."
-    exposes [Inst, Store, Frame, Machine, Outcome, Obj, Heap, Placed, Fn, MemState, Settled, instantiate, prepare, settle, settlePart, invoke, resume, resumeThrow, tagId, exportFunc, Ready, writeMem, machineRoots, memState, putMemState, table, setTable]
-    depends [Ast, Value, Num, Mem, Bin, Kompost, Arr, Simd]
+    exposes [Inst, Store, Frame, Machine, Outcome, Obj, Heap, Placed, Fn, MemState, Settled, Links, instantiate, prepare, prepareIn, blankStore, noLinks, gaddr, taddr, maddr, swapTo, settle, settlePart, invoke, resume, resumeThrow, tagId, exportFunc, Ready, writeMem, machineRoots, memState, putMemState, table, setTable]
+    depends [Ast, Value, Num, Mem, Bin, Kompost, Arr, Simd, Types]
     effects []
 
 record Label
@@ -37,6 +37,7 @@ record Store
     mem: Map<Int, Vector<Int>>
     pages: Int
     maxPages: Int
+    memAt: Int
     others: Map<Int, MemState>
     tables: Vector<Vector<Val>>
     elems: Vector<Vector<Val>>
@@ -44,6 +45,7 @@ record Store
     gcAt: Int
     pinned: List<Val>
     steps: Int
+    mods: Map<Int, Module>
 
 record MemState
     mem: Map<Int, Vector<Int>>
@@ -67,6 +69,12 @@ record Inst
     fns: Vector<Fn>
     base: Int
     tags: Vector<Int>
+    ga: Vector<Int>
+    ta: Vector<Int>
+    ma: Vector<Int>
+    ea: Vector<Int>
+    da: Vector<Int>
+    flat: Bool
 
 record Machine
     frame: Frame
@@ -88,6 +96,54 @@ record Ready
     s: Store
 
 // ---- small helpers ----
+
+// ---- addresses ----
+
+fn gaddr(x: Inst, k: Int) -> Int
+    ? "The store address of global k: k itself in a flat instance (a lone module), else what its map says."
+    match x.flat
+        true -> k
+        false -> Option.withDefault(Vector.get(x.ga, k), k)
+
+fn taddr(x: Inst, t: Int) -> Int
+    ? "The store address of table t."
+    match x.flat
+        true -> t
+        false -> Option.withDefault(Vector.get(x.ta, t), t)
+
+fn maddr(x: Inst, k: Int) -> Int
+    ? "The store address of memory k."
+    match x.flat
+        true -> k
+        false -> Option.withDefault(Vector.get(x.ma, k), k)
+
+fn eaddr(x: Inst, e: Int) -> Int
+    ? "The store address of element segment e."
+    match x.flat
+        true -> e
+        false -> Option.withDefault(Vector.get(x.ea, e), e)
+
+fn daddr(x: Inst, d: Int) -> Int
+    ? "The store address of data segment d."
+    match x.flat
+        true -> d
+        false -> Option.withDefault(Vector.get(x.da, d), d)
+
+verify gaddr
+    gaddr(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), 3) => 3
+    gaddr(Inst.update(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), ga = Vector.fromList([7]), flat = false), 0) => 7
+
+verify taddr
+    taddr(Inst.update(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), ta = Vector.fromList([4]), flat = false), 0) => 4
+
+verify maddr
+    maddr(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), 1) => 1
+
+verify eaddr
+    eaddr(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), 2) => 2
+
+verify daddr
+    daddr(Inst.update(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), da = Vector.fromList([9]), flat = false), 0) => 9
 
 fn adv(f: Frame) -> Frame
     ? "The frame moved to its next instruction."
@@ -249,7 +305,7 @@ fn loop(x: Inst, f: Frame, calls: List<Frame>, s: Store, n: Int) -> Outcome
             Instr.LocalSet(k) -> loop(x, Frame.update(f, pc = f.pc + 1, sp = f.sp - 1, locals = vset(f.locals, k, at(f, 0))), calls, s, n + 1)
             Instr.LocalTee(k) -> loop(x, Frame.update(f, pc = f.pc + 1, locals = vset(f.locals, k, at(f, 0))), calls, s, n + 1)
             Instr.Drop -> loop(x, putN(f, 1), calls, s, n + 1)
-            Instr.GlobalGet(k) -> loop(x, push(f, vget(s.globals, k)), calls, s, n + 1)
+            Instr.GlobalGet(k) -> loop(x, push(f, vget(s.globals, gaddr(x, k))), calls, s, n + 1)
             Instr.RefNull(_) -> loop(x, push(f, Val.Null), calls, s, n + 1)
             Instr.Call(fi) -> match calleeFrame(x, fi, f)
                 Option.Some(g) -> loop(x, g, List.prepend(afterCall(x, fi, f), calls), s, n + 1)
@@ -540,12 +596,12 @@ fn castField(x: Inst, s: Store, f: Frame, a: Int, nl: Bool, h: Int, t: Int, k: I
 fn castFieldVal(x: Inst, s: Store, v: Val, h: Int, t: Int, k: Int, e: Int) -> Option<Val>
     ? "Field k of the struct v refers to, when it is of heap type h."
     match v
-        Val.Ref(r) -> fieldIfMatches(x, Kompost.get(s.heap, r), h, t, k, e)
+        Val.Ref(r) -> fieldIfMatches(x, s, Kompost.get(s.heap, r), h, t, k, e)
         _ -> Option.None
 
-fn fieldIfMatches(x: Inst, o: Obj, h: Int, t: Int, k: Int, e: Int) -> Option<Val>
+fn fieldIfMatches(x: Inst, s: Store, o: Obj, h: Int, t: Int, k: Int, e: Int) -> Option<Val>
     ? "Field k of o when o is of heap type h."
-    match objMatches(x, o, h)
+    match objMatches(x, s, o, h)
         true -> Option.Some(fieldOf(x, o, t, k, e))
         false -> Option.None
 
@@ -561,16 +617,16 @@ verify copyLocal
     vget(copyLocal(bare(Vector.fromList([Val.I32(4), Val.Null]), 1, 0), 0, 1).locals, 1) => Val.I32(4)
 
 verify castFieldVal
-    castFieldVal(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), emptyStore(Ast.emptyModule()), Val.Null, 0, 0, 0, 0) => Option.None
+    castFieldVal(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), emptyStore(Ast.emptyModule()), Val.Null, 0, 0, 0, 0) => Option.None
 
 verify fieldIfMatches
-    fieldIfMatches(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), Obj.Free, 0, 0, 0, 0) => Option.None
+    fieldIfMatches(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), blankStore(), Obj.Free, 0, 0, 0, 0) => Option.None
 
 verify castField
-    castField(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), emptyStore(Ast.emptyModule()), bare(Vector.fromList([Val.Null]), 1, 0), 0, true, 0, 0, 0, 0).pc => 1
+    castField(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), emptyStore(Ast.emptyModule()), bare(Vector.fromList([Val.Null]), 1, 0), 0, true, 0, 0, 0, 0).pc => 1
 
 verify testIfNot
-    testIfNot(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), emptyStore(Ast.emptyModule()), pushOnly(bare(Vector.fromList([]), 1, 0), Val.Null), true, 0, 9).pc => 2
+    testIfNot(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), emptyStore(Ast.emptyModule()), pushOnly(bare(Vector.fromList([]), 1, 0), Val.Null), true, 0, 9).pc => 2
 
 fn jumpIf(f: Frame, t: Int) -> Frame
     ? "A br_if that moves no values: pops the condition, then to t when it holds."
@@ -850,7 +906,7 @@ fn exec(x: Inst, i: Instr, f: Frame, calls: List<Frame>, s: Store) -> Next
         Instr.Return -> doReturn(x, f, calls, s)
         Instr.RefIsNull -> refIsNull(x, f, calls, s)
         Instr.RefNull(_) -> go(x, push(f, Val.Null), calls, s)
-        Instr.GlobalGet(k) -> go(x, push(f, vget(s.globals, k)), calls, s)
+        Instr.GlobalGet(k) -> go(x, push(f, vget(s.globals, gaddr(x, k))), calls, s)
         Instr.Drop -> go(x, putN(f, 1), calls, s)
         _ -> execRest(x, i, f, calls, s)
 
@@ -905,18 +961,18 @@ fn execHeap(x: Inst, i: Instr, f: Frame, calls: List<Frame>, s: Store) -> Next
         Instr.ArrayCopy(_, _) -> arrayCopy(x, f, calls, s)
         Instr.ArrayInitData(t, d) -> arrayInitData(x, f, t, d, calls, s)
         Instr.ArrayInitElem(_, e) -> arrayInitElem(x, f, e, calls, s)
-        Instr.Load(op, off, _, k) -> onMem(k, load(x, f, op, off, calls, withMem(s, k)))
-        Instr.Store(op, off, _, k) -> onMem(k, store(x, f, op, off, calls, withMem(s, k)))
-        Instr.MemorySize(k) -> onMem(k, memorySize(x, f, Ast.memIs64(x.m, k), calls, withMem(s, k)))
-        Instr.MemoryGrow(k) -> onMem(k, memoryGrow(x, f, Ast.memIs64(x.m, k), calls, withMem(s, k)))
-        Instr.MemoryFill(k) -> onMem(k, memoryFill(x, f, calls, withMem(s, k)))
+        Instr.Load(op, off, _, k) -> onMem(x, k, load(x, f, op, off, calls, withMem(x, s, k)))
+        Instr.Store(op, off, _, k) -> onMem(x, k, store(x, f, op, off, calls, withMem(x, s, k)))
+        Instr.MemorySize(k) -> onMem(x, k, memorySize(x, f, Ast.memIs64(x.m, k), calls, withMem(x, s, k)))
+        Instr.MemoryGrow(k) -> onMem(x, k, memoryGrow(x, f, Ast.memIs64(x.m, k), calls, withMem(x, s, k)))
+        Instr.MemoryFill(k) -> onMem(x, k, memoryFill(x, f, calls, withMem(x, s, k)))
         Instr.MemoryCopy(a, b) -> memoryCopyIn(x, f, a, b, calls, s)
-        Instr.MemoryInit(d, k) -> onMem(k, memoryInit(x, f, d, calls, withMem(s, k)))
-        Instr.DataDrop(d) -> go(x, adv(f), calls, Store.update(s, datas = Option.withDefault(Vector.set(s.datas, d, Vector.fromList([])), s.datas)))
-        Instr.ElemDrop(e) -> go(x, adv(f), calls, Store.update(s, elems = dropSeg(s.elems, e)))
+        Instr.MemoryInit(d, k) -> onMem(x, k, memoryInit(x, f, d, calls, withMem(x, s, k)))
+        Instr.DataDrop(d) -> go(x, adv(f), calls, Store.update(s, datas = Option.withDefault(Vector.set(s.datas, daddr(x, d), Vector.fromList([])), s.datas)))
+        Instr.ElemDrop(e) -> go(x, adv(f), calls, Store.update(s, elems = dropSeg(s.elems, eaddr(x, e))))
         Instr.TableGet(t) -> tableGet(x, f, t, calls, s)
         Instr.TableSet(t) -> tableSet(x, f, t, calls, s)
-        Instr.TableSize(t) -> go(x, push(f, sized(Ast.tableIs64(x.m, t), Vector.len(table(s, t)))), calls, s)
+        Instr.TableSize(t) -> go(x, push(f, sized(Ast.tableIs64(x.m, t), Vector.len(table(s, taddr(x, t))))), calls, s)
         Instr.TableGrow(t) -> tableGrow(x, f, t, calls, s)
         Instr.TableFill(t) -> tableFill(x, f, t, calls, s)
         Instr.TableCopy(d, sr) -> tableCopy(x, f, d, sr, calls, s)
@@ -957,7 +1013,7 @@ fn doReturn(x: Inst, f: Frame, calls: List<Frame>, s: Store) -> Next
 fn simdOp(x: Inst, f: Frame, op: Int, imm: Int, k: Int, off: Int, calls: List<Frame>, s: Store) -> Next
     ? "A SIMD instruction: memory ones on memory k, the rest pure (see Simd.pure)."
     match Simd.isMem(op)
-        true -> onMem(k, simdMem(x, f, op, imm, off, calls, withMem(s, k)))
+        true -> onMem(x, k, simdMem(x, f, op, imm, off, calls, withMem(x, s, k)))
         false -> simdPure(x, f, op, imm, calls, s)
 
 fn simdPure(x: Inst, f: Frame, op: Int, imm: Int, calls: List<Frame>, s: Store) -> Next
@@ -1022,8 +1078,8 @@ fn tagId(x: Inst, t: Int) -> Int
     Option.withDefault(Vector.get(x.tags, t), x.base + t)
 
 verify tagId
-    tagId(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), 2) => 2
-    tagId(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([9])), 0) => 9
+    tagId(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), 2) => 2
+    tagId(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([9]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), 0) => 9
 
 fn resumeThrow(x: Inst, mach: Machine, t: Int, vs: List<Val>) -> Outcome
     ? "Continues a machine that called into another instance, which threw tag t (an identity, see tagId) with values vs: the exception is made in this store and unwinds from the call."
@@ -1098,14 +1154,14 @@ verify payload
     payload(2, 3, [Val.I32(1)]) => []
 
 verify handlerAt
-    handlerAt(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), Vector.fromList([Instr.End, Instr.Handler(0, 5, 0, 1, 7), Instr.Handler(2, 4, 0, 2, 6)]), 2, 3, 1) => Option.Some(Hit(kind = 0, target = 7))
-    handlerAt(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), Vector.fromList([Instr.End, Instr.Handler(0, 5, 0, 1, 7)]), 1, 6, 1) => Option.None
+    handlerAt(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), Vector.fromList([Instr.End, Instr.Handler(0, 5, 0, 1, 7), Instr.Handler(2, 4, 0, 2, 6)]), 2, 3, 1) => Option.Some(Hit(kind = 0, target = 7))
+    handlerAt(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), Vector.fromList([Instr.End, Instr.Handler(0, 5, 0, 1, 7)]), 1, 6, 1) => Option.None
 
 verify handlerIf
-    handlerIf(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), Vector.fromList([]), 0, 0, 0, true, Hit(kind = 2, target = 1)) => Option.Some(Hit(kind = 2, target = 1))
+    handlerIf(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), Vector.fromList([]), 0, 0, 0, true, Hit(kind = 2, target = 1)) => Option.Some(Hit(kind = 2, target = 1))
 
 verify unwindOut
-    unwindOut(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), [], emptyStore(Ast.emptyModule()), 0, 0, []) => Next.Out(Outcome.Thrown(0, [], emptyStore(Ast.emptyModule())))
+    unwindOut(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), [], emptyStore(Ast.emptyModule()), 0, 0, []) => Next.Out(Outcome.Thrown(0, [], emptyStore(Ast.emptyModule())))
 
 fn call(x: Inst, fi: Int, f: Frame, calls: List<Frame>, s: Store, tail: Bool) -> Next
     ? "call or return_call of function fi."
@@ -1162,11 +1218,11 @@ fn isLocal(x: Inst, a: Int) -> Bool
     Bool.and(a >= x.base, a - x.base < Vector.len(x.fns))
 
 verify isLocal
-    isLocal(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), 0) => false
+    isLocal(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), 0) => false
 
 fn callIndirect(x: Inst, t: Int, tb: Int, f: Frame, calls: List<Frame>, s: Store, tail: Bool) -> Next
     ? "call_indirect: the table entry at the popped index, checked against type t."
-    callEntry(x, t, Vector.get(table(s, tb), idx(at(f, 0))), below(f, 1), calls, s, tail)
+    callEntry(x, t, Vector.get(table(s, taddr(x, tb)), idx(at(f, 0))), below(f, 1), calls, s, tail)
 
 fn callEntry(x: Inst, t: Int, e: Option<Val>, f: Frame, calls: List<Frame>, s: Store, tail: Bool) -> Next
     ? "Calls a table entry when it is a function of the right type."
@@ -1176,9 +1232,11 @@ fn callEntry(x: Inst, t: Int, e: Option<Val>, f: Frame, calls: List<Frame>, s: S
         Option.None -> trap("undefined element", s)
 
 fn callChecked(x: Inst, t: Int, a: Int, f: Frame, calls: List<Frame>, s: Store, tail: Bool) -> Next
-    ? "Calls the function at address a when its type is t or a subtype of it; another instance's function is not checked (its types belong to its own module)."
+    ? "Calls the function at address a when its type is t or a subtype of it; another instance's function is checked against its own module's type (see funcSub)."
     match isLocal(x, a)
-        false -> callAt(x, t, a, f, calls, s, tail)
+        false -> match funcSub(x, s, a, t)
+            true -> callAt(x, t, a, f, calls, s, tail)
+            false -> trap("indirect call type mismatch", s)
         true -> match isSub(x.m, fnType(x, a - x.base), t, 64)
             true -> call(x, a - x.base, f, calls, s, tail)
             false -> trap("indirect call type mismatch", s)
@@ -1218,7 +1276,7 @@ fn localTee(x: Inst, f: Frame, k: Int, calls: List<Frame>, s: Store) -> Next
 fn globalSet(x: Inst, f: Frame, k: Int, calls: List<Frame>, s: Store) -> Next
     ? "global.set."
     match top(f, 1)
-        [v, .._] -> go(x, putN(f, 1), calls, Store.update(s, globals = vset(s.globals, k, v)))
+        [v, .._] -> go(x, putN(f, 1), calls, Store.update(s, globals = vset(s.globals, gaddr(x, k), v)))
         [] -> underflow(s)
 
 fn unOp(x: Inst, op: Int, f: Frame, calls: List<Frame>, s: Store) -> Next
@@ -1344,17 +1402,49 @@ fn matches(x: Inst, s: Store, r: Val, nullable: Bool, h: Int) -> Bool
     match r
         Val.Null -> nullable
         Val.I31(_) -> Bool.or(Bool.or(h == -20, h == -17), Bool.or(h == -19, h == -18))
-        Val.Ref(a) -> Bool.or(h == -17, objMatches(x, Kompost.get(s.heap, a), h))
-        Val.Func(a) -> Bool.or(h == -16, Bool.and(Bool.and(h >= 0, isLocal(x, a)), isSub(x.m, fnType(x, a - x.base), h, 64)))
+        Val.Ref(a) -> Bool.or(h == -17, objMatches(x, s, Kompost.get(s.heap, a), h))
+        Val.Func(a) -> Bool.or(h == -16, Bool.and(h >= 0, funcSub(x, s, a, h)))
         Val.Host(_) -> Bool.or(h == -17, h == -18)
         _ -> false
 
-fn objMatches(x: Inst, o: Obj, h: Int) -> Bool
-    ? "Whether a heap object is of heap type h."
+fn objMatches(x: Inst, s: Store, o: Obj, h: Int) -> Bool
+    ? "Whether a heap object is of heap type h. Its type is an identity: the allocating instance's base plus its type index."
     match o
         Obj.Free -> false
-        Obj.Array(t, _) -> Bool.or(Bool.or(h == -18, h == -19), Bool.or(h == -22, Bool.and(h >= 0, isSub(x.m, t, h, 64))))
-        _ -> Bool.or(Bool.or(h == -18, h == -19), Bool.or(h == -21, Bool.and(h >= 0, isSub(x.m, Kompost.typeOf(o), h, 64))))
+        Obj.Array(t, _) -> Bool.or(Bool.or(h == -18, h == -19), Bool.or(h == -22, Bool.and(h >= 0, typeSub(x, s, t, h))))
+        _ -> Bool.or(Bool.or(h == -18, h == -19), Bool.or(h == -21, Bool.and(h >= 0, typeSub(x, s, Kompost.typeOf(o), h))))
+
+fn typeSub(x: Inst, s: Store, tid: Int, h: Int) -> Bool
+    ? "Whether the type with identity tid is a subtype of x's type h: within x by x's own rules, across instances by Types.subX on the two modules."
+    match Bool.and(tid >= x.base, tid - x.base < Vector.len(x.m.types))
+        true -> isSub(x.m, tid - x.base, h, 64)
+        false -> match Map.get(s.mods, Int.div(tid, 4294967296))
+            Option.Some(om) -> Types.subX(om, Int.mod(tid, 4294967296), x.m, h, 8)
+            Option.None -> false
+
+fn funcSub(x: Inst, s: Store, a: Int, h: Int) -> Bool
+    ? "Whether the function at address a is of x's type h, wherever it lives."
+    match isLocal(x, a)
+        true -> isSub(x.m, fnType(x, a - x.base), h, 64)
+        false -> match Map.get(s.mods, Int.div(a, 4294967296))
+            Option.Some(om) -> Types.subX(om, modFnType(om, Int.mod(a, 4294967296)), x.m, h, 8)
+            Option.None -> false
+
+fn modFnType(m: Module, fi: Int) -> Int
+    ? "The type index of function fi of module m."
+    match Vector.get(m.funcs, fi)
+        Option.Some(Func.Imported(_, _, t)) -> t
+        Option.Some(Func.Local(t, _, _)) -> t
+        Option.None -> -1
+
+verify typeSub
+    typeSub(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), blankStore(), 4294967296, 0) => false
+
+verify funcSub
+    funcSub(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), blankStore(), 4294967296, 0) => false
+
+verify modFnType
+    modFnType(Ast.emptyModule(), 0) => -1
 
 fn isSub(m: Module, t: Int, target: Int, fuel: Int) -> Bool
     ? "Whether type t is target, up to iso-recursive equivalence, or declares it among its supertypes, transitively."
@@ -1492,7 +1582,7 @@ fn allocStruct(x: Inst, f: Frame, popped: Int, o: Obj, calls: List<Frame>, s: St
 
 fn allocArr(x: Inst, f: Frame, popped: Int, t: Int, arr: Arr, calls: List<Frame>, s: Store) -> Next
     ? "A new array of type t holding arr."
-    alloc(x, f, popped, Obj.Array(t, Arr.len(arr)), Option.Some(arr), calls, s)
+    alloc(x, f, popped, Obj.Array(x.base + t, Arr.len(arr)), Option.Some(arr), calls, s)
 
 fn composted(rs: List<Val>, s: Store) -> Store
     ? "The store after a collection from the roots rs: the next one waits until the heap has doubled what survived. The heap goes to the collector moved, never shared."
@@ -1536,15 +1626,15 @@ verify flat
     flat([Vector.fromList([Val.Null]), Vector.fromList([Val.I32(1)])], []) => [Val.I32(1), Val.Null]
 
 verify composted
-    composted([], Store(globals = Vector.fromList([]), heap = Kompost.empty(), mem = {}, pages = 0, maxPages = 0, others = {}, tables = Vector.fromList([]), elems = Vector.fromList([]), datas = Vector.fromList([]), gcAt = 0, pinned = [], steps = 0)).gcAt => 65536
+    composted([], Store(globals = Vector.fromList([]), heap = Kompost.empty(), mem = {}, pages = 0, maxPages = 0, memAt = -1, others = {}, tables = Vector.fromList([]), elems = Vector.fromList([]), datas = Vector.fromList([]), gcAt = 0, pinned = [], steps = 0, mods = {})).gcAt => 65536
 
 fn structNew(x: Inst, f: Frame, t: Int, dflt: Bool, calls: List<Frame>, s: Store) -> Next
     ? "struct.new and struct.new_default."
     fs = List.fromVector(Ast.structFields(x.m, t))
     n = List.len(fs)
     match dflt
-        true -> allocStruct(x, f, 0, Kompost.mkStruct(t, defaults(fs, [])), calls, s)
-        false -> allocStruct(x, f, n, Kompost.mkStruct(t, packAll(fs, List.reverse(top(f, n)), [])), calls, s)
+        true -> allocStruct(x, f, 0, Kompost.mkStruct(x.base + t, defaults(fs, [])), calls, s)
+        false -> allocStruct(x, f, n, Kompost.mkStruct(x.base + t, packAll(fs, List.reverse(top(f, n)), [])), calls, s)
 
 fn structGet(x: Inst, f: Frame, t: Int, k: Int, e: Int, calls: List<Frame>, s: Store) -> Next
     ? "struct.get, struct.get_s and struct.get_u."
@@ -1684,7 +1774,7 @@ fn dataSeg(s: Store, d: Int) -> Vector<Int>
 fn arrayNewData(x: Inst, f: Frame, t: Int, d: Int, calls: List<Frame>, s: Store) -> Next
     ? "array.new_data: n elements from data segment d at an offset."
     match top(f, 2)
-        [n, off, .._] -> arrayFromData(x, f, t, dataSeg(s, d), idx(off), idx(n), 2, calls, s)
+        [n, off, .._] -> arrayFromData(x, f, t, dataSeg(s, daddr(x, d)), idx(off), idx(n), 2, calls, s)
         _ -> underflow(s)
 
 fn arrayFromData(x: Inst, f: Frame, t: Int, bytes: Vector<Int>, off: Int, n: Int, popped: Int, calls: List<Frame>, s: Store) -> Next
@@ -1712,7 +1802,7 @@ verify slice
 fn arrayNewElem(x: Inst, f: Frame, t: Int, e: Int, calls: List<Frame>, s: Store) -> Next
     ? "array.new_elem: n references from element segment e."
     match top(f, 2)
-        [n, off, .._] -> arrayFromElem(x, f, t, elemSeg(s, e), idx(off), idx(n), 2, calls, s)
+        [n, off, .._] -> arrayFromElem(x, f, t, elemSeg(s, eaddr(x, e)), idx(off), idx(n), 2, calls, s)
         _ -> underflow(s)
 
 fn arrayFromElem(x: Inst, f: Frame, t: Int, seg: Vector<Val>, off: Int, n: Int, popped: Int, calls: List<Frame>, s: Store) -> Next
@@ -1822,7 +1912,7 @@ fn arrayCopyIn(x: Inst, f: Frame, src: Int, si: Int, dst: Int, di: Int, n: Int, 
 fn arrayInitData(x: Inst, f: Frame, t: Int, d: Int, calls: List<Frame>, s: Store) -> Next
     ? "array.init_data."
     match top(f, 4)
-        [n, so, k, Val.Ref(a), .._] -> arrayInitDataIn(x, f, a, t, dataSeg(s, d), idx(so), idx(k), idx(n), 4, calls, s)
+        [n, so, k, Val.Ref(a), .._] -> arrayInitDataIn(x, f, a, t, dataSeg(s, daddr(x, d)), idx(so), idx(k), idx(n), 4, calls, s)
         [_, _, _, Val.Null, .._] -> trap("null array reference", s)
         _ -> underflow(s)
 
@@ -1843,7 +1933,7 @@ fn arrayInitDataRead(x: Inst, f: Frame, a: Int, et: ValType, bytes: Vector<Int>,
 fn arrayInitElem(x: Inst, f: Frame, e: Int, calls: List<Frame>, s: Store) -> Next
     ? "array.init_elem."
     match top(f, 4)
-        [n, so, k, Val.Ref(a), .._] -> arrayInitElemIn(x, f, a, elemSeg(s, e), idx(so), idx(k), idx(n), 4, calls, s)
+        [n, so, k, Val.Ref(a), .._] -> arrayInitElemIn(x, f, a, elemSeg(s, eaddr(x, e)), idx(so), idx(k), idx(n), 4, calls, s)
         [_, _, _, Val.Null, .._] -> trap("null array reference", s)
         _ -> underflow(s)
 
@@ -1855,52 +1945,81 @@ fn arrayInitElemIn(x: Inst, f: Frame, a: Int, seg: Vector<Val>, so: Int, k: Int,
 
 // ---- linear memory ----
 
-fn withMem(s: Store, k: Int) -> Store
-    ? "The store with memory k in the place of memory 0, so the code for memory 0 works on it; memory 0 itself needs nothing."
+fn withMem(x: Inst, s: Store, k: Int) -> Store
+    ? "The store with memory k of instance x on top, where the code for memory 0 works on it. Memory 0 of the running instance is always on top, so it needs nothing."
     match k == 0
         true -> s
-        false -> swapMem(s, k)
+        false -> swapTo(s, maddr(x, k))
 
-fn swapMem(s: Store, k: Int) -> Store
-    ? "Swaps memory 0 with memory k; doing it twice gives the store back."
-    match Map.get(s.others, k)
-        Option.Some(o) -> Store.update(s, mem = o.mem, pages = o.pages, maxPages = o.maxPages, others = Map.set(s.others, k, MemState(mem = s.mem, pages = s.pages, maxPages = s.maxPages)))
-        Option.None -> s
+fn swapTo(s: Store, a: Int) -> Store
+    ? "The store with the memory at address a on top, the one that was on top parked under its own address; memAt says which is on top."
+    match a == s.memAt
+        true -> s
+        false -> match Map.get(s.others, a)
+            Option.Some(o) -> Store.update(s, mem = o.mem, pages = o.pages, maxPages = o.maxPages, memAt = a, others = parked(Map.remove(s.others, a), s))
+            Option.None -> s
+
+fn parked(others: Map<Int, MemState>, s: Store) -> Map<Int, MemState>
+    ? "others with the memory on top of s parked under its address, when there is one."
+    match s.memAt >= 0
+        true -> Map.set(others, s.memAt, MemState(mem = s.mem, pages = s.pages, maxPages = s.maxPages))
+        false -> others
+
+fn memBack(x: Inst, s: Store, k: Int) -> Store
+    ? "After working on memory k, memory 0 of x goes back on top."
+    match k == 0
+        true -> s
+        false -> swapTo(s, maddr(x, 0))
+
+fn memAtOf(m: Module) -> Int
+    ? "The address of the memory on top of a lone module's store: its memory 0, or -1 when it has none."
+    match m.hasMemory
+        true -> 0
+        false -> -1
+
+verify memBack
+    memBack(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), emptyStore(Ast.emptyModule()), 0) => emptyStore(Ast.emptyModule())
+
+verify memAtOf
+    memAtOf(Ast.emptyModule()) => -1
+
+verify swapTo
+    swapTo(emptyStore(Ast.emptyModule()), 2).pages => 0
+
+verify parked
+    Map.len(parked({}, emptyStore(Ast.emptyModule()))) => 0
 
 verify withMem
-    withMem(Store.update(emptyStore(Ast.emptyModule()), others = {1 => MemState(mem = {}, pages = 3, maxPages = 4)}), 1).pages => 3
-    withMem(withMem(Store.update(emptyStore(Ast.emptyModule()), others = {1 => MemState(mem = {}, pages = 3, maxPages = 4)}), 1), 1).pages => 0
+    withMem(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), Store.update(emptyStore(Ast.emptyModule()), others = {1 => MemState(mem = {}, pages = 3, maxPages = 4)}), 1).pages => 3
+    memBack(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), withMem(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), Store.update(emptyStore(Module.update(Ast.emptyModule(), hasMemory = true)), others = {1 => MemState(mem = {}, pages = 3, maxPages = 4)}), 1), 1).pages => 0
 
-verify swapMem
-    swapMem(emptyStore(Ast.emptyModule()), 2).pages => 0
-
-fn onMem(k: Int, n: Next) -> Next
-    ? "Puts memory k back where it belongs after an instruction ran on it in the place of memory 0."
+fn onMem(x: Inst, k: Int, n: Next) -> Next
+    ? "Puts memory 0 of x back on top after an instruction ran on memory k."
     match k == 0
         true -> n
-        false -> backMem(k, n)
+        false -> backMem(x, n)
 
-fn backMem(k: Int, n: Next) -> Next
-    ? "Swaps memory k back in the store a step goes on with."
+fn backMem(x: Inst, n: Next) -> Next
+    ? "Memory 0 of x back on top in the store a step goes on with."
     match n
-        Next.Go(f, calls, s) -> Next.Go(f, calls, swapMem(s, k))
-        Next.Out(o) -> Next.Out(outBack(k, o))
+        Next.Go(f, calls, s) -> Next.Go(f, calls, swapTo(s, maddr(x, 0)))
+        Next.Out(o) -> Next.Out(outBack(x, o))
 
-fn outBack(k: Int, o: Outcome) -> Outcome
-    ? "A trap or an exception carries its store: memory k goes back to its place in it too."
+fn outBack(x: Inst, o: Outcome) -> Outcome
+    ? "A trap or an exception carries its store: memory 0 of x goes back on top in it too."
     match o
-        Outcome.Trap(e, s) -> Outcome.Trap(e, swapMem(s, k))
-        Outcome.Thrown(t, vs, s) -> Outcome.Thrown(t, vs, swapMem(s, k))
+        Outcome.Trap(e, s) -> Outcome.Trap(e, swapTo(s, maddr(x, 0)))
+        Outcome.Thrown(t, vs, s) -> Outcome.Thrown(t, vs, swapTo(s, maddr(x, 0)))
         _ -> o
 
 verify outBack
-    outBack(1, Outcome.Trap("x", emptyStore(Ast.emptyModule()))) => Outcome.Trap("x", emptyStore(Ast.emptyModule()))
+    outBack(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), Outcome.Trap("x", emptyStore(Ast.emptyModule()))) => Outcome.Trap("x", emptyStore(Ast.emptyModule()))
 
 verify onMem
-    onMem(0, Next.Out(Outcome.Trap("x", emptyStore(Ast.emptyModule())))) => Next.Out(Outcome.Trap("x", emptyStore(Ast.emptyModule())))
+    onMem(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), 0, Next.Out(Outcome.Trap("x", emptyStore(Ast.emptyModule())))) => Next.Out(Outcome.Trap("x", emptyStore(Ast.emptyModule())))
 
 verify backMem
-    backMem(1, Next.Out(Outcome.Trap("x", emptyStore(Ast.emptyModule())))) => Next.Out(Outcome.Trap("x", emptyStore(Ast.emptyModule())))
+    backMem(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), Next.Out(Outcome.Trap("x", emptyStore(Ast.emptyModule())))) => Next.Out(Outcome.Trap("x", emptyStore(Ast.emptyModule())))
 
 fn memorySize(x: Inst, f: Frame, wide: Bool, calls: List<Frame>, s: Store) -> Next
     ? "memory.size."
@@ -1909,24 +2028,24 @@ fn memorySize(x: Inst, f: Frame, wide: Bool, calls: List<Frame>, s: Store) -> Ne
 fn memoryCopyIn(x: Inst, f: Frame, d: Int, src: Int, calls: List<Frame>, s: Store) -> Next
     ? "memory.copy from memory src to memory d."
     match d == src
-        true -> onMem(d, memoryCopy(x, f, calls, withMem(s, d)))
+        true -> onMem(x, d, memoryCopy(x, f, calls, withMem(x, s, d)))
         false -> memoryCopyAcross(x, f, d, src, calls, s)
 
 fn memoryCopyAcross(x: Inst, f: Frame, dm: Int, sm: Int, calls: List<Frame>, s: Store) -> Next
     ? "memory.copy between two memories."
     match top(f, 3)
-        [n, src, d, .._] -> copyAcross(x, f, dm, sm, idx(src), idx(d), idx(n), calls, withMem(s, sm))
+        [n, src, d, .._] -> copyAcross(x, f, dm, sm, idx(src), idx(d), idx(n), calls, withMem(x, s, sm))
         _ -> underflow(s)
 
 fn copyAcross(x: Inst, f: Frame, dm: Int, sm: Int, src: Int, d: Int, n: Int, calls: List<Frame>, ss: Store) -> Next
     ? "Reads from memory sm (in the place of memory 0 in ss) after its bounds check, then writes into memory dm."
     match src + n > memBytes(ss)
-        true -> trap("out of bounds memory access", withMem(ss, sm))
-        false -> copyInto(x, f, dm, d, Mem.readList(ss.mem, src, n), n, calls, withMem(ss, sm))
+        true -> trap("out of bounds memory access", memBack(x, ss, sm))
+        false -> copyInto(x, f, dm, d, Mem.readList(ss.mem, src, n), n, calls, memBack(x, ss, sm))
 
 fn copyInto(x: Inst, f: Frame, dm: Int, d: Int, bs: List<Int>, n: Int, calls: List<Frame>, s: Store) -> Next
     ? "Writes the copied octets into memory dm."
-    onMem(dm, memWrite(x, f, d, bs, n, 3, calls, withMem(s, dm)))
+    onMem(x, dm, memWrite(x, f, d, bs, n, 3, calls, withMem(x, s, dm)))
 
 fn idx(v: Val) -> Int
     ? "An address, index or count as an unsigned number: i64 for 64-bit memories and tables, i32 otherwise."
@@ -2104,7 +2223,7 @@ fn memCopyFrom(x: Inst, f: Frame, src: Int, d: Int, n: Int, popped: Int, calls: 
 fn memoryInit(x: Inst, f: Frame, dI: Int, calls: List<Frame>, s: Store) -> Next
     ? "memory.init from a data segment."
     match top(f, 3)
-        [n, src, d, .._] -> memInitFrom(x, f, dataSeg(s, dI), idx(src), idx(d), idx(n), 3, calls, s)
+        [n, src, d, .._] -> memInitFrom(x, f, dataSeg(s, daddr(x, dI)), idx(src), idx(d), idx(n), 3, calls, s)
         _ -> underflow(s)
 
 fn memInitFrom(x: Inst, f: Frame, bytes: Vector<Int>, src: Int, d: Int, n: Int, popped: Int, calls: List<Frame>, s: Store) -> Next
@@ -2126,7 +2245,7 @@ fn setTable(s: Store, t: Int, v: Vector<Val>) -> Store
 fn tableGet(x: Inst, f: Frame, t: Int, calls: List<Frame>, s: Store) -> Next
     ? "table.get."
     match top(f, 1)
-        [k, .._] -> tablePush(x, f, Vector.get(table(s, t), idx(k)), 1, calls, s)
+        [k, .._] -> tablePush(x, f, Vector.get(table(s, taddr(x, t)), idx(k)), 1, calls, s)
         [] -> underflow(s)
 
 fn tablePush(x: Inst, f: Frame, v: Option<Val>, popped: Int, calls: List<Frame>, s: Store) -> Next
@@ -2143,10 +2262,10 @@ fn tableSet(x: Inst, f: Frame, t: Int, calls: List<Frame>, s: Store) -> Next
 
 fn tableWrite(x: Inst, f: Frame, t: Int, k: Int, vs: List<Val>, popped: Int, calls: List<Frame>, s: Store) -> Next
     ? "Writes vs into table t from k, after the bounds check."
-    tb = table(s, t)
+    tb = table(s, taddr(x, t))
     match k + List.len(vs) > Vector.len(tb)
         true -> trap("out of bounds table access", s)
-        false -> go(x, putN(f, popped), calls, setTable(s, t, writeVals(tb, k, vs)))
+        false -> go(x, putN(f, popped), calls, setTable(s, taddr(x, t), writeVals(tb, k, vs)))
 
 fn tableGrow(x: Inst, f: Frame, t: Int, calls: List<Frame>, s: Store) -> Next
     ? "table.grow: the old size, or -1 past ten million entries."
@@ -2156,15 +2275,15 @@ fn tableGrow(x: Inst, f: Frame, t: Int, calls: List<Frame>, s: Store) -> Next
 
 fn tableGrowBy(x: Inst, f: Frame, t: Int, n: Int, v: Val, popped: Int, calls: List<Frame>, s: Store) -> Next
     ? "Grows table t by n copies of v when it may."
-    tb = table(s, t)
+    tb = table(s, taddr(x, t))
     match Bool.or(Vector.len(tb) + n > 10000000, Vector.len(tb) + n > Ast.tableMax(x.m, t))
         true -> go(x, put1(f, popped, sized(Ast.tableIs64(x.m, t), -1)), calls, s)
-        false -> go(x, put1(f, popped, sized(Ast.tableIs64(x.m, t), Vector.len(tb))), calls, setTable(s, t, Vector.fromList(List.concat(List.fromVector(tb), repeatVal(v, n, [])))))
+        false -> go(x, put1(f, popped, sized(Ast.tableIs64(x.m, t), Vector.len(tb))), calls, setTable(s, taddr(x, t), Vector.fromList(List.concat(List.fromVector(tb), repeatVal(v, n, [])))))
 
 fn tableFill(x: Inst, f: Frame, t: Int, calls: List<Frame>, s: Store) -> Next
     ? "table.fill."
     match top(f, 3)
-        [n, v, k, .._] -> match idx(k) + idx(n) > Vector.len(table(s, t))
+        [n, v, k, .._] -> match idx(k) + idx(n) > Vector.len(table(s, taddr(x, t)))
             true -> trap("out of bounds table access", s)
             false -> tableWrite(x, f, t, idx(k), repeatVal(v, idx(n), []), 3, calls, s)
         _ -> underflow(s)
@@ -2172,7 +2291,7 @@ fn tableFill(x: Inst, f: Frame, t: Int, calls: List<Frame>, s: Store) -> Next
 fn tableCopy(x: Inst, f: Frame, d: Int, sr: Int, calls: List<Frame>, s: Store) -> Next
     ? "table.copy."
     match top(f, 3)
-        [n, so, k, .._] -> tableCopyFrom(x, f, d, table(s, sr), idx(so), idx(k), idx(n), 3, calls, s)
+        [n, so, k, .._] -> tableCopyFrom(x, f, d, table(s, taddr(x, sr)), idx(so), idx(k), idx(n), 3, calls, s)
         _ -> underflow(s)
 
 fn tableCopyFrom(x: Inst, f: Frame, d: Int, src: Vector<Val>, so: Int, k: Int, n: Int, popped: Int, calls: List<Frame>, s: Store) -> Next
@@ -2184,7 +2303,7 @@ fn tableCopyFrom(x: Inst, f: Frame, d: Int, src: Vector<Val>, so: Int, k: Int, n
 fn tableInit(x: Inst, f: Frame, e: Int, t: Int, calls: List<Frame>, s: Store) -> Next
     ? "table.init from an element segment."
     match top(f, 3)
-        [n, so, k, .._] -> tableCopyFrom(x, f, t, elemSeg(s, e), idx(so), idx(k), idx(n), 3, calls, s)
+        [n, so, k, .._] -> tableCopyFrom(x, f, t, elemSeg(s, eaddr(x, e)), idx(so), idx(k), idx(n), 3, calls, s)
         _ -> underflow(s)
 
 // ---- instantiation and invocation ----
@@ -2796,7 +2915,7 @@ verify firstShape
 
 fn emptyStore(m: Module) -> Store
     ? "The store before globals, tables and segments are set up."
-    Store(globals = Vector.fromList([]), heap = Kompost.empty(), mem = {}, pages = m.memMin, maxPages = Int.min(m.memMax, pageCap(m, 0)), others = othersOf(m, m.moreMems, 1, {}), tables = Vector.fromList(tablesOf(m.tables, m.tableMins, [])), elems = Vector.fromList([]), datas = Vector.fromList(dataBytes(List.fromVector(m.datas), [])), gcAt = 65536, pinned = [], steps = 0)
+    Store(globals = Vector.fromList([]), heap = Kompost.empty(), mem = {}, pages = m.memMin, maxPages = Int.min(m.memMax, pageCap(m, 0)), memAt = memAtOf(m), others = othersOf(m, m.moreMems, 1, {}), tables = Vector.fromList(tablesOf(m.tables, m.tableMins, [])), elems = Vector.fromList([]), datas = Vector.fromList(dataBytes(List.fromVector(m.datas), [])), gcAt = 65536, pinned = [], steps = 0, mods = {})
 
 fn othersOf(m: Module, ms: List<MemType>, k: Int, acc: Map<Int, MemState>) -> Map<Int, MemState>
     ? "Memories 1 and up, each empty at its minimum size."
@@ -2854,12 +2973,118 @@ fn instantiate(m: Module, hostGlobals: Map<String, Val>, shapes: Vector<Shape>) 
     Result.Ok(Ready(x = r.x, s = s))
 
 fn prepare(m: Module, hostGlobals: Map<String, Val>, shapes: Vector<Shape>, base: Int) -> Result<Ready, String>
-    ? "The first half of instantiation: functions built, globals and tables initialized, segments evaluated but not yet placed. A linker puts imported memories and tables into the store before settle places the segments in them."
-    x = Inst(m = m, fns = Vector.fromList(buildFns(m, List.fromVector(m.funcs), List.fromVector(shapes), [])), base = base, tags = Vector.fromList([]))
-    s1 = initGlobals(x, List.fromVector(m.globals), emptyStore(m), hostGlobals)?
-    s1b = initTables(x, m.tableInits, 0, s1)?
-    s2 = initElems(x, List.fromVector(m.elems), s1b, [])?
-    Result.Ok(Ready(x = x, s = s2))
+    ? "The first half of instantiating a lone module into a fresh store."
+    prepareIn(blankStore(), m, hostGlobals, shapes, Int.div(base, 4294967296), noLinks())
+
+record Links
+    globals: Map<Int, Int>
+    tables: Map<Int, Int>
+    mems: Map<Int, Int>
+    tags: Vector<Int>
+
+fn noLinks() -> Links
+    ? "Nothing imported from another instance."
+    Links(globals = {}, tables = {}, mems = {}, tags = Vector.fromList([]))
+
+fn blankStore() -> Store
+    ? "A store with nothing in it yet."
+    Store(globals = Vector.fromList([]), heap = Kompost.empty(), mem = {}, pages = 0, maxPages = 0, memAt = -1, others = {}, tables = Vector.fromList([]), elems = Vector.fromList([]), datas = Vector.fromList([]), gcAt = 65536, pinned = [], steps = 0, mods = {})
+
+fn prepareIn(s0: Store, m: Module, hostGlobals: Map<String, Val>, shapes: Vector<Shape>, id: Int, links: Links) -> Result<Ready, String>
+    ? "The first half of instantiating m as instance id into a store other instances may share: its own globals, tables and segments get the next addresses, its own memories the addresses id * 65536 + k, what it imports from another instance (links) that instance's addresses; functions built, globals and tables initialized, segments evaluated but not placed. Memory 0 of the instance ends up on top of the store."
+    ga = addrs(Vector.len(m.globals), links.globals, Vector.len(s0.globals), 0, [])
+    ta = addrs(List.len(m.tables), links.tables, Vector.len(s0.tables), 0, [])
+    ma = memAddrs(Ast.memCount(m), links.mems, id * 65536, 0, [])
+    ea = countFrom(Vector.len(s0.elems), Vector.len(m.elems), [])
+    da = countFrom(Vector.len(s0.datas), Vector.len(m.datas), [])
+    isFlat = Bool.and(Bool.and(isIdentity(ga, 0), isIdentity(ta, 0)), Bool.and(isIdentity(ma, 0), Bool.and(isIdentity(ea, 0), isIdentity(da, 0))))
+    x = Inst(m = m, fns = Vector.fromList(buildFns(m, List.fromVector(m.funcs), List.fromVector(shapes), [])), base = id * 4294967296, tags = links.tags, ga = Vector.fromList(ga), ta = Vector.fromList(ta), ma = Vector.fromList(ma), ea = Vector.fromList(ea), da = Vector.fromList(da), flat = isFlat)
+    s1 = swapTo(Store.update(extended(s0, m, ma, links), mods = Map.set(s0.mods, id, m)), maddr(x, 0))
+    s2 = initGlobals(x, List.fromVector(m.globals), 0, s1, hostGlobals, links.globals)?
+    s3 = initTables(x, m.tableInits, 0, s2)?
+    s4 = initElems(x, List.fromVector(m.elems), s3, [])?
+    Result.Ok(Ready(x = x, s = s4))
+
+fn addrs(n: Int, linked: Map<Int, Int>, next: Int, j: Int, acc: List<Int>) -> List<Int>
+    ? "The address of each of n objects: a linked one's from linked, the others the next free addresses in order."
+    match j >= n
+        true -> List.reverse(acc)
+        false -> match Map.get(linked, j)
+            Option.Some(a) -> addrs(n, linked, next, j + 1, List.prepend(a, acc))
+            Option.None -> addrs(n, linked, next + 1, j + 1, List.prepend(next, acc))
+
+fn memAddrs(n: Int, linked: Map<Int, Int>, base: Int, k: Int, acc: List<Int>) -> List<Int>
+    ? "The address of each memory: a linked one's, or base + k for one of its own."
+    match k >= n
+        true -> List.reverse(acc)
+        false -> memAddrs(n, linked, base, k + 1, List.prepend(Option.withDefault(Map.get(linked, k), base + k), acc))
+
+fn isIdentity(xs: List<Int>, k: Int) -> Bool
+    ? "Whether xs is 0, 1, 2, ..."
+    match xs
+        [] -> true
+        [x, ..rest] -> Bool.and(x == k, isIdentity(rest, k + 1))
+
+fn extended(s: Store, m: Module, ma: List<Int>, links: Links) -> Store
+    ? "The store with m's own tables (at their minimum size, full of nulls), data segments and memories added, and m's memory 0 on top."
+    t = Store.update(s, tables = Vector.fromList(List.concat(List.fromVector(s.tables), ownTables(m.tableMins, links.tables, 0, []))), datas = Vector.fromList(List.concat(List.fromVector(s.datas), dataBytes(List.fromVector(m.datas), []))))
+    withOwnMems(t, m, ma, links.mems, 0)
+
+fn ownTables(mins: List<Int>, linked: Map<Int, Int>, j: Int, acc: List<Vector<Val>>) -> List<Vector<Val>>
+    ? "A table of nulls at its minimum size for each table that is not linked."
+    match mins
+        [] -> List.reverse(acc)
+        [n, ..rest] -> match Map.has(linked, j)
+            true -> ownTables(rest, linked, j + 1, acc)
+            false -> ownTables(rest, linked, j + 1, List.prepend(Vector.fromList(repeatVal(Val.Null, n, [])), acc))
+
+fn withOwnMems(s: Store, m: Module, ma: List<Int>, linked: Map<Int, Int>, k: Int) -> Store
+    ? "Each memory that is not linked added under its address, then memory 0 put on top."
+    match ma
+        [] -> topMem(s, m)
+        [a, ..rest] -> match Map.has(linked, k)
+            true -> withOwnMems(s, m, rest, linked, k + 1)
+            false -> withOwnMems(Store.update(s, others = Map.set(s.others, a, freshMem(m, k))), m, rest, linked, k + 1)
+
+fn topMem(s: Store, m: Module) -> Store
+    ? "Nothing to do here: the caller puts memory 0 on top once the addresses are known (see prepareIn)."
+    s
+
+fn freshMem(m: Module, k: Int) -> MemState
+    ? "Memory k of m, empty at its minimum size."
+    match k == 0
+        true -> MemState(mem = {}, pages = m.memMin, maxPages = Int.min(m.memMax, pageCap(m, 0)))
+        false -> match List.drop(m.moreMems, k - 1)
+            [t, .._] -> MemState(mem = {}, pages = t.min, maxPages = Int.min(t.max, pageCap(m, k)))
+            [] -> MemState(mem = {}, pages = 0, maxPages = 0)
+
+verify prepareIn
+    Result.withDefault(prepareIn(blankStore(), Module.update(Ast.emptyModule(), memMin = 2, hasMemory = true), {}, Vector.fromList([]), 0, noLinks()), Ready(x = Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), s = blankStore())).s.pages => 2
+
+verify addrs
+    addrs(3, {1 => 9}, 4, 0, []) => [4, 9, 5]
+
+verify memAddrs
+    memAddrs(2, {0 => 7}, 65536, 0, []) => [7, 65537]
+
+verify isIdentity
+    isIdentity([0, 1, 2], 0) => true
+    isIdentity([0, 2], 0) => false
+
+verify extended
+    Vector.len(extended(blankStore(), Module.update(Ast.emptyModule(), tables = [ValType.Ref(true, -16)], tableMins = [2]), [], noLinks()).tables) => 1
+
+verify ownTables
+    ownTables([1, 2], {0 => 5}, 0, []) => [Vector.fromList([Val.Null, Val.Null])]
+
+verify withOwnMems
+    Map.len(withOwnMems(blankStore(), Module.update(Ast.emptyModule(), hasMemory = true), [65536], {}, 0).others) => 1
+
+verify topMem
+    topMem(blankStore(), Ast.emptyModule()) => blankStore()
+
+verify freshMem
+    freshMem(Module.update(Ast.emptyModule(), memMin = 3, hasMemory = true), 0).pages => 3
 
 fn settle(x: Inst, s: Store) -> Result<Store, String>
     ? "The second half: active element and data segments copied into their tables and memories."
@@ -2896,35 +3121,29 @@ fn datasPart(x: Inst, ds: List<Data>, k: Int, s: Store) -> Settled
             Result.Err(msg) -> Settled(s = s, err = msg)
 
 verify settlePart
-    settlePart(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), emptyStore(Ast.emptyModule())).err => ""
+    settlePart(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), emptyStore(Ast.emptyModule())).err => ""
 
 verify elemsPart
-    elemsPart(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), [], 0, emptyStore(Ast.emptyModule())).err => ""
+    elemsPart(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), [], 0, emptyStore(Ast.emptyModule())).err => ""
 
 verify datasPart
-    datasPart(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), [], 0, emptyStore(Ast.emptyModule())).err => ""
+    datasPart(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), [], 0, emptyStore(Ast.emptyModule())).err => ""
 
-fn memState(s: Store, k: Int) -> MemState
-    ? "Memory k as it stands."
-    w = withMem(s, k)
-    MemState(mem = w.mem, pages = w.pages, maxPages = w.maxPages)
-
-fn putMemState(s: Store, k: Int, ms: MemState) -> Store
-    ? "The store with memory k replaced by ms."
-    w = withMem(s, k)
-    withMem(Store.update(w, mem = ms.mem, pages = ms.pages, maxPages = ms.maxPages), k)
+fn memState(s: Store, a: Int) -> MemState
+    ? "The memory at address a as it stands."
+    match a == s.memAt
+        true -> MemState(mem = s.mem, pages = s.pages, maxPages = s.maxPages)
+        false -> Option.withDefault(Map.get(s.others, a), MemState(mem = {}, pages = 0, maxPages = 0))
 
 verify prepare
-    Result.withDefault(prepare(Ast.emptyModule(), {}, Vector.fromList([]), 0), Ready(x = Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), s = emptyStore(Ast.emptyModule()))).s.pages => 0
+    Result.withDefault(prepare(Ast.emptyModule(), {}, Vector.fromList([]), 0), Ready(x = Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), s = emptyStore(Ast.emptyModule()))).s.pages => 0
 
 verify settle
-    settle(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), emptyStore(Ast.emptyModule())) => Result.Ok(emptyStore(Ast.emptyModule()))
+    settle(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), emptyStore(Ast.emptyModule())) => Result.Ok(emptyStore(Ast.emptyModule()))
 
 verify memState
     memState(emptyStore(Module.update(Ast.emptyModule(), memMin = 2, hasMemory = true)), 0).pages => 2
 
-verify putMemState
-    putMemState(emptyStore(Ast.emptyModule()), 0, MemState(mem = {}, pages = 3, maxPages = 5)).pages => 3
 
 fn initTables(x: Inst, inits: List<Vector<Instr>>, t: Int, s: Store) -> Result<Store, String>
     ? "Fills each table that has an initializer expression with its value."
@@ -2936,23 +3155,25 @@ fn initTable(x: Inst, e: Vector<Instr>, t: Int, s: Store) -> Result<Store, Strin
     ? "Table t filled with the value of e, when it has one."
     match Vector.len(e) == 0
         true -> Result.Ok(s)
-        false -> filledTable(t, evalConst(x, e, s)?)
+        false -> filledTable(x, t, evalConst(x, e, s)?)
 
-fn filledTable(t: Int, r: VS) -> Result<Store, String>
+fn filledTable(x: Inst, t: Int, r: VS) -> Result<Store, String>
     ? "Every element of table t set to the value."
-    Result.Ok(setTable(r.s, t, Vector.fromList(repeatVal(r.v, Vector.len(table(r.s, t)), []))))
+    Result.Ok(setTable(r.s, taddr(x, t), Vector.fromList(repeatVal(r.v, Vector.len(table(r.s, taddr(x, t))), []))))
 
 verify initTables
-    initTables(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), [], 0, emptyStore(Ast.emptyModule())) => Result.Ok(emptyStore(Ast.emptyModule()))
+    initTables(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), [], 0, emptyStore(Ast.emptyModule())) => Result.Ok(emptyStore(Ast.emptyModule()))
 
 verify initTable
-    initTable(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([])), Vector.fromList([]), 0, emptyStore(Ast.emptyModule())) => Result.Ok(emptyStore(Ast.emptyModule()))
+    initTable(Inst(m = Ast.emptyModule(), fns = Vector.fromList([]), base = 0, tags = Vector.fromList([]), ga = Vector.fromList([]), ta = Vector.fromList([]), ma = Vector.fromList([]), ea = Vector.fromList([]), da = Vector.fromList([]), flat = true), Vector.fromList([]), 0, emptyStore(Ast.emptyModule())) => Result.Ok(emptyStore(Ast.emptyModule()))
 
-fn initGlobals(x: Inst, gs: List<Global>, s: Store, hg: Map<String, Val>) -> Result<Store, String>
-    ? "Evaluates each global's initializer in order; each may read the globals before it. An imported one takes the host's value."
+fn initGlobals(x: Inst, gs: List<Global>, j: Int, s: Store, hg: Map<String, Val>, linked: Map<Int, Int>) -> Result<Store, String>
+    ? "Evaluates each global's initializer in order; each may read the globals before it. One imported from the host takes the host's value; one linked to another instance's global is that global, already in the store."
     match gs
         [] -> Result.Ok(s)
-        [g, ..rest] -> initGlobalsNext(x, globalValue(x, g, s, hg)?, rest, hg)
+        [g, ..rest] -> match Map.has(linked, j)
+            true -> initGlobals(x, rest, j + 1, s, hg, linked)
+            false -> initGlobalsNext(x, globalValue(x, g, s, hg)?, rest, j, hg, linked)
 
 fn globalValue(x: Inst, g: Global, s: Store, hg: Map<String, Val>) -> Result<VS, String>
     ? "A global's initial value: from the host when imported, else its initializer's."
@@ -2960,14 +3181,14 @@ fn globalValue(x: Inst, g: Global, s: Store, hg: Map<String, Val>) -> Result<VS,
         true -> evalConst(x, g.init, s)
         false -> Result.Ok(VS(v = Result.fromOption(Map.get(hg, g.from), "unknown import {g.from}")?, s = s))
 
-fn initGlobalsNext(x: Inst, r: VS, rest: List<Global>, hg: Map<String, Val>) -> Result<Store, String>
+fn initGlobalsNext(x: Inst, r: VS, rest: List<Global>, j: Int, hg: Map<String, Val>, linked: Map<Int, Int>) -> Result<Store, String>
     ? "Appends one global's value and evaluates the rest."
-    initGlobals(x, rest, Store.update(r.s, globals = Vector.fromList(List.concat(List.fromVector(r.s.globals), [r.v]))), hg)
+    initGlobals(x, rest, j + 1, Store.update(r.s, globals = Vector.fromList(List.concat(List.fromVector(r.s.globals), [r.v]))), hg, linked)
 
 fn initElems(x: Inst, es: List<Elem>, s: Store, acc: List<Vector<Val>>) -> Result<Store, String>
     ? "Evaluates the items of every element segment."
     match es
-        [] -> Result.Ok(Store.update(s, elems = Vector.fromList(List.reverse(acc))))
+        [] -> Result.Ok(Store.update(s, elems = Vector.fromList(List.concat(List.fromVector(s.elems), List.reverse(acc)))))
         [e, ..rest] -> initElemsNext(x, evalItems(x, e.items, s, [])?, rest, acc)
 
 record VLS
@@ -2999,16 +3220,16 @@ fn placeElem(x: Inst, e: Elem, k: Int, s: Store) -> Result<Store, String>
     match e.mode
         0 -> placeActiveElem(x, e, k, evalConst(x, e.offset, s)?)
         1 -> Result.Ok(s)
-        _ -> Result.Ok(Store.update(s, elems = dropSeg(s.elems, k)))
+        _ -> Result.Ok(Store.update(s, elems = dropSeg(s.elems, eaddr(x, k))))
 
 fn placeActiveElem(x: Inst, e: Elem, k: Int, r: VS) -> Result<Store, String>
     ? "Writes an active segment at its offset."
-    seg = elemSeg(r.s, k)
-    tb = table(r.s, e.table)
+    seg = elemSeg(r.s, eaddr(x, k))
+    tb = table(r.s, taddr(x, e.table))
     off = idx(r.v)
     match off + Vector.len(seg) > Vector.len(tb)
         true -> Result.Err("out of bounds table access")
-        false -> Result.Ok(Store.update(setTable(r.s, e.table, writeVals(tb, off, List.fromVector(seg))), elems = dropSeg(r.s.elems, k)))
+        false -> Result.Ok(Store.update(setTable(r.s, taddr(x, e.table), writeVals(tb, off, List.fromVector(seg))), elems = dropSeg(r.s.elems, eaddr(x, k))))
 
 fn placeDatas(x: Inst, ds: List<Data>, k: Int, s: Store) -> Result<Store, String>
     ? "Copies active data segments into memory and drops them."
@@ -3020,17 +3241,17 @@ fn placeData(x: Inst, d: Data, k: Int, s: Store) -> Result<Store, String>
     ? "Places one data segment when it is active."
     match d.active
         false -> Result.Ok(s)
-        true -> placeActiveData(d, k, evalConst(x, d.offset, s)?)
+        true -> placeActiveData(x, d, k, evalConst(x, d.offset, s)?)
 
-fn placeActiveData(d: Data, k: Int, r: VS) -> Result<Store, String>
+fn placeActiveData(x: Inst, d: Data, k: Int, r: VS) -> Result<Store, String>
     ? "Writes an active data segment at its offset in its memory."
-    placeIn(d, k, idx(r.v), withMem(r.s, d.mem))
+    placeIn(x, d, k, idx(r.v), withMem(x, r.s, d.mem))
 
-fn placeIn(d: Data, k: Int, off: Int, s: Store) -> Result<Store, String>
-    ? "Writes the segment with its memory in the place of memory 0, then puts the memory back."
+fn placeIn(x: Inst, d: Data, k: Int, off: Int, s: Store) -> Result<Store, String>
+    ? "Writes the segment with its memory on top, then puts memory 0 back on top."
     match off + Vector.len(d.bytes) > memBytes(s)
         true -> Result.Err("out of bounds memory access")
-        false -> Result.Ok(withMem(Store.update(s, mem = Mem.writeList(s.mem, off, List.fromVector(d.bytes)), datas = Option.withDefault(Vector.set(s.datas, k, Vector.fromList([])), s.datas)), d.mem))
+        false -> Result.Ok(memBack(x, Store.update(s, mem = Mem.writeList(s.mem, off, List.fromVector(d.bytes)), datas = Option.withDefault(Vector.set(s.datas, daddr(x, k), Vector.fromList([])), s.datas)), d.mem))
 
 fn exportFunc(m: Module, name: String) -> Option<Int>
     ? "The index of the function exported under name."
