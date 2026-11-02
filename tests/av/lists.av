@@ -1,0 +1,79 @@
+module Main
+    intent = "Lists, records, sum types and maps."
+    effects [Console.print]
+
+type Shape
+    Circle(Int)
+    Rect(Int, Int)
+    Point
+
+record Item
+    name: String
+    count: Int
+
+fn area(s: Shape) -> Int
+    ? "Integer area, with pi as three."
+    match s
+        Shape.Circle(r) -> 3 * r * r
+        Shape.Rect(w, h) -> w * h
+        Shape.Point -> 0
+
+verify area
+    area(Shape.Rect(2, 3)) => 6
+
+fn total(xs: List<Shape>, acc: Int) -> Int
+    ? "Sum of the areas."
+    match xs
+        [] -> acc
+        [s, ..rest] -> total(rest, acc + area(s))
+
+verify total
+    total([Shape.Point], 0) => 0
+
+fn range(n: Int, acc: List<Int>) -> List<Int>
+    ? "0..n-1."
+    match n <= 0
+        true -> acc
+        false -> range(n - 1, List.prepend(n - 1, acc))
+
+verify range
+    range(2, []) => [0, 1]
+
+fn squares(xs: List<Int>, acc: Map<Int, Int>) -> Map<Int, Int>
+    ? "Each number mapped to its square."
+    match xs
+        [] -> acc
+        [x, ..rest] -> squares(rest, Map.set(acc, x, x * x))
+
+verify squares
+    squares([2], {}) => {2 => 4}
+
+fn render(xs: List<Int>) -> String
+    ? "Numbers joined by spaces."
+    String.join(strs(xs, []), " ")
+
+fn strs(xs: List<Int>, acc: List<String>) -> List<String>
+    ? "Numbers as text."
+    match xs
+        [] -> List.reverse(acc)
+        [x, ..rest] -> strs(rest, List.prepend(String.fromInt(x), acc))
+
+verify render
+    render([1, 2]) => "1 2"
+
+verify strs
+    strs([1], []) => ["1"]
+
+fn main() -> Unit
+    ! [Console.print]
+    shapes = [Shape.Circle(2), Shape.Rect(3, 4), Shape.Point, Shape.Rect(5, 5)]
+    Console.print("total {total(shapes, 0)}")
+    m = squares(range(10, []), {})
+    Console.print("keys {render(Map.keys(m))}")
+    Console.print("sq7 {Option.withDefault(Map.get(m, 7), -1)} has11 {Map.has(m, 11)} len {Map.len(m)}")
+    it = Item(name = "pestka", count = 3)
+    it2 = Item.update(it, count = it.count + 39)
+    Console.print("{it2.name} x{it2.count}")
+    Console.print(render(List.reverse(List.concat(range(3, []), [10, 20]))))
+    v = Vector.fromList(range(5, []))
+    Console.print("vec {Option.withDefault(Vector.get(v, 3), -1)} {Vector.len(v)}")

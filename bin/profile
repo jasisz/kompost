@@ -1,0 +1,27 @@
+#!/bin/sh
+# Dynamic instruction profile: builds a counting copy of Kompost (tools/instrument.py)
+# and runs a wasm file in it; prints the commonest instructions, pairs and triples
+# as they are dispatched (fused instructions count once).
+# usage: bin/profile FILE.wasm [ARGS...]
+set -e
+root=$(cd "$(dirname "$0")/.." && pwd)
+[ -x "$root/.aver-tool/bin/aver" ] && PATH="$root/.aver-tool/bin:$PATH"
+export AVER_RUNTIME_PATH="${AVER_RUNTIME_PATH:-$root/.aver-rt/aver-rt}"
+work="$root/.build/profile"
+rm -rf "$work" && mkdir -p "$work/src"
+python3 "$root/tools/instrument.py" "$root/src" "$work/src"
+aver compile "$work/src/main.av" --module-root "$work/src" -o "$work/out" --name kprof >/dev/null
+(cd "$work/out" && cargo build --release -j "${JOBS:-4}" --quiet)
+"$work/out/target/release/kprof" --stats "$@" 2>&1 | grep -E '^[0-9]+ ' | sort -rn > "$work/windows.txt"
+python3 - "$work/windows.txt" <<'PY'
+import collections, sys
+c1, c2, c3, tot = collections.Counter(), collections.Counter(), collections.Counter(), 0
+for line in open(sys.argv[1]):
+    n, *w = line.split(); n = int(n); tot += n
+    c1[w[0]] += n; c2[tuple(w[:2])] += n; c3[tuple(w[:3])] += n
+print("dispatches", tot)
+for title, c in (("single", c1), ("pairs", c2), ("triples", c3)):
+    print(title)
+    for k, v in c.most_common(25):
+        print(f"{v:>12} {k if isinstance(k, str) else ' '.join(k)}")
+PY

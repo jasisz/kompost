@@ -1,0 +1,30 @@
+#!/bin/sh
+# Differential test: every tests/av/*.av (or the files given) is compiled
+# with aver --target wasm-gc, run by aver run --wasm-gc (Wasmtime) and by
+# Kompost; their stdout must match. KOMPOST names the binary to test.
+root=$(cd "$(dirname "$0")/.." && pwd)
+[ -x "$root/.aver-tool/bin/aver" ] && PATH="$root/.aver-tool/bin:$PATH"
+kompost="${KOMPOST:-$root/.build/target/release/kompost}"
+work="${WORK:-$root/.build/difftest}"
+mkdir -p "$work"
+pass=0; fail=0
+for src in "${@:-$root/tests/av/*.av}"; do
+  for f in $src; do
+    name=$(basename "$f" .av)
+    aver compile "$f" --target wasm-gc -o "$work/$name" >/dev/null 2>&1 || { echo "SKIP $name (does not compile)"; continue; }
+    wasm="$work/$name/$name.wasm"
+    args=$(sed -n 's|^// args: ||p' "$f")
+    eval "set -- $args"
+    aver run "$f" --wasm-gc -- "$@" >"$work/$name.want" 2>&1
+    start=$(date +%s)
+    "$kompost" "$wasm" "$@" >"$work/$name.got" 2>&1
+    secs=$(( $(date +%s) - start ))
+    if cmp -s "$work/$name.want" "$work/$name.got"; then
+      pass=$((pass+1)); echo "ok   $name (${secs}s)"
+    else
+      fail=$((fail+1)); echo "FAIL $name"; diff "$work/$name.want" "$work/$name.got" | head -10
+    fi
+  done
+done
+echo "$pass passed, $fail failed"
+[ "$fail" = 0 ]

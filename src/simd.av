@@ -1,0 +1,1316 @@
+module Simd
+    intent =
+        "The 128-bit SIMD instructions (prefix 0xFD) and relaxed SIMD, as pure"
+        "functions on values. A v128 is one unsigned Int below 2^128 with lane 0"
+        "in its lowest bits; lanes are read and written with division and"
+        "remainder by powers of two. Float lanes go through Num's scalar"
+        "operations (by their scalar opcodes), so rounding, NaN propagation and"
+        "canonical NaNs are the scalar ones. Relaxed instructions take the"
+        "deterministic choice: relaxed swizzle, truncation, min, max, q15mulr and"
+        "laneselect behave as their strict counterparts, madd and nmadd round"
+        "twice, and the dot products treat both operands as signed and wrap."
+        "Loads and stores touch memory, so Exec does them; this module says how"
+        "wide they are and builds or splits their values."
+    exposes [known, isMem, laneLimit, alignMax, accessSize, ins, outs, arity, pure, loaded, stored, laneBits]
+    depends [Ast, Value, Num]
+    effects []
+
+// ---- lanes ----
+
+fn dv(a: Int, b: Int) -> Int
+    ? "a / b rounded toward zero; the divisors here are never zero."
+    Result.withDefault(Int.div(a, b), 0)
+
+fn md(a: Int, b: Int) -> Int
+    ? "The remainder of a / b, with a's sign."
+    Result.withDefault(Int.mod(a, b), 0)
+
+verify dv
+    dv(7, 2) => 3
+
+verify md
+    md(7, 2) => 1
+
+fn pw(k: Int) -> Int
+    ? "2^k."
+    match k <= 0
+        true -> 1
+        false -> 2 * pw(k - 1)
+
+verify pw
+    pw(8) => 256
+    pw(0) => 1
+
+fn umod(x: Int, m: Int) -> Int
+    ? "x modulo m, never negative."
+    md(md(x, m) + m, m)
+
+verify umod
+    umod(-1, 256) => 255
+
+fn sgn(x: Int, w: Int) -> Int
+    ? "A w-bit lane read as signed."
+    match x >= pw(w - 1)
+        true -> x - pw(w)
+        false -> x
+
+verify sgn
+    sgn(255, 8) => -1
+    sgn(127, 8) => 127
+
+fn lane(n: Int, w: Int, k: Int) -> Int
+    ? "Lane k of width w, unsigned."
+    md(dv(n, pw(k * w)), pw(w))
+
+verify lane
+    lane(65280, 8, 1) => 255
+
+fn lanes(n: Int, w: Int) -> List<Int>
+    ? "All lanes of width w, lane 0 first, unsigned."
+    lanesFrom(n, w, dv(128, w) - 1, [])
+
+fn lanesFrom(n: Int, w: Int, k: Int, acc: List<Int>) -> List<Int>
+    ? "Lanes 0..k, collected from the top."
+    match k < 0
+        true -> acc
+        false -> lanesFrom(n, w, k - 1, List.prepend(lane(n, w, k), acc))
+
+verify lanes
+    lanes(258, 64) => [258, 0]
+
+fn slanes(n: Int, w: Int) -> List<Int>
+    ? "All lanes of width w read as signed."
+    signAll(lanes(n, w), w, [])
+
+fn signAll(xs: List<Int>, w: Int, acc: List<Int>) -> List<Int>
+    ? "Each lane read as signed."
+    match xs
+        [] -> List.reverse(acc)
+        [x, ..rest] -> signAll(rest, w, List.prepend(sgn(x, w), acc))
+
+verify slanes
+    slanes(255, 64) => [255, 0]
+
+verify signAll
+    signAll([255], 8, []) => [-1]
+
+fn pack(xs: List<Int>, w: Int) -> Int
+    ? "Lanes of width w, lane 0 first, as one v128; each lane is taken modulo 2^w."
+    packFrom(xs, w, 0, 0)
+
+fn packFrom(xs: List<Int>, w: Int, k: Int, acc: Int) -> Int
+    ? "Adds lanes from k on."
+    match xs
+        [] -> acc
+        [x, ..rest] -> packFrom(rest, w, k + 1, acc + umod(x, pw(w)) * pw(k * w))
+
+verify pack
+    pack([1, -1], 64) => 340282366920938463444927863358058659841
+    pack(lanes(12345, 8), 8) => 12345
+
+verify packFrom
+    packFrom([], 8, 0, 7) => 7
+
+fn repeat(x: Int, n: Int, acc: List<Int>) -> List<Int>
+    ? "n copies of x."
+    match n <= 0
+        true -> acc
+        false -> repeat(x, n - 1, List.prepend(x, acc))
+
+verify repeat
+    repeat(3, 2, []) => [3, 3]
+
+fn half(xs: List<Int>, high: Bool) -> List<Int>
+    ? "The low or high half of the lanes."
+    n = dv(List.len(xs), 2)
+    match high
+        true -> List.drop(xs, n)
+        false -> List.take(xs, n)
+
+verify half
+    half([1, 2, 3, 4], true) => [3, 4]
+
+fn v(n: Int) -> Val
+    ? "A v128 value."
+    Val.V128(n)
+
+fn bitsOf(a: Val) -> Int
+    ? "The 128 bits of a v128 value."
+    match a
+        Val.V128(n) -> n
+        _ -> 0
+
+verify bitsOf
+    bitsOf(Val.V128(5)) => 5
+    bitsOf(Val.I32(5)) => 0
+
+fn allOnes(w: Int) -> Int
+    ? "A w-bit lane of ones."
+    pw(w) - 1
+
+verify allOnes
+    allOnes(8) => 255
+
+// ---- what each opcode is ----
+
+fn known(op: Int) -> Bool
+    ? "Whether op is a SIMD or relaxed SIMD opcode."
+    match op > 275
+        true -> false
+        false -> Bool.not(List.contains([154, 162, 165, 166, 175, 176, 178, 179, 180, 187, 194, 197, 198, 207, 208, 210, 211, 212, 226, 238], op))
+
+verify known
+    known(154) => false
+    known(110) => true
+    known(276) => false
+
+fn isMem(op: Int) -> Bool
+    ? "Whether op reads or writes memory."
+    Bool.or(op <= 11, Bool.and(op >= 84, op <= 93))
+
+verify isMem
+    isMem(11) => true
+    isMem(12) => false
+    isMem(92) => true
+
+fn accessSize(op: Int) -> Int
+    ? "How many octets a memory instruction reads or writes."
+    match op
+        0 -> 16
+        11 -> 16
+        7 -> 1
+        8 -> 2
+        9 -> 4
+        10 -> 8
+        84 -> 1
+        88 -> 1
+        85 -> 2
+        89 -> 2
+        86 -> 4
+        90 -> 4
+        92 -> 4
+        _ -> 8
+
+verify accessSize
+    accessSize(0) => 16
+    accessSize(1) => 8
+    accessSize(85) => 2
+
+fn alignMax(op: Int) -> Int
+    ? "The largest alignment exponent a memory instruction allows: its access size."
+    log2(accessSize(op))
+
+fn log2(n: Int) -> Int
+    ? "The exponent of a power of two."
+    match n <= 1
+        true -> 0
+        false -> 1 + log2(dv(n, 2))
+
+verify alignMax
+    alignMax(0) => 4
+    alignMax(7) => 0
+
+verify log2
+    log2(8) => 3
+
+fn laneLimit(op: Int) -> Int
+    ? "How many lanes a lane immediate may name (0 when op has none); shuffle's lanes go up to 32."
+    match op
+        13 -> 32
+        21 -> 16
+        22 -> 16
+        23 -> 16
+        84 -> 16
+        88 -> 16
+        24 -> 8
+        25 -> 8
+        26 -> 8
+        85 -> 8
+        89 -> 8
+        27 -> 4
+        28 -> 4
+        31 -> 4
+        32 -> 4
+        86 -> 4
+        90 -> 4
+        29 -> 2
+        30 -> 2
+        33 -> 2
+        34 -> 2
+        87 -> 2
+        91 -> 2
+        _ -> 0
+
+verify laneLimit
+    laneLimit(21) => 16
+    laneLimit(110) => 0
+
+fn laneBits(op: Int) -> Int
+    ? "The lane width of a lane instruction (extract, replace, load and store lane)."
+    match laneLimit(op)
+        16 -> 8
+        8 -> 16
+        4 -> 32
+        _ -> 64
+
+verify laneBits
+    laneBits(27) => 32
+
+fn vt() -> ValType
+    ? "v128."
+    ValType.V128
+
+fn ins(op: Int, at: ValType) -> List<ValType>
+    ? "What op pops, the first pushed first; at is the memory's address type."
+    match isMem(op)
+        true -> memIns(op, at)
+        false -> pureIns(op)
+
+fn memIns(op: Int, at: ValType) -> List<ValType>
+    ? "Operands of a memory instruction."
+    match op
+        11 -> [at, vt()]
+        _ -> memLaneIns(op, at)
+
+fn memLaneIns(op: Int, at: ValType) -> List<ValType>
+    ? "A lane load or store takes the vector too."
+    match op >= 84
+        true -> laneMemIns(op, at)
+        false -> [at]
+
+fn laneMemIns(op: Int, at: ValType) -> List<ValType>
+    ? "load_lane and store_lane: address and vector."
+    match op <= 91
+        true -> [at, vt()]
+        false -> [at]
+
+fn pureIns(op: Int) -> List<ValType>
+    ? "Operands of an instruction that does not touch memory."
+    match arity(op)
+        0 -> []
+        1 -> [unaryIn(op)]
+        2 -> [vt(), binarySecond(op)]
+        _ -> [vt(), vt(), vt()]
+
+fn unaryIn(op: Int) -> ValType
+    ? "The operand of a one-operand instruction: a scalar for the splats, else a vector."
+    match op
+        15 -> ValType.I32
+        16 -> ValType.I32
+        17 -> ValType.I32
+        18 -> ValType.I64
+        19 -> ValType.F32
+        20 -> ValType.F64
+        _ -> vt()
+
+fn binarySecond(op: Int) -> ValType
+    ? "The second operand of a two-operand instruction: the scalar of a replace_lane or a shift amount, else a vector."
+    match op
+        23 -> ValType.I32
+        26 -> ValType.I32
+        28 -> ValType.I32
+        30 -> ValType.I64
+        32 -> ValType.F32
+        34 -> ValType.F64
+        _ -> shiftSecond(op)
+
+fn shiftSecond(op: Int) -> ValType
+    ? "A shift takes an i32 amount."
+    match List.contains([107, 108, 109, 139, 140, 141, 171, 172, 173, 203, 204, 205], op)
+        true -> ValType.I32
+        false -> vt()
+
+verify ins
+    ins(11, ValType.I64) => [ValType.I64, ValType.V128]
+    ins(84, ValType.I32) => [ValType.I32, ValType.V128]
+    ins(0, ValType.I32) => [ValType.I32]
+    ins(30, ValType.I32) => [ValType.V128, ValType.I64]
+    ins(12, ValType.I32) => []
+    ins(82, ValType.I32) => [ValType.V128, ValType.V128, ValType.V128]
+
+verify memIns
+    memIns(92, ValType.I32) => [ValType.I32]
+
+verify memLaneIns
+    memLaneIns(3, ValType.I32) => [ValType.I32]
+
+verify laneMemIns
+    laneMemIns(93, ValType.I64) => [ValType.I64]
+
+verify pureIns
+    pureIns(19) => [ValType.F32]
+
+verify unaryIn
+    unaryIn(18) => ValType.I64
+
+verify binarySecond
+    binarySecond(107) => ValType.I32
+
+verify shiftSecond
+    shiftSecond(110) => ValType.V128
+
+fn outs(op: Int) -> List<ValType>
+    ? "What op pushes."
+    match Bool.or(op == 11, Bool.and(op >= 88, op <= 91))
+        true -> []
+        false -> [outOf(op)]
+
+fn outOf(op: Int) -> ValType
+    ? "The one result: a scalar for extract_lane and the tests, else a vector."
+    match op
+        21 -> ValType.I32
+        22 -> ValType.I32
+        24 -> ValType.I32
+        25 -> ValType.I32
+        27 -> ValType.I32
+        29 -> ValType.I64
+        31 -> ValType.F32
+        33 -> ValType.F64
+        _ -> testOut(op)
+
+fn testOut(op: Int) -> ValType
+    ? "any_true, all_true and bitmask give an i32."
+    match List.contains([83, 99, 100, 131, 132, 163, 164, 195, 196], op)
+        true -> ValType.I32
+        false -> vt()
+
+verify outs
+    outs(11) => []
+    outs(29) => [ValType.I64]
+    outs(100) => [ValType.I32]
+    outs(110) => [ValType.V128]
+
+verify outOf
+    outOf(31) => ValType.F32
+
+verify testOut
+    testOut(83) => ValType.I32
+
+fn arity(op: Int) -> Int
+    ? "How many operands an instruction that does not touch memory pops."
+    match op
+        12 -> 0
+        82 -> 3
+        _ -> arityRest(op)
+
+fn arityRest(op: Int) -> Int
+    ? "arity past const and bitselect."
+    match Bool.and(op >= 261, op <= 268)
+        true -> 3
+        false -> match op == 275
+            true -> 3
+            false -> match isUnaryOp(op)
+                true -> 1
+                false -> 2
+
+fn isUnaryOp(op: Int) -> Bool
+    ? "The one-operand instructions."
+    match Bool.and(op >= 15, op <= 34)
+        true -> List.contains([15, 16, 17, 18, 19, 20, 21, 22, 24, 25, 27, 29, 31, 33], op)
+        false -> List.contains([77, 83, 94, 95, 96, 97, 98, 99, 100, 103, 104, 105, 106, 116, 117, 122, 124, 125, 126, 127, 128, 129, 131, 132, 135, 136, 137, 138, 148, 160, 161, 163, 164, 167, 168, 169, 170, 192, 193, 195, 196, 199, 200, 201, 202, 224, 225, 227, 236, 237, 239, 248, 249, 250, 251, 252, 253, 254, 255, 257, 258, 259, 260], op)
+
+verify arity
+    arity(12) => 0
+    arity(77) => 1
+    arity(110) => 2
+    arity(275) => 3
+
+verify arityRest
+    arityRest(262) => 3
+
+verify isUnaryOp
+    isUnaryOp(23) => false
+    isUnaryOp(21) => true
+
+// ---- memory values ----
+
+fn loaded(op: Int, imm: Int, raw: Int, old: Val) -> Val
+    ? "The vector a load gives from the octets it read (as a little-endian number); a lane load replaces lane imm of old."
+    match op
+        0 -> v(raw)
+        92 -> v(raw)
+        93 -> v(raw)
+        1 -> v(pack(signAll(lanes(raw, 8), 8, []), 16))
+        2 -> v(pack(lanes(raw, 8), 16))
+        3 -> v(pack(signAll(lanes(raw, 16), 16, []), 32))
+        4 -> v(pack(lanes(raw, 16), 32))
+        5 -> v(pack(signAll(lanes(raw, 32), 32, []), 64))
+        6 -> v(pack(lanes(raw, 32), 64))
+        7 -> v(pack(repeat(raw, 16, []), 8))
+        8 -> v(pack(repeat(raw, 8, []), 16))
+        9 -> v(pack(repeat(raw, 4, []), 32))
+        10 -> v(pack(repeat(raw, 2, []), 64))
+        _ -> v(withLane(bitsOf(old), laneBits(op), imm, raw))
+
+fn withLane(n: Int, w: Int, k: Int, x: Int) -> Int
+    ? "n with lane k of width w replaced by x."
+    n - lane(n, w, k) * pw(k * w) + umod(x, pw(w)) * pw(k * w)
+
+verify loaded
+    loaded(1, 0, 255, Val.Null) => Val.V128(65535)
+    loaded(7, 0, 1, Val.Null) => Val.V128(1334440654591915542993625911497130241)
+    loaded(84, 1, 7, Val.V128(0)) => Val.V128(1792)
+
+verify withLane
+    withLane(65535, 8, 0, 0) => 65280
+
+fn stored(op: Int, imm: Int, a: Val) -> List<Int>
+    ? "The octets a store writes, the lowest first: the whole vector, or lane imm of it."
+    n = accessSize(op)
+    w = laneBits(op)
+    match op
+        11 -> lanes(bitsOf(a), 8)
+        _ -> List.take(lanes(lane(bitsOf(a), w, imm), 8), n)
+
+verify stored
+    stored(88, 1, Val.V128(1792)) => [7]
+    stored(89, 0, Val.V128(258)) => [2, 1]
+
+// ---- everything else ----
+
+fn pure(op: Int, imm: Int, args: List<Val>) -> Val
+    ? "An instruction that does not touch memory, on its operands (the first pushed first)."
+    match args
+        [] -> v(imm)
+        [a] -> unary(op, imm, a)
+        [a, b] -> binary(op, imm, a, b)
+        [a, b, c] -> ternary(op, a, b, c)
+        _ -> v(0)
+
+verify pure
+    pure(12, 9, []) => Val.V128(9)
+    pure(17, 0, [Val.I32(1)]) => Val.V128(79228162532711081671548469249)
+
+fn unary(op: Int, imm: Int, a: Val) -> Val
+    ? "One-operand instructions; imm is the lane of an extract_lane."
+    match Bool.and(op >= 15, op <= 20)
+        true -> splat(op, a)
+        false -> match Bool.and(op >= 21, op <= 33)
+            true -> extractAt(op, imm, bitsOf(a))
+            false -> unaryVec(op, bitsOf(a))
+
+verify unary
+    unary(77, 0, Val.V128(0)) => Val.V128(340282366920938463463374607431768211455)
+
+fn splat(op: Int, a: Val) -> Val
+    ? "A scalar in every lane."
+    match op
+        15 -> v(pack(repeat(Value.i32(a), 16, []), 8))
+        16 -> v(pack(repeat(Value.i32(a), 8, []), 16))
+        17 -> v(pack(repeat(Value.i32(a), 4, []), 32))
+        18 -> v(pack(repeat(Value.i64(a), 2, []), 64))
+        19 -> v(pack(repeat(Num.bits32(a), 4, []), 32))
+        _ -> v(pack(repeat(Num.bits64(a), 2, []), 64))
+
+verify splat
+    splat(15, Val.I32(-1)) => Val.V128(340282366920938463463374607431768211455)
+
+fn extractAt(op: Int, k: Int, n: Int) -> Val
+    ? "Lane k of n as the instruction's scalar."
+    match op
+        21 -> Val.I32(sgn(lane(n, 8, k), 8))
+        22 -> Val.I32(lane(n, 8, k))
+        24 -> Val.I32(sgn(lane(n, 16, k), 16))
+        25 -> Val.I32(lane(n, 16, k))
+        27 -> Val.I32(sgn(lane(n, 32, k), 32))
+        29 -> Val.I64(sgn(lane(n, 64, k), 64))
+        31 -> Num.f32Val(lane(n, 32, k))
+        _ -> Num.f64Val(lane(n, 64, k))
+
+verify extractAt
+    extractAt(21, 0, 255) => Val.I32(-1)
+    extractAt(22, 0, 255) => Val.I32(255)
+
+fn unaryVec(op: Int, n: Int) -> Val
+    ? "One-operand instructions on a vector."
+    match op
+        77 -> v(allOnes(128) - n)
+        83 -> boolI32(n != 0)
+        99 -> boolI32(allTrue(lanes(n, 8)))
+        131 -> boolI32(allTrue(lanes(n, 16)))
+        163 -> boolI32(allTrue(lanes(n, 32)))
+        195 -> boolI32(allTrue(lanes(n, 64)))
+        100 -> Val.I32(bitmask(slanes(n, 8), 0, 0))
+        132 -> Val.I32(bitmask(slanes(n, 16), 0, 0))
+        164 -> Val.I32(bitmask(slanes(n, 32), 0, 0))
+        196 -> Val.I32(bitmask(slanes(n, 64), 0, 0))
+        _ -> unaryLanes(op, n)
+
+fn boolI32(b: Bool) -> Val
+    ? "1 or 0."
+    match b
+        true -> Val.I32(1)
+        false -> Val.I32(0)
+
+fn allTrue(xs: List<Int>) -> Bool
+    ? "Whether no lane is zero."
+    Bool.not(List.contains(xs, 0))
+
+fn bitmask(xs: List<Int>, k: Int, acc: Int) -> Int
+    ? "Bit k set for each negative lane k."
+    match xs
+        [] -> acc
+        [x, ..rest] -> bitmask(rest, k + 1, acc + bitIf(x < 0, k))
+
+fn bitIf(c: Bool, k: Int) -> Int
+    ? "2^k when c holds."
+    match c
+        true -> pw(k)
+        false -> 0
+
+verify unaryVec
+    unaryVec(83, 0) => Val.I32(0)
+    unaryVec(100, 255) => Val.I32(1)
+
+verify boolI32
+    boolI32(true) => Val.I32(1)
+
+verify allTrue
+    allTrue([1, 0]) => false
+
+verify bitmask
+    bitmask([-1, 1, -3], 0, 0) => 5
+
+verify bitIf
+    bitIf(false, 3) => 0
+
+fn unaryLanes(op: Int, n: Int) -> Val
+    ? "Lane-wise one-operand instructions: integer abs, neg, popcnt, extensions, pairwise sums, float rounding and conversions."
+    match op
+        96 -> v(pack(intMap(slanes(n, 8), 0, []), 8))
+        97 -> v(pack(intMap(slanes(n, 8), 1, []), 8))
+        98 -> v(pack(intMap(lanes(n, 8), 2, []), 8))
+        128 -> v(pack(intMap(slanes(n, 16), 0, []), 16))
+        129 -> v(pack(intMap(slanes(n, 16), 1, []), 16))
+        160 -> v(pack(intMap(slanes(n, 32), 0, []), 32))
+        161 -> v(pack(intMap(slanes(n, 32), 1, []), 32))
+        192 -> v(pack(intMap(slanes(n, 64), 0, []), 64))
+        193 -> v(pack(intMap(slanes(n, 64), 1, []), 64))
+        _ -> widen(op, n)
+
+fn intMap(xs: List<Int>, k: Int, acc: List<Int>) -> List<Int>
+    ? "abs (0), neg (1) or popcnt (2) on each lane."
+    match xs
+        [] -> List.reverse(acc)
+        [x, ..rest] -> intMap(rest, k, List.prepend(intOne(x, k), acc))
+
+fn intOne(x: Int, k: Int) -> Int
+    ? "One lane of abs, neg or popcnt."
+    match k
+        0 -> Int.abs(x)
+        1 -> 0 - x
+        _ -> popcnt(x)
+
+fn popcnt(x: Int) -> Int
+    ? "The ones in a non-negative number."
+    match x <= 0
+        true -> 0
+        false -> md(x, 2) + popcnt(dv(x, 2))
+
+verify unaryLanes
+    unaryLanes(97, 1) => Val.V128(255)
+
+verify intMap
+    intMap([-3, 2], 0, []) => [3, 2]
+
+verify intOne
+    intOne(5, 1) => -5
+
+verify popcnt
+    popcnt(255) => 8
+
+fn widen(op: Int, n: Int) -> Val
+    ? "Extensions of half the lanes and pairwise sums."
+    match op
+        135 -> v(pack(half(slanes(n, 8), false), 16))
+        136 -> v(pack(half(slanes(n, 8), true), 16))
+        137 -> v(pack(half(lanes(n, 8), false), 16))
+        138 -> v(pack(half(lanes(n, 8), true), 16))
+        167 -> v(pack(half(slanes(n, 16), false), 32))
+        168 -> v(pack(half(slanes(n, 16), true), 32))
+        169 -> v(pack(half(lanes(n, 16), false), 32))
+        170 -> v(pack(half(lanes(n, 16), true), 32))
+        199 -> v(pack(half(slanes(n, 32), false), 64))
+        200 -> v(pack(half(slanes(n, 32), true), 64))
+        201 -> v(pack(half(lanes(n, 32), false), 64))
+        202 -> v(pack(half(lanes(n, 32), true), 64))
+        124 -> v(pack(pairs(slanes(n, 8), []), 16))
+        125 -> v(pack(pairs(lanes(n, 8), []), 16))
+        126 -> v(pack(pairs(slanes(n, 16), []), 32))
+        127 -> v(pack(pairs(lanes(n, 16), []), 32))
+        _ -> floatUnary(op, n)
+
+fn pairs(xs: List<Int>, acc: List<Int>) -> List<Int>
+    ? "Sums of neighbouring lanes."
+    match xs
+        [a, b, ..rest] -> pairs(rest, List.prepend(a + b, acc))
+        _ -> List.reverse(acc)
+
+verify widen
+    widen(135, 255) => Val.V128(65535)
+    widen(125, 513) => Val.V128(3)
+
+verify pairs
+    pairs([1, 2, 3, 4], []) => [3, 7]
+
+fn floatUnary(op: Int, n: Int) -> Val
+    ? "Float lane-wise rounding, abs, neg, sqrt and the conversions, through Num's scalar opcodes."
+    match op
+        103 -> v(f32Map(n, 141))
+        104 -> v(f32Map(n, 142))
+        105 -> v(f32Map(n, 143))
+        106 -> v(f32Map(n, 144))
+        224 -> v(f32Map(n, 139))
+        225 -> v(f32Map(n, 140))
+        227 -> v(f32Map(n, 145))
+        116 -> v(f64Map(n, 155))
+        117 -> v(f64Map(n, 156))
+        122 -> v(f64Map(n, 157))
+        148 -> v(f64Map(n, 158))
+        236 -> v(f64Map(n, 153))
+        237 -> v(f64Map(n, 154))
+        239 -> v(f64Map(n, 159))
+        _ -> convert(op, n)
+
+fn f32Map(n: Int, sop: Int) -> Int
+    ? "Scalar opcode sop on every f32 lane."
+    pack(scalarMap(lanes(n, 32), sop, true, []), 32)
+
+fn f64Map(n: Int, sop: Int) -> Int
+    ? "Scalar opcode sop on every f64 lane."
+    pack(scalarMap(lanes(n, 64), sop, false, []), 64)
+
+fn scalarMap(xs: List<Int>, sop: Int, single: Bool, acc: List<Int>) -> List<Int>
+    ? "A unary scalar float operation on float lanes, bits in and out."
+    match xs
+        [] -> List.reverse(acc)
+        [x, ..rest] -> scalarMap(rest, sop, single, List.prepend(fbits(Num.unary(sop, fval(x, single)), single), acc))
+
+fn fval(x: Int, single: Bool) -> Val
+    ? "A float lane as a value."
+    match single
+        true -> Num.f32Val(x)
+        false -> Num.f64Val(x)
+
+fn fbits(r: Result<Val, String>, single: Bool) -> Int
+    ? "A float result's bits."
+    match single
+        true -> Num.bits32(Result.withDefault(r, Val.F32(0.0)))
+        false -> Num.bits64(Result.withDefault(r, Val.F64(0.0)))
+
+verify floatUnary
+    floatUnary(225, 1065353216) => Val.V128(170141183500083312998042844552723693568)
+
+verify f32Map
+    f32Map(1065353216, 140) => 170141183500083312998042844552723693568
+
+verify f64Map
+    f64Map(0, 154) => 170141183460469231740910675752738881536
+
+verify scalarMap
+    scalarMap([], 139, true, []) => []
+
+verify fval
+    fval(1065353216, true) => Val.F32(1.0)
+
+verify fbits
+    fbits(Result.Ok(Val.F64(1.0)), false) => 4607182418800017408
+
+fn convert(op: Int, n: Int) -> Val
+    ? "Conversions between integer and float lanes."
+    match op
+        248 -> v(pack(toInt(lanes(n, 32), 64512, true, []), 32))
+        249 -> v(pack(toInt(lanes(n, 32), 64513, true, []), 32))
+        257 -> v(pack(toInt(lanes(n, 32), 64512, true, []), 32))
+        258 -> v(pack(toInt(lanes(n, 32), 64513, true, []), 32))
+        252 -> v(pack(List.concat(toInt(List.take(lanes(n, 64), 2), 64514, false, []), [0, 0]), 32))
+        253 -> v(pack(List.concat(toInt(List.take(lanes(n, 64), 2), 64515, false, []), [0, 0]), 32))
+        259 -> v(pack(List.concat(toInt(List.take(lanes(n, 64), 2), 64514, false, []), [0, 0]), 32))
+        260 -> v(pack(List.concat(toInt(List.take(lanes(n, 64), 2), 64515, false, []), [0, 0]), 32))
+        250 -> v(pack(toFloat(lanes(n, 32), 178, true, []), 32))
+        251 -> v(pack(toFloat(lanes(n, 32), 179, true, []), 32))
+        254 -> v(pack(toFloat(List.take(lanes(n, 32), 2), 183, false, []), 64))
+        255 -> v(pack(toFloat(List.take(lanes(n, 32), 2), 184, false, []), 64))
+        94 -> v(pack(List.concat(fconv(List.take(lanes(n, 64), 2), 182, false, true, []), [0, 0]), 32))
+        _ -> v(pack(fconv(List.take(lanes(n, 32), 2), 187, true, false, []), 64))
+
+fn toInt(xs: List<Int>, sop: Int, single: Bool, acc: List<Int>) -> List<Int>
+    ? "A saturating float-to-integer conversion on each lane."
+    match xs
+        [] -> List.reverse(acc)
+        [x, ..rest] -> toInt(rest, sop, single, List.prepend(Value.i32(Result.withDefault(Num.unary(sop, fval(x, single)), Val.I32(0))), acc))
+
+fn toFloat(xs: List<Int>, sop: Int, single: Bool, acc: List<Int>) -> List<Int>
+    ? "An i32-to-float conversion on each lane; single says the result is an f32."
+    match xs
+        [] -> List.reverse(acc)
+        [x, ..rest] -> toFloat(rest, sop, single, List.prepend(fbits(Num.unary(sop, Val.I32(sgn(x, 32))), single), acc))
+
+fn fconv(xs: List<Int>, sop: Int, fromSingle: Bool, toSingle: Bool, acc: List<Int>) -> List<Int>
+    ? "demote or promote on each lane."
+    match xs
+        [] -> List.reverse(acc)
+        [x, ..rest] -> fconv(rest, sop, fromSingle, toSingle, List.prepend(fbits(Num.unary(sop, fval(x, fromSingle)), toSingle), acc))
+
+verify convert
+    convert(250, 1) => Val.V128(1065353216)
+    convert(248, 1065353216) => Val.V128(1)
+
+verify toInt
+    toInt([1065353216], 64512, true, []) => [1]
+
+verify toFloat
+    toFloat([1], 178, true, []) => [1065353216]
+
+verify fconv
+    fconv([1065353216], 187, true, false, []) => [4607182418800017408]
+
+fn binary(op: Int, imm: Int, a: Val, b: Val) -> Val
+    ? "Two-operand instructions; imm is the lane of extract and replace, or the lanes of a shuffle."
+    match Bool.and(op >= 21, op <= 34)
+        true -> laneOp(op, imm, a, b)
+        false -> binaryVec(op, imm, bitsOf(a), b)
+
+fn laneOp(op: Int, k: Int, a: Val, b: Val) -> Val
+    ? "replace_lane; an extract_lane never gets here, it has one operand."
+    match op
+        23 -> v(withLane(bitsOf(a), 8, k, Value.i32(b)))
+        26 -> v(withLane(bitsOf(a), 16, k, Value.i32(b)))
+        28 -> v(withLane(bitsOf(a), 32, k, Value.i32(b)))
+        30 -> v(withLane(bitsOf(a), 64, k, Value.i64(b)))
+        32 -> v(withLane(bitsOf(a), 32, k, Num.bits32(b)))
+        34 -> v(withLane(bitsOf(a), 64, k, Num.bits64(b)))
+        _ -> extractAt(op, k, bitsOf(a))
+
+verify binary
+    binary(23, 1, Val.V128(0), Val.I32(7)) => Val.V128(1792)
+
+verify laneOp
+    laneOp(22, 1, Val.V128(1792), Val.Null) => Val.I32(7)
+
+fn binaryVec(op: Int, imm: Int, n: Int, b: Val) -> Val
+    ? "Two-operand instructions whose first operand is a vector and whose second is a vector or a shift amount."
+    match shiftWidth(op)
+        0 -> binaryVV(op, imm, n, bitsOf(b))
+        w -> v(pack(shiftAll(lanes(n, w), w, md(Value.i32(b), w), shiftKind(op), []), w))
+
+fn shiftWidth(op: Int) -> Int
+    ? "The lane width of a shift, 0 for anything else."
+    match op
+        107 -> 8
+        108 -> 8
+        109 -> 8
+        139 -> 16
+        140 -> 16
+        141 -> 16
+        171 -> 32
+        172 -> 32
+        173 -> 32
+        203 -> 64
+        204 -> 64
+        205 -> 64
+        _ -> 0
+
+fn shiftKind(op: Int) -> Int
+    ? "shl (0), shr_s (1), shr_u (2)."
+    md(op - 107, 32)
+
+fn shiftAll(xs: List<Int>, w: Int, s: Int, kind: Int, acc: List<Int>) -> List<Int>
+    ? "Shifts every lane by s."
+    match xs
+        [] -> List.reverse(acc)
+        [x, ..rest] -> shiftAll(rest, w, s, kind, List.prepend(shiftOne(x, w, s, kind), acc))
+
+fn shiftOne(x: Int, w: Int, s: Int, kind: Int) -> Int
+    ? "One lane shifted: left, arithmetic right (rounding down) or logical right."
+    match kind
+        0 -> x * pw(s)
+        1 -> floorDiv(sgn(x, w), pw(s))
+        _ -> dv(x, pw(s))
+
+fn floorDiv(x: Int, d: Int) -> Int
+    ? "x / d rounded down."
+    dv(x - umod(x, d), d)
+
+verify binaryVec
+    binaryVec(107, 0, 1, Val.I32(9)) => Val.V128(2)
+
+verify shiftWidth
+    shiftWidth(205) => 64
+
+verify shiftKind
+    shiftKind(108) => 1
+    shiftKind(173) => 2
+    shiftKind(203) => 0
+
+verify shiftAll
+    shiftAll([255], 8, 1, 1, []) => [-1]
+
+verify shiftOne
+    shiftOne(3, 8, 1, 2) => 1
+
+verify floorDiv
+    floorDiv(-3, 2) => -2
+
+fn binaryVV(op: Int, imm: Int, a: Int, b: Int) -> Val
+    ? "Two vectors in, one out."
+    match op
+        13 -> v(pack(shuffle(lanes(imm, 8), lanes(a, 8), lanes(b, 8), []), 8))
+        14 -> v(pack(swizzle(lanes(b, 8), Vector.fromList(lanes(a, 8)), []), 8))
+        256 -> v(pack(swizzle(lanes(b, 8), Vector.fromList(lanes(a, 8)), []), 8))
+        78 -> v(bitAnd(a, b))
+        79 -> v(bitAnd(a, allOnes(128) - b))
+        80 -> v(a + b - bitAnd(a, b))
+        81 -> v(a + b - 2 * bitAnd(a, b))
+        _ -> compareOrArith(op, a, b)
+
+fn bitAnd(a: Int, b: Int) -> Int
+    ? "Bitwise and of two vectors, a 64-bit half at a time."
+    Num.u64(Bits.and(Num.wrap64(lane(a, 64, 0)), Num.wrap64(lane(b, 64, 0)))) + Num.u64(Bits.and(Num.wrap64(lane(a, 64, 1)), Num.wrap64(lane(b, 64, 1)))) * pw(64)
+
+fn shuffle(idx: List<Int>, a: List<Int>, b: List<Int>, acc: List<Int>) -> List<Int>
+    ? "Lane k is lane idx[k] of a followed by b."
+    match idx
+        [] -> List.reverse(acc)
+        [i, ..rest] -> shuffle(rest, a, b, List.prepend(pick(List.concat(a, b), i), acc))
+
+fn pick(xs: List<Int>, i: Int) -> Int
+    ? "Element i, 0 past the end."
+    match List.drop(xs, i)
+        [x, .._] -> x
+        [] -> 0
+
+fn swizzle(idx: List<Int>, a: Vector<Int>, acc: List<Int>) -> List<Int>
+    ? "Lane k is lane idx[k] of a, or 0 when idx[k] is 16 or more."
+    match idx
+        [] -> List.reverse(acc)
+        [i, ..rest] -> swizzle(rest, a, List.prepend(Option.withDefault(Vector.get(a, i), 0), acc))
+
+verify binaryVV
+    binaryVV(81, 0, 3, 5) => Val.V128(6)
+    binaryVV(80, 0, 3, 5) => Val.V128(7)
+    binaryVV(79, 0, 3, 1) => Val.V128(2)
+
+verify bitAnd
+    bitAnd(6, 3) => 2
+
+verify shuffle
+    shuffle([1, 2], [7, 8], [9], []) => [8, 9]
+
+verify pick
+    pick([1], 4) => 0
+
+verify swizzle
+    swizzle([1, 20], Vector.fromList([5, 6]), []) => [6, 0]
+
+fn compareOrArith(op: Int, a: Int, b: Int) -> Val
+    ? "Comparisons, then integer arithmetic, then the rest."
+    match Bool.and(op >= 35, op <= 64)
+        true -> v(intCompare(op, a, b))
+        false -> match Bool.and(op >= 214, op <= 219)
+            true -> v(pack(cmpAll(slanes(a, 64), slanes(b, 64), i64Cmp(op), 64, []), 64))
+            false -> match Bool.and(op >= 65, op <= 76)
+                true -> v(floatCompare(op, a, b))
+                false -> intArith(op, a, b)
+
+fn intCompare(op: Int, a: Int, b: Int) -> Int
+    ? "i8x16, i16x8 and i32x4 comparisons (eq, ne, lt_s, lt_u, gt_s, gt_u, le_s, le_u, ge_s, ge_u)."
+    w = pickWidth(op)
+    k = md(op - 35, 10)
+    signed = Bool.or(Bool.or(k == 2, k == 4), Bool.or(k == 6, k == 8))
+    pack(cmpAll(lanesSigned(a, w, signed), lanesSigned(b, w, signed), cmpOf(k), w, []), w)
+
+fn pickWidth(op: Int) -> Int
+    ? "The lane width of an integer comparison."
+    match op < 45
+        true -> 8
+        false -> match op < 55
+            true -> 16
+            false -> 32
+
+fn lanesSigned(n: Int, w: Int, signed: Bool) -> List<Int>
+    ? "Lanes read signed or unsigned."
+    match signed
+        true -> slanes(n, w)
+        false -> lanes(n, w)
+
+fn cmpOf(k: Int) -> Int
+    ? "The relation of comparison k: 0 eq, 1 ne, 2 lt, 3 gt, 4 le, 5 ge."
+    match k
+        0 -> 0
+        1 -> 1
+        _ -> dv(k - 2, 2) + 2
+
+fn i64Cmp(op: Int) -> Int
+    ? "The relation of an i64x2 comparison (all signed)."
+    match op
+        214 -> 0
+        215 -> 1
+        216 -> 2
+        217 -> 3
+        218 -> 4
+        _ -> 5
+
+fn cmpAll(xs: List<Int>, ys: List<Int>, rel: Int, w: Int, acc: List<Int>) -> List<Int>
+    ? "Lane-wise comparison: all ones where it holds."
+    match xs
+        [] -> List.reverse(acc)
+        [x, ..rest] -> cmpAll(rest, List.drop(ys, 1), rel, w, List.prepend(maskIf(holds(rel, x, pick(ys, 0))) * allOnes(w), acc))
+
+fn holds(rel: Int, x: Int, y: Int) -> Bool
+    ? "Whether x rel y."
+    match rel
+        0 -> x == y
+        1 -> x != y
+        2 -> x < y
+        3 -> x > y
+        4 -> x <= y
+        _ -> x >= y
+
+fn maskIf(c: Bool) -> Int
+    ? "1 or 0."
+    match c
+        true -> 1
+        false -> 0
+
+verify compareOrArith
+    compareOrArith(35, 1, 1) => Val.V128(340282366920938463463374607431768211455)
+
+verify intCompare
+    intCompare(37, 255, 0) => 255
+    intCompare(38, 255, 0) => 0
+
+verify pickWidth
+    pickWidth(60) => 32
+
+verify lanesSigned
+    lanesSigned(255, 64, true) => [255, 0]
+
+verify cmpOf
+    cmpOf(5) => 3
+    cmpOf(9) => 5
+
+verify i64Cmp
+    i64Cmp(219) => 5
+
+verify cmpAll
+    cmpAll([1, 2], [2, 2], 0, 8, []) => [0, 255]
+
+verify holds
+    holds(4, 1, 1) => true
+
+verify maskIf
+    maskIf(false) => 0
+
+fn floatCompare(op: Int, a: Int, b: Int) -> Int
+    ? "f32x4 (65-70) and f64x2 (71-76) comparisons through the scalar ones (f32 91-96, f64 97-102)."
+    match op <= 70
+        true -> pack(fcmpAll(lanes(a, 32), lanes(b, 32), op + 26, true, []), 32)
+        false -> pack(fcmpAll(lanes(a, 64), lanes(b, 64), op + 26, false, []), 64)
+
+fn fcmpAll(xs: List<Int>, ys: List<Int>, sop: Int, single: Bool, acc: List<Int>) -> List<Int>
+    ? "A scalar float comparison on each pair of lanes, all ones where it holds."
+    match xs
+        [] -> List.reverse(acc)
+        [x, ..rest] -> fcmpAll(rest, List.drop(ys, 1), sop, single, List.prepend(0 - Value.i32(Result.withDefault(Num.binary(sop, fval(x, single), fval(pick(ys, 0), single)), Val.I32(0))), acc))
+
+verify floatCompare
+    floatCompare(65, 1065353216, 1065353216) => 340282366920938463463374607431768211455
+
+verify fcmpAll
+    fcmpAll([0], [1], 97, false, []) => [0]
+
+fn intArith(op: Int, a: Int, b: Int) -> Val
+    ? "Lane-wise integer arithmetic, narrowing, extending multiplication and dot products."
+    match arithOf(op)
+        Option.Some(k) -> v(pack(arithAll(lanes(a, k.w), lanes(b, k.w), k, []), k.w))
+        Option.None -> narrowOrMul(op, a, b)
+
+record Ar
+    w: Int
+    kind: Int
+
+fn arithOf(op: Int) -> Option<Ar>
+    ? "Width and kind of a lane-wise integer operation: 0 add, 1 add_sat_s, 2 add_sat_u, 3 sub, 4 sub_sat_s, 5 sub_sat_u, 6 mul, 7 min_s, 8 min_u, 9 max_s, 10 max_u, 11 avgr_u, 12 q15mulr_sat_s."
+    match op
+        110 -> Option.Some(Ar(w = 8, kind = 0))
+        111 -> Option.Some(Ar(w = 8, kind = 1))
+        112 -> Option.Some(Ar(w = 8, kind = 2))
+        113 -> Option.Some(Ar(w = 8, kind = 3))
+        114 -> Option.Some(Ar(w = 8, kind = 4))
+        115 -> Option.Some(Ar(w = 8, kind = 5))
+        118 -> Option.Some(Ar(w = 8, kind = 7))
+        119 -> Option.Some(Ar(w = 8, kind = 8))
+        120 -> Option.Some(Ar(w = 8, kind = 9))
+        121 -> Option.Some(Ar(w = 8, kind = 10))
+        123 -> Option.Some(Ar(w = 8, kind = 11))
+        142 -> Option.Some(Ar(w = 16, kind = 0))
+        143 -> Option.Some(Ar(w = 16, kind = 1))
+        144 -> Option.Some(Ar(w = 16, kind = 2))
+        145 -> Option.Some(Ar(w = 16, kind = 3))
+        146 -> Option.Some(Ar(w = 16, kind = 4))
+        147 -> Option.Some(Ar(w = 16, kind = 5))
+        149 -> Option.Some(Ar(w = 16, kind = 6))
+        150 -> Option.Some(Ar(w = 16, kind = 7))
+        151 -> Option.Some(Ar(w = 16, kind = 8))
+        152 -> Option.Some(Ar(w = 16, kind = 9))
+        153 -> Option.Some(Ar(w = 16, kind = 10))
+        155 -> Option.Some(Ar(w = 16, kind = 11))
+        130 -> Option.Some(Ar(w = 16, kind = 12))
+        273 -> Option.Some(Ar(w = 16, kind = 12))
+        174 -> Option.Some(Ar(w = 32, kind = 0))
+        177 -> Option.Some(Ar(w = 32, kind = 3))
+        181 -> Option.Some(Ar(w = 32, kind = 6))
+        182 -> Option.Some(Ar(w = 32, kind = 7))
+        183 -> Option.Some(Ar(w = 32, kind = 8))
+        184 -> Option.Some(Ar(w = 32, kind = 9))
+        185 -> Option.Some(Ar(w = 32, kind = 10))
+        206 -> Option.Some(Ar(w = 64, kind = 0))
+        209 -> Option.Some(Ar(w = 64, kind = 3))
+        213 -> Option.Some(Ar(w = 64, kind = 6))
+        _ -> Option.None
+
+fn arithAll(xs: List<Int>, ys: List<Int>, k: Ar, acc: List<Int>) -> List<Int>
+    ? "One operation on each pair of unsigned lanes."
+    match xs
+        [] -> List.reverse(acc)
+        [x, ..rest] -> arithAll(rest, List.drop(ys, 1), k, List.prepend(arithOne(x, pick(ys, 0), k.w, k.kind), acc))
+
+fn arithOne(x: Int, y: Int, w: Int, kind: Int) -> Int
+    ? "One lane of an integer operation; x and y unsigned."
+    sx = sgn(x, w)
+    sy = sgn(y, w)
+    match kind
+        0 -> x + y
+        1 -> clamp(sx + sy, 0 - pw(w - 1), pw(w - 1) - 1)
+        2 -> clamp(x + y, 0, allOnes(w))
+        3 -> x - y
+        4 -> clamp(sx - sy, 0 - pw(w - 1), pw(w - 1) - 1)
+        5 -> clamp(x - y, 0, allOnes(w))
+        6 -> x * y
+        7 -> Int.min(sx, sy)
+        8 -> Int.min(x, y)
+        9 -> Int.max(sx, sy)
+        10 -> Int.max(x, y)
+        11 -> dv(x + y + 1, 2)
+        _ -> clamp(floorDiv(sx * sy + 16384, 32768), 0 - 32768, 32767)
+
+fn clamp(x: Int, lo: Int, hi: Int) -> Int
+    ? "x saturated to lo..hi."
+    Int.max(lo, Int.min(hi, x))
+
+verify intArith
+    intArith(110, 255, 1) => Val.V128(0)
+    intArith(112, 255, 1) => Val.V128(255)
+
+verify arithOf
+    arithOf(213) => Option.Some(Ar(w = 64, kind = 6))
+    arithOf(1) => Option.None
+
+verify arithAll
+    arithAll([1], [2], Ar(w = 8, kind = 3), []) => [-1]
+
+verify arithOne
+    arithOne(127, 1, 8, 1) => 127
+    arithOne(32768, 32768, 16, 12) => 32767
+
+verify clamp
+    clamp(9, 0, 5) => 5
+
+fn narrowOrMul(op: Int, a: Int, b: Int) -> Val
+    ? "Narrowing, extending multiplication and dot products."
+    match op
+        101 -> v(pack(satAll(List.concat(slanes(a, 16), slanes(b, 16)), 0 - 128, 127, []), 8))
+        102 -> v(pack(satAll(List.concat(slanes(a, 16), slanes(b, 16)), 0, 255, []), 8))
+        133 -> v(pack(satAll(List.concat(slanes(a, 32), slanes(b, 32)), 0 - 32768, 32767, []), 16))
+        134 -> v(pack(satAll(List.concat(slanes(a, 32), slanes(b, 32)), 0, 65535, []), 16))
+        156 -> v(pack(mulAll(half(slanes(a, 8), false), half(slanes(b, 8), false), []), 16))
+        157 -> v(pack(mulAll(half(slanes(a, 8), true), half(slanes(b, 8), true), []), 16))
+        158 -> v(pack(mulAll(half(lanes(a, 8), false), half(lanes(b, 8), false), []), 16))
+        159 -> v(pack(mulAll(half(lanes(a, 8), true), half(lanes(b, 8), true), []), 16))
+        188 -> v(pack(mulAll(half(slanes(a, 16), false), half(slanes(b, 16), false), []), 32))
+        189 -> v(pack(mulAll(half(slanes(a, 16), true), half(slanes(b, 16), true), []), 32))
+        190 -> v(pack(mulAll(half(lanes(a, 16), false), half(lanes(b, 16), false), []), 32))
+        191 -> v(pack(mulAll(half(lanes(a, 16), true), half(lanes(b, 16), true), []), 32))
+        220 -> v(pack(mulAll(half(slanes(a, 32), false), half(slanes(b, 32), false), []), 64))
+        221 -> v(pack(mulAll(half(slanes(a, 32), true), half(slanes(b, 32), true), []), 64))
+        222 -> v(pack(mulAll(half(lanes(a, 32), false), half(lanes(b, 32), false), []), 64))
+        223 -> v(pack(mulAll(half(lanes(a, 32), true), half(lanes(b, 32), true), []), 64))
+        186 -> v(pack(pairs(mulAll(slanes(a, 16), slanes(b, 16), []), []), 32))
+        274 -> v(pack(pairs(mulAll(slanes(a, 8), slanes(b, 8), []), []), 16))
+        _ -> floatBinary(op, a, b)
+
+fn satAll(xs: List<Int>, lo: Int, hi: Int, acc: List<Int>) -> List<Int>
+    ? "Each lane saturated to lo..hi."
+    match xs
+        [] -> List.reverse(acc)
+        [x, ..rest] -> satAll(rest, lo, hi, List.prepend(clamp(x, lo, hi), acc))
+
+fn mulAll(xs: List<Int>, ys: List<Int>, acc: List<Int>) -> List<Int>
+    ? "Lane-wise products."
+    match xs
+        [] -> List.reverse(acc)
+        [x, ..rest] -> mulAll(rest, List.drop(ys, 1), List.prepend(x * pick(ys, 0), acc))
+
+verify narrowOrMul
+    narrowOrMul(101, 300, 0) => Val.V128(127)
+
+verify satAll
+    satAll([300, -300], -128, 127, []) => [127, -128]
+
+verify mulAll
+    mulAll([2, 3], [4, 5], []) => [8, 15]
+
+fn floatBinary(op: Int, a: Int, b: Int) -> Val
+    ? "Lane-wise float arithmetic through the scalar opcodes (f32 146-151, f64 160-165), and pmin and pmax."
+    match op
+        228 -> v(f32Zip(a, b, 146))
+        229 -> v(f32Zip(a, b, 147))
+        230 -> v(f32Zip(a, b, 148))
+        231 -> v(f32Zip(a, b, 149))
+        232 -> v(f32Zip(a, b, 150))
+        233 -> v(f32Zip(a, b, 151))
+        269 -> v(f32Zip(a, b, 150))
+        270 -> v(f32Zip(a, b, 151))
+        240 -> v(f64Zip(a, b, 160))
+        241 -> v(f64Zip(a, b, 161))
+        242 -> v(f64Zip(a, b, 162))
+        243 -> v(f64Zip(a, b, 163))
+        244 -> v(f64Zip(a, b, 164))
+        245 -> v(f64Zip(a, b, 165))
+        271 -> v(f64Zip(a, b, 164))
+        272 -> v(f64Zip(a, b, 165))
+        234 -> v(pack(pminmax(lanes(a, 32), lanes(b, 32), 93, true, true, []), 32))
+        235 -> v(pack(pminmax(lanes(a, 32), lanes(b, 32), 93, true, false, []), 32))
+        246 -> v(pack(pminmax(lanes(a, 64), lanes(b, 64), 99, false, true, []), 64))
+        _ -> v(pack(pminmax(lanes(a, 64), lanes(b, 64), 99, false, false, []), 64))
+
+fn f32Zip(a: Int, b: Int, sop: Int) -> Int
+    ? "A binary scalar f32 operation on each pair of lanes."
+    pack(zipScalar(lanes(a, 32), lanes(b, 32), sop, true, []), 32)
+
+fn f64Zip(a: Int, b: Int, sop: Int) -> Int
+    ? "A binary scalar f64 operation on each pair of lanes."
+    pack(zipScalar(lanes(a, 64), lanes(b, 64), sop, false, []), 64)
+
+fn zipScalar(xs: List<Int>, ys: List<Int>, sop: Int, single: Bool, acc: List<Int>) -> List<Int>
+    ? "sop on each pair of float lanes, bits in and out."
+    match xs
+        [] -> List.reverse(acc)
+        [x, ..rest] -> zipScalar(rest, List.drop(ys, 1), sop, single, List.prepend(fbits(Num.binary(sop, fval(x, single), fval(pick(ys, 0), single)), single), acc))
+
+fn pminmax(xs: List<Int>, ys: List<Int>, ltOp: Int, single: Bool, isMin: Bool, acc: List<Int>) -> List<Int>
+    ? "pmin is b < a ? b : a and pmax a < b ? b : a, lane by lane, keeping the chosen lane's bits."
+    match xs
+        [] -> List.reverse(acc)
+        [x, ..rest] -> pminmax(rest, List.drop(ys, 1), ltOp, single, isMin, List.prepend(pminOne(x, pick(ys, 0), ltOp, single, isMin), acc))
+
+fn pminOne(x: Int, y: Int, ltOp: Int, single: Bool, isMin: Bool) -> Int
+    ? "One lane of pmin or pmax."
+    match isMin
+        true -> pickBits(flt(y, x, ltOp, single), y, x)
+        false -> pickBits(flt(x, y, ltOp, single), y, x)
+
+fn flt(x: Int, y: Int, ltOp: Int, single: Bool) -> Bool
+    ? "x < y on float lanes."
+    Value.i32(Result.withDefault(Num.binary(ltOp, fval(x, single), fval(y, single)), Val.I32(0))) == 1
+
+fn pickBits(c: Bool, a: Int, b: Int) -> Int
+    ? "a when c holds, else b."
+    match c
+        true -> a
+        false -> b
+
+verify floatBinary
+    floatBinary(228, 1065353216, 1065353216) => Val.V128(1073741824)
+
+verify f32Zip
+    f32Zip(0, 0, 146) => 0
+
+verify f64Zip
+    f64Zip(4607182418800017408, 0, 162) => 0
+
+verify zipScalar
+    zipScalar([], [], 146, true, []) => []
+
+verify pminmax
+    pminmax([1065353216], [1073741824], 93, true, true, []) => [1065353216]
+
+verify pminOne
+    pminOne(1065353216, 1073741824, 93, true, false) => 1073741824
+
+verify flt
+    flt(0, 1065353216, 93, true) => true
+
+verify pickBits
+    pickBits(false, 1, 2) => 2
+
+fn ternary(op: Int, a: Val, b: Val, c: Val) -> Val
+    ? "bitselect and laneselect, relaxed madd and nmadd, and the dot product with an accumulator."
+    x = bitsOf(a)
+    y = bitsOf(b)
+    z = bitsOf(c)
+    match op
+        261 -> v(pack(madd(lanes(x, 32), lanes(y, 32), lanes(z, 32), 148, 146, true, false, []), 32))
+        262 -> v(pack(madd(lanes(x, 32), lanes(y, 32), lanes(z, 32), 148, 146, true, true, []), 32))
+        263 -> v(pack(madd(lanes(x, 64), lanes(y, 64), lanes(z, 64), 162, 160, false, false, []), 64))
+        264 -> v(pack(madd(lanes(x, 64), lanes(y, 64), lanes(z, 64), 162, 160, false, true, []), 64))
+        275 -> v(pack(addAll(quads(mulAll(slanes(x, 8), slanes(y, 8), []), []), slanes(z, 32), []), 32))
+        _ -> v(bitAnd(x, z) + bitAnd(y, allOnes(128) - z))
+
+fn madd(xs: List<Int>, ys: List<Int>, zs: List<Int>, mulOp: Int, addOp: Int, single: Bool, neg: Bool, acc: List<Int>) -> List<Int>
+    ? "x * y + z (or -(x * y) + z), rounded after each step."
+    match xs
+        [] -> List.reverse(acc)
+        [x, ..rest] -> madd(rest, List.drop(ys, 1), List.drop(zs, 1), mulOp, addOp, single, neg, List.prepend(maddOne(x, pick(ys, 0), pick(zs, 0), mulOp, addOp, single, neg), acc))
+
+fn maddOne(x: Int, y: Int, z: Int, mulOp: Int, addOp: Int, single: Bool, neg: Bool) -> Int
+    ? "One lane of madd or nmadd."
+    p = Result.withDefault(Num.binary(mulOp, fval(x, single), fval(y, single)), Val.F64(0.0))
+    q = negIf(p, neg, single)
+    fbits(Num.binary(addOp, q, fval(z, single)), single)
+
+fn negIf(p: Val, neg: Bool, single: Bool) -> Val
+    ? "p negated (by the scalar neg) when neg holds."
+    match neg
+        false -> p
+        true -> Result.withDefault(Num.unary(pickNeg(single), p), p)
+
+fn pickNeg(single: Bool) -> Int
+    ? "The scalar neg opcode."
+    match single
+        true -> 140
+        false -> 154
+
+fn quads(xs: List<Int>, acc: List<Int>) -> List<Int>
+    ? "Sums of four neighbouring lanes."
+    match xs
+        [a, b, c, d, ..rest] -> quads(rest, List.prepend(a + b + c + d, acc))
+        _ -> List.reverse(acc)
+
+fn addAll(xs: List<Int>, ys: List<Int>, acc: List<Int>) -> List<Int>
+    ? "Lane-wise sums."
+    match xs
+        [] -> List.reverse(acc)
+        [x, ..rest] -> addAll(rest, List.drop(ys, 1), List.prepend(x + pick(ys, 0), acc))
+
+verify ternary
+    ternary(82, Val.V128(15), Val.V128(240), Val.V128(12)) => Val.V128(252)
+
+verify madd
+    madd([], [], [], 148, 146, true, false, []) => []
+
+verify maddOne
+    maddOne(1065353216, 1065353216, 1065353216, 148, 146, true, false) => 1073741824
+
+verify negIf
+    negIf(Val.F32(1.0), true, true) => Val.F32(-1.0)
+
+verify pickNeg
+    pickNeg(false) => 154
+
+verify quads
+    quads([1, 2, 3, 4, 5], []) => [10]
+
+verify addAll
+    addAll([1, 2], [3, 4], []) => [4, 6]

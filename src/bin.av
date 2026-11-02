@@ -1,0 +1,261 @@
+module Bin
+    intent =
+        "Reads the binary format of a wasm module out of its octets, held in a"
+        "Vector for random access. Reading is total: a position past the end"
+        "reads as zero, and each section checks at its end that decoding did"
+        "not run past it, so a truncated file is still refused. LEB128 numbers are"
+        "read strictly for their width (u32, u64, s32, s33, s64): too many octets,"
+        "or unused bits in the last one that are not zero (or the sign), make a"
+        "malformed number, which reads as 0 with its next position past the end of"
+        "the octets, so the section or body around it is refused."
+    exposes [U, byte, utf8, uleb, uleb64, sleb32, sleb33, sleb64, fixed, name, shl, octetsAt]
+    depends [Bytes]
+    effects []
+
+record U
+    v: Int
+    next: Int
+
+fn shl(x: Int, n: Int) -> Int
+    ? "x shifted left by n bits; a negative n shifts nothing."
+    Result.withDefault(Bits.shiftLeft(x, n), x)
+
+verify shl
+    shl(3, 4) => 48
+    shl(3, -1) => 3
+
+fn byte(buf: Vector<Int>, p: Int) -> Int
+    ? "The octet at p, or zero past the end."
+    Option.withDefault(Vector.get(buf, p), 0)
+
+verify byte
+    byte(Vector.fromList([7, 8]), 1) => 8
+    byte(Vector.fromList([7, 8]), 2) => 0
+
+fn uleb(buf: Vector<Int>, p: Int) -> U
+    ? "An unsigned 32-bit LEB128 number starting at p."
+    leb(buf, p, 32, false)
+
+fn uleb64(buf: Vector<Int>, p: Int) -> U
+    ? "An unsigned 64-bit LEB128 number starting at p."
+    leb(buf, p, 64, false)
+
+fn sleb32(buf: Vector<Int>, p: Int) -> U
+    ? "A signed 32-bit LEB128 number."
+    leb(buf, p, 32, true)
+
+fn sleb33(buf: Vector<Int>, p: Int) -> U
+    ? "A signed 33-bit LEB128 number (block types and heap types)."
+    leb(buf, p, 33, true)
+
+fn sleb64(buf: Vector<Int>, p: Int) -> U
+    ? "A signed 64-bit LEB128 number."
+    leb(buf, p, 64, true)
+
+fn leb(buf: Vector<Int>, p: Int, bits: Int, sgn: Bool) -> U
+    ? "A LEB128 number of the given width, checked strictly."
+    lebFrom(buf, p, p, Int.div(bits + 6, 7), bits, sgn, 0, 0)
+
+fn lebFrom(buf: Vector<Int>, start: Int, p: Int, maxN: Int, bits: Int, sgn: Bool, k: Int, acc: Int) -> U
+    ? "Octet k of a LEB128 number at p; acc holds the bits so far."
+    b = byte(buf, p)
+    acc2 = acc + shl(Bits.low(b, 7), 7 * k)
+    match k == maxN - 1
+        true -> lebLast(buf, p, b, acc2, bits - 7 * k, bits, sgn)
+        false -> match b >= 128
+            true -> lebFrom(buf, start, p + 1, maxN, bits, sgn, k + 1, acc2)
+            false -> lebDone(buf, p, b, acc2, 7 * (k + 1), sgn)
+
+fn lebLast(buf: Vector<Int>, p: Int, b: Int, acc: Int, used: Int, bits: Int, sgn: Bool) -> U
+    ? "The last octet a number of this width may have: no continuation, and its bits past the width zero (unsigned) or copies of the sign (signed)."
+    top = divPow(Bits.low(b, 7), used - pickInt(sgn, 1, 0))
+    ok = Bool.and(b < 128, Bool.or(top == 0, Bool.and(sgn, top == pow2(8 - used) - 1)))
+    match ok
+        true -> lebDone(buf, p, b, acc, bits - used + 7, sgn)
+        false -> malformed(buf)
+
+fn lebDone(buf: Vector<Int>, p: Int, b: Int, acc: Int, width: Int, sgn: Bool) -> U
+    ? "The number ends at p; a signed one takes its sign from bit 6 of its last octet."
+    match Bool.and(sgn, Bits.and(b, 64) != 0)
+        true -> U(v = acc - pow2(width), next = p + 1)
+        false -> U(v = acc, next = p + 1)
+
+fn malformed(buf: Vector<Int>) -> U
+    ? "A malformed number: 0, continuing past the end of the octets."
+    U(v = 0, next = Vector.len(buf) + 1)
+
+fn divPow(x: Int, k: Int) -> Int
+    ? "x divided by 2^k."
+    Result.withDefault(Int.div(x, pow2(k)), 0)
+
+fn pow2(k: Int) -> Int
+    ? "2^k, 1 for k at most 0."
+    match k <= 0
+        true -> 1
+        false -> 2 * pow2(k - 1)
+
+fn pickInt(c: Bool, a: Int, b: Int) -> Int
+    ? "a when c holds, else b."
+    match c
+        true -> a
+        false -> b
+
+verify uleb64
+    uleb64(Vector.fromList([255, 255, 255, 255, 255, 255, 255, 255, 255, 1]), 0) => U(v = 18446744073709551615, next = 10)
+
+verify sleb32
+    sleb32(Vector.fromList([127]), 0) => U(v = -1, next = 1)
+    sleb32(Vector.fromList([255, 255, 255, 255, 127]), 0) => U(v = -1, next = 5)
+    sleb32(Vector.fromList([255, 255, 255, 255, 79]), 0) => U(v = 0, next = 6)
+
+verify sleb33
+    sleb33(Vector.fromList([64]), 0) => U(v = -64, next = 1)
+
+verify sleb64
+    sleb64(Vector.fromList([128, 128, 128, 128, 128, 128, 128, 128, 128, 127]), 0) => U(v = -9223372036854775808, next = 10)
+
+verify leb
+    leb(Vector.fromList([128, 128, 128, 128, 16]), 0, 32, false) => U(v = 0, next = 6)
+    leb(Vector.fromList([128, 128, 128, 128, 128, 0]), 0, 32, false) => U(v = 0, next = 7)
+    leb(Vector.fromList([255, 255, 255, 255, 15]), 0, 32, false) => U(v = 4294967295, next = 5)
+
+verify lebFrom
+    lebFrom(Vector.fromList([5]), 0, 0, 5, 32, false, 0, 0) => U(v = 5, next = 1)
+
+verify lebLast
+    lebLast(Vector.fromList([]), 0, 15, 0, 4, 32, false) => U(v = 0, next = 1)
+
+verify lebDone
+    lebDone(Vector.fromList([]), 0, 127, 127, 7, true) => U(v = -1, next = 1)
+
+verify malformed
+    malformed(Vector.fromList([1])) => U(v = 0, next = 2)
+
+verify divPow
+    divPow(15, 2) => 3
+
+verify pow2
+    pow2(3) => 8
+
+verify pickInt
+    pickInt(true, 1, 2) => 1
+
+fn ulebFrom(buf: Vector<Int>, p: Int, shift: Int, acc: Int) -> U
+    ? "Continues an unsigned LEB128 number with acc holding the bits so far. Stops after ten bytes so a run of continuation bytes cannot go on forever."
+    b = byte(buf, p)
+    acc2 = acc + shl(Bits.low(b, 7), shift)
+    match Bool.and(b >= 128, shift < 63)
+        true -> ulebFrom(buf, p + 1, shift + 7, acc2)
+        false -> U(v = acc2, next = p + 1)
+
+verify ulebFrom
+    ulebFrom(Vector.fromList([1]), 0, 7, 5) => U(v = 133, next = 1)
+
+verify uleb
+    uleb(Vector.fromList([5]), 0) => U(v = 5, next = 1)
+    uleb(Vector.fromList([229, 142, 38]), 0) => U(v = 624485, next = 3)
+    uleb(Vector.fromList([0, 128, 1]), 1) => U(v = 128, next = 3)
+
+fn sleb(buf: Vector<Int>, p: Int) -> U
+    ? "A signed LEB128 number starting at p."
+    slebFrom(buf, p, 0, 0)
+
+fn slebFrom(buf: Vector<Int>, p: Int, shift: Int, acc: Int) -> U
+    ? "Continues a signed LEB128 number; the sign bit of the last byte extends it."
+    b = byte(buf, p)
+    acc2 = acc + shl(Bits.low(b, 7), shift)
+    match Bool.and(b >= 128, shift < 63)
+        true -> slebFrom(buf, p + 1, shift + 7, acc2)
+        false -> U(v = signed(acc2, b, shift + 7), next = p + 1)
+
+fn signed(acc: Int, last: Int, bits: Int) -> Int
+    ? "acc with the sign of the last byte's bit 6 extended above bits."
+    match Bits.and(last, 64) == 0
+        true -> acc
+        false -> acc - shl(1, bits)
+
+verify slebFrom
+    slebFrom(Vector.fromList([126]), 0, 0, 0) => U(v = -2, next = 1)
+
+verify signed
+    signed(126, 126, 7) => -2
+    signed(5, 5, 7) => 5
+
+verify sleb
+    sleb(Vector.fromList([2]), 0) => U(v = 2, next = 1)
+    sleb(Vector.fromList([126]), 0) => U(v = -2, next = 1)
+    sleb(Vector.fromList([255, 0]), 0) => U(v = 127, next = 2)
+    sleb(Vector.fromList([128, 127]), 0) => U(v = -128, next = 2)
+    sleb(Vector.fromList([192, 187, 120]), 0) => U(v = -123456, next = 3)
+
+fn fixed(buf: Vector<Int>, p: Int, n: Int) -> Int
+    ? "n octets at p read little-endian as an unsigned number."
+    fixedFrom(buf, p + n - 1, n, 0)
+
+fn fixedFrom(buf: Vector<Int>, p: Int, n: Int, acc: Int) -> Int
+    ? "Folds n octets, from the most significant at p downwards."
+    match n <= 0
+        true -> acc
+        false -> fixedFrom(buf, p - 1, n - 1, acc * 256 + byte(buf, p))
+
+verify fixedFrom
+    fixedFrom(Vector.fromList([1, 2]), 1, 2, 0) => 513
+
+verify fixed
+    fixed(Vector.fromList([1, 2, 3, 4]), 0, 4) => 67305985
+    fixed(Vector.fromList([9, 255, 255]), 1, 2) => 65535
+
+fn utf8(buf: Vector<Int>, p: Int, n: Int) -> Option<String>
+    ? "n octets at p as UTF-8 text, None when they are not valid UTF-8 or run past the end."
+    match p + n > Vector.len(buf)
+        true -> Option.None
+        false -> utf8Of(Bytes.fromList(octets(buf, p + n - 1, n, [])))
+
+fn utf8Of(b: Result<Bytes, String>) -> Option<String>
+    ? "Valid UTF-8 text of the octets."
+    match b
+        Result.Ok(bs) -> textOf(String.fromUtf8(bs))
+        Result.Err(_) -> Option.None
+
+fn textOf(r: Result<String, String>) -> Option<String>
+    ? "The text when decoding succeeded."
+    match r
+        Result.Ok(t) -> Option.Some(t)
+        Result.Err(_) -> Option.None
+
+verify textOf
+    textOf(Result.Ok("a")) => Option.Some("a")
+
+verify utf8
+    utf8(Vector.fromList([104, 105]), 0, 2) => Option.Some("hi")
+    utf8(Vector.fromList([192, 128]), 0, 2) => Option.None
+    utf8(Vector.fromList([104]), 0, 2) => Option.None
+
+verify utf8Of
+    utf8Of(Result.Err("x")) => Option.None
+
+fn name(buf: Vector<Int>, p: Int, n: Int) -> String
+    ? "n octets at p read as UTF-8 text; invalid text reads as a placeholder."
+    match Bytes.fromList(octets(buf, p + n - 1, n, []))
+        Result.Ok(b) -> Result.withDefault(String.fromUtf8(b), "?")
+        _ -> "?"
+
+fn octets(buf: Vector<Int>, p: Int, n: Int, acc: List<Int>) -> List<Int>
+    ? "The n octets ending at p, in order."
+    match n <= 0
+        true -> acc
+        false -> octets(buf, p - 1, n - 1, List.prepend(byte(buf, p), acc))
+
+verify octets
+    octets(Vector.fromList([1, 2, 3]), 2, 2, []) => [2, 3]
+
+verify name
+    name(Vector.fromList([104, 105, 33]), 0, 2) => "hi"
+
+fn octetsAt(buf: Vector<Int>, p: Int, n: Int) -> List<Int>
+    ? "The n octets starting at p, in order; never past the end of buf, so a malformed length cannot ask for more than there is."
+    k = Int.max(0, Int.min(n, Vector.len(buf) - p))
+    octets(buf, p + k - 1, k, [])
+
+verify octetsAt
+    octetsAt(Vector.fromList([1, 2, 3]), 1, 2) => [2, 3]

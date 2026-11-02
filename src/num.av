@@ -1,0 +1,1207 @@
+module Num
+    intent =
+        "The numeric instructions of wasm, by opcode, over Value.Val. Integers"
+        "are computed on Aver's unbounded Int and wrapped back to their width,"
+        "so each operation reads as its mathematical definition. f64 is Aver's"
+        "Float, its bit pattern Float.toBits and Float.fromBits. An f32 is a Float that f32 can"
+        "represent exactly: each operation is computed in f64 and rounded to"
+        "f32, which for + - * / and sqrt gives the correctly rounded result, and"
+        "integers are rounded to f32 directly so they are not rounded twice."
+    exposes [icmp, f64Val, f32Val, bits64, bits32, unary, binary, wrap32, wrap64, u32, u64, f64ToBits, f64FromBits, ext, f32ToBits, f32FromBits, roundF32]
+    depends [Value]
+    effects []
+
+// ---- widths ----
+
+two63: Int = 9223372036854775808
+two64: Int = 18446744073709551616
+maxU64: Int = 18446744073709551615
+minI64: Int = -9223372036854775807 - 1
+
+fn wrap32(x: Int) -> Int
+    ? "x reduced to a signed 32-bit integer; already in range is the common case."
+    match Bool.and(x >= -2147483648, x <= 2147483647)
+        true -> x
+        false -> wrap32Slow(x)
+
+fn wrap32Slow(x: Int) -> Int
+    ? "x reduced to a signed 32-bit integer when it is outside the range."
+    s = Bits.low(x, 32)
+    match s >= 2147483648
+        true -> s - 4294967296
+        false -> s
+
+verify wrap32Slow
+    wrap32Slow(4294967297) => 1
+
+verify wrap32
+    wrap32(2147483648) => -2147483648
+    wrap32(-1) => -1
+    wrap32(4294967297) => 1
+
+verify wrap32 law stays
+    given x: Int = [-5000000000, -2147483649, -1, 0, 1, 2147483647, 2147483648, 9999999999]
+    Bool.and(wrap32(x) >= -2147483648, wrap32(x) <= 2147483647) => true
+
+fn wrap64(x: Int) -> Int
+    ? "x reduced to a signed 64-bit integer."
+    match Bool.and(x >= minI64, x <= 9223372036854775807)
+        true -> x
+        false -> wrap64Slow(x)
+
+fn wrap64Slow(x: Int) -> Int
+    ? "x reduced to a signed 64-bit integer when it is outside the range."
+    s = Bits.low(x, 64)
+    match s >= two63
+        true -> s - two64
+        false -> s
+
+verify wrap64
+    wrap64(9223372036854775808) => -9223372036854775808
+    wrap64(-1) => -1
+
+verify wrap64Slow
+    wrap64Slow(18446744073709551617) => 1
+
+fn u32(x: Int) -> Int
+    ? "The unsigned reading of a 32-bit integer."
+    Bits.low(x, 32)
+
+verify u32
+    u32(-1) => 4294967295
+    u32(5) => 5
+
+fn u64(x: Int) -> Int
+    ? "The unsigned reading of a 64-bit integer."
+    match x >= 0
+        true -> x
+        false -> x + two64
+
+verify u64
+    u64(-1) => 18446744073709551615
+    u64(7) => 7
+
+fn b2i(b: Bool) -> Val
+    ? "A comparison result as an i32."
+    match b
+        true -> Val.I32(1)
+        false -> Val.I32(0)
+
+verify b2i
+    b2i(true) => Val.I32(1)
+    b2i(false) => Val.I32(0)
+
+fn pow2(n: Int) -> Int
+    ? "2^n for n at least zero; one for a negative n."
+    Result.withDefault(Bits.shiftLeft(1, n), 1)
+
+verify pow2
+    pow2(10) => 1024
+    pow2(-1) => 1
+
+fn shr(x: Int, n: Int) -> Int
+    ? "x shifted right arithmetically by n bits."
+    Result.withDefault(Bits.shiftRight(x, n), x)
+
+verify shr
+    shr(-8, 1) => -4
+    shr(8, -1) => 8
+
+// ---- integer helpers ----
+
+fn tdiv(a: Int, b: Int) -> Int
+    ? "Division truncated toward zero; b must not be zero."
+    q = Result.withDefault(Int.div(Int.abs(a), Int.abs(b)), 0)
+    match (a < 0) == (b < 0)
+        true -> q
+        false -> 0 - q
+
+verify tdiv
+    tdiv(7, 2) => 3
+    tdiv(-7, 2) => -3
+    tdiv(7, -2) => -3
+    tdiv(-7, -2) => 3
+
+fn trem(a: Int, b: Int) -> Int
+    ? "The remainder of tdiv, with the sign of a."
+    a - b * tdiv(a, b)
+
+verify trem
+    trem(-7, 2) => -1
+    trem(7, -2) => 1
+
+fn udiv(a: Int, b: Int) -> Int
+    ? "Division of non-negative numbers."
+    Result.withDefault(Int.div(a, b), 0)
+
+verify udiv
+    udiv(7, 2) => 3
+
+fn umod(a: Int, b: Int) -> Int
+    ? "Remainder of non-negative numbers."
+    Result.withDefault(Int.mod(a, b), 0)
+
+verify umod
+    umod(7, 2) => 1
+
+fn clz(u: Int, width: Int) -> Int
+    ? "Leading zero bits of an unsigned number of the given width."
+    width - bitLen(u, 0)
+
+fn bitLen(u: Int, acc: Int) -> Int
+    ? "The number of bits needed to write u."
+    match u <= 0
+        true -> acc
+        false -> bitLen(shr(u, 1), acc + 1)
+
+verify clz
+    clz(1, 32) => 31
+    clz(0, 32) => 32
+    clz(4294967295, 32) => 0
+
+verify bitLen
+    bitLen(5, 0) => 3
+
+fn ctz(u: Int, width: Int) -> Int
+    ? "Trailing zero bits of an unsigned number of the given width."
+    match u == 0
+        true -> width
+        false -> ctzFrom(u, 0)
+
+fn ctzFrom(u: Int, acc: Int) -> Int
+    ? "Trailing zeros of a non-zero u."
+    match Bits.and(u, 1) == 1
+        true -> acc
+        false -> ctzFrom(shr(u, 1), acc + 1)
+
+verify ctz
+    ctz(8, 32) => 3
+    ctz(0, 64) => 64
+
+verify ctzFrom
+    ctzFrom(12, 0) => 2
+
+fn rotl(u: Int, k: Int, width: Int) -> Int
+    ? "An unsigned number of the given width rotated left by k bits."
+    Bits.or(Result.withDefault(Bits.low(u * pow2(k), width), 0), shr(u, width - k))
+
+verify rotl
+    rotl(2147483648, 1, 32) => 1
+    rotl(1, 4, 32) => 16
+    rotl(5, 0, 32) => 5
+
+fn ext(x: Int, bits: Int) -> Int
+    ? "The low bits of x, sign-extended."
+    s = Result.withDefault(Bits.low(x, bits), 0)
+    match s >= pow2(bits - 1)
+        true -> s - pow2(bits)
+        false -> s
+
+verify ext
+    ext(255, 8) => -1
+    ext(127, 8) => 127
+    ext(65535, 16) => -1
+
+// ---- floats ----
+
+fn inf() -> Float
+    ? "Positive infinity."
+    1.0 / 0.0
+
+verify inf
+    inf() > 1000000.0 => true
+
+fn nan() -> Float
+    ? "A quiet NaN."
+    0.0 / 0.0
+
+verify nan
+    nan() == nan() => false
+
+fn isNan(x: Float) -> Bool
+    ? "Whether x is NaN."
+    x != x
+
+verify isNan
+    isNan(nan()) => true
+    isNan(1.0) => false
+
+fn isNeg(x: Float) -> Bool
+    ? "Whether the sign bit of x is set, telling -0.0 from 0.0."
+    match x == 0.0
+        true -> 1.0 / x < 0.0
+        false -> x < 0.0
+
+verify isNeg
+    isNeg(0.0 * -1.0) => true
+    isNeg(0.0) => false
+    isNeg(-2.0) => true
+
+fn p2f(k: Int) -> Float
+    ? "2^k as a float, exactly, for k from -1074 to 1023: its bit pattern is written directly."
+    match k >= -1022
+        true -> Float.fromBits((k + 1023) * 4503599627370496)
+        false -> p2fNeg(k)
+
+fn p2fNeg(k: Int) -> Float
+    ? "2^k below the normal range, a subnormal with one fraction bit set."
+    Float.fromBits(pow2(k + 1074))
+
+verify p2f
+    p2f(3) => 8.0
+    p2f(-1) => 0.5
+    p2f(-1074) > 0.0 => true
+
+verify p2fNeg
+    p2fNeg(-1074) > 0.0 => true
+    p2fNeg(-1023) * 2.0 => p2f(-1022)
+
+fn f64FromBits(b: Int) -> Float
+    ? "The f64 whose bit pattern is the 64-bit integer b."
+    Float.fromBits(b)
+
+fn nanOrInf(frac: Int) -> Float
+    ? "Infinity for a zero fraction, NaN otherwise."
+    match frac == 0
+        true -> inf()
+        false -> nan()
+
+verify f64FromBits
+    f64FromBits(4607182418800017408) => 1.0
+    f64FromBits(-4611686018427387904) => -2.0
+    f64FromBits(0) => 0.0
+    f64FromBits(14114281232179134464) => -9223372036854775808.0
+    f64FromBits(9218868437227405312) => inf()
+
+verify nanOrInf
+    nanOrInf(0) => inf()
+    isNan(nanOrInf(1)) => true
+
+fn f64ToBits(x: Float) -> Int
+    ? "The bit pattern of x as a signed 64-bit integer. A NaN that came out of arithmetic reads as the canonical quiet NaN; a NaN with a payload is kept as bits elsewhere (Val.NaN64)."
+    match isNan(x)
+        true -> 9221120237041090560
+        false -> wrap64(Float.toBits(x))
+
+fn expOf(a: Float, lo: Int, hi: Int) -> Int
+    ? "The e in lo..hi with 2^e <= a < 2^(e+1), by bisection."
+    match lo >= hi
+        true -> lo
+        false -> expStep(a, lo, hi, Int.div(lo + hi + 1, 2))
+
+fn expStep(a: Float, lo: Int, hi: Int, mid: Int) -> Int
+    ? "One bisection step of expOf."
+    match p2f(mid) <= a
+        true -> expOf(a, mid, hi)
+        false -> expOf(a, lo, mid - 1)
+
+verify f64ToBits
+    f64ToBits(1.0) => 4607182418800017408
+    f64ToBits(-2.0) => -4611686018427387904
+    f64ToBits(0.0 * -1.0) => -9223372036854775808
+    f64ToBits(0.1) => 4591870180066957722
+    f64ToBits(inf()) => 9218868437227405312
+
+verify f64ToBits law roundTrip
+    given b: Int = [0, 1, 4503599627370495, 4503599627370496, 4607182418800017408, 4591870180066957722, -4611686018427387904, 9218868437227405311]
+    f64ToBits(f64FromBits(b)) => b
+
+verify expOf
+    expOf(1.0, -1022, 1023) => 0
+    expOf(3.0, -1022, 1023) => 1
+    expOf(0.75, -1022, 1023) => -1
+
+verify expStep
+    expStep(1.0, 0, 1, 1) => 0
+
+fn fmin(a: Float, b: Float) -> Float
+    ? "wasm min: NaN wins, and -0.0 is below 0.0."
+    match Bool.or(isNan(a), isNan(b))
+        true -> nan()
+        false -> fminNum(a, b)
+
+fn fminNum(a: Float, b: Float) -> Float
+    ? "min of two non-NaN floats with signed zeros ordered."
+    match a == b
+        true -> pickSign(a, b, true)
+        false -> Float.min(a, b)
+
+fn fmax(a: Float, b: Float) -> Float
+    ? "wasm max: NaN wins, and 0.0 is above -0.0."
+    match Bool.or(isNan(a), isNan(b))
+        true -> nan()
+        false -> fmaxNum(a, b)
+
+fn fmaxNum(a: Float, b: Float) -> Float
+    ? "max of two non-NaN floats with signed zeros ordered."
+    match a == b
+        true -> pickSign(a, b, false)
+        false -> Float.max(a, b)
+
+fn pickSign(a: Float, b: Float, neg: Bool) -> Float
+    ? "Of two equal floats, the negative zero when neg asks for it, else the positive one."
+    match isNeg(a) == neg
+        true -> a
+        false -> b
+
+verify fmin
+    fmin(1.0, 2.0) => 1.0
+    isNeg(fmin(0.0, 0.0 * -1.0)) => true
+    isNan(fmin(nan(), 1.0)) => true
+
+verify fminNum
+    fminNum(3.0, 2.0) => 2.0
+
+verify fmax
+    fmax(1.0, 2.0) => 2.0
+    isNeg(fmax(0.0 * -1.0, 0.0)) => false
+
+verify fmaxNum
+    fmaxNum(3.0, 2.0) => 3.0
+
+verify pickSign
+    pickSign(1.0, 1.0, true) => 1.0
+
+fn integral(x: Float) -> Bool
+    ? "Whether x is already a whole number, infinite or NaN, which rounding leaves alone."
+    Bool.or(isNan(x), Float.abs(x) >= 4503599627370496.0)
+
+verify integral
+    integral(1.5) => false
+    integral(inf()) => true
+
+fn keepSign(r: Float, x: Float) -> Float
+    ? "r, given the sign of x when r is zero."
+    match Bool.and(r == 0.0, isNeg(x))
+        true -> 0.0 * -1.0
+        false -> r
+
+verify keepSign
+    isNeg(keepSign(0.0, -0.5)) => true
+    keepSign(2.0, -0.5) => 2.0
+
+fn ffloor(x: Float) -> Float
+    ? "floor, keeping infinities, NaN and the sign of zero."
+    match integral(x)
+        true -> x
+        false -> keepSign(Float.fromInt(Float.floor(x)), x)
+
+fn fceil(x: Float) -> Float
+    ? "ceil, keeping infinities, NaN and the sign of zero."
+    match integral(x)
+        true -> x
+        false -> keepSign(Float.fromInt(Float.ceil(x)), x)
+
+fn ftrunc(x: Float) -> Float
+    ? "Rounding toward zero."
+    match x < 0.0
+        true -> fceil(x)
+        false -> ffloor(x)
+
+fn fnearest(x: Float) -> Float
+    ? "Rounding to the nearest whole number, ties to even."
+    match integral(x)
+        true -> x
+        false -> keepSign(nearestOf(x, Float.floor(x)), x)
+
+fn nearestOf(x: Float, f: Int) -> Float
+    ? "The whole number nearest to x given its floor f, ties to the even one."
+    d = x - Float.fromInt(f)
+    match d == 0.5
+        true -> Float.fromInt(f + umod(f, 2))
+        false -> nearestNotTie(d, f)
+
+fn nearestNotTie(d: Float, f: Int) -> Float
+    ? "f or f + 1, whichever is nearer, away from a tie."
+    match d < 0.5
+        true -> Float.fromInt(f)
+        false -> Float.fromInt(f + 1)
+
+verify ffloor
+    ffloor(1.5) => 1.0
+    ffloor(-1.5) => -2.0
+    isNeg(ffloor(0.0 * -1.0)) => true
+
+verify fceil
+    fceil(1.5) => 2.0
+    isNeg(fceil(-0.5)) => true
+
+verify ftrunc
+    ftrunc(-1.5) => -1.0
+    ftrunc(1.5) => 1.0
+
+verify fnearest
+    fnearest(2.5) => 2.0
+    fnearest(3.5) => 4.0
+    fnearest(-2.5) => -2.0
+    fnearest(2.4) => 2.0
+
+verify nearestOf
+    nearestOf(1.5, 1) => 2.0
+
+verify nearestNotTie
+    nearestNotTie(0.7, 1) => 2.0
+    nearestNotTie(0.2, 1) => 1.0
+
+fn copysign(a: Float, b: Float) -> Float
+    ? "The magnitude of a with the sign of b."
+    match isNeg(b)
+        true -> Float.abs(a) * -1.0
+        false -> Float.abs(a)
+
+verify copysign
+    copysign(-2.0, 0.0) => 2.0
+    copysign(2.0, -1.0) => -2.0
+
+fn truncTo(x: Float, lo: Int, hi: Int) -> Result<Int, String>
+    ? "x truncated to a whole number in lo..hi, trapping on NaN and outside the range."
+    match isNan(x)
+        true -> Result.Err("invalid conversion to integer")
+        false -> truncRange(x, lo, hi)
+
+fn truncRange(x: Float, lo: Int, hi: Int) -> Result<Int, String>
+    ? "A non-NaN x truncated, or the overflow trap: an infinity, or a whole part outside lo..hi, compared exactly (lo - 1.0 as a float rounds back to lo at -2^63)."
+    match x - x == 0.0
+        false -> Result.Err("integer overflow")
+        true -> truncIn(truncInt(x), lo, hi)
+
+fn truncIn(t: Int, lo: Int, hi: Int) -> Result<Int, String>
+    ? "t when it is in lo..hi."
+    match Bool.and(t >= lo, t <= hi)
+        true -> Result.Ok(t)
+        false -> Result.Err("integer overflow")
+
+verify truncIn
+    truncIn(-9223372036854775808, -9223372036854775808, 9223372036854775807) => Result.Ok(-9223372036854775808)
+    truncIn(5, 0, 4) => Result.Err("integer overflow")
+
+fn truncInt(x: Float) -> Int
+    ? "A finite x truncated toward zero."
+    match x < 0.0
+        true -> Float.ceil(x)
+        false -> Float.floor(x)
+
+verify truncTo
+    truncTo(-1.9, -2147483648, 2147483647) => Result.Ok(-1)
+    truncTo(nan(), 0, 1) => Result.Err("invalid conversion to integer")
+    truncTo(2147483648.0, -2147483648, 2147483647) => Result.Err("integer overflow")
+    truncTo(-0.9, 0, 4294967295) => Result.Ok(0)
+
+verify truncRange
+    truncRange(5.0, 0, 3) => Result.Err("integer overflow")
+
+verify truncInt
+    truncInt(-2.5) => -2
+
+fn truncSat(x: Float, lo: Int, hi: Int) -> Int
+    ? "x truncated and clamped to lo..hi; NaN gives zero."
+    match isNan(x)
+        true -> 0
+        false -> truncClamp(x, lo, hi)
+
+fn truncClamp(x: Float, lo: Int, hi: Int) -> Int
+    ? "A non-NaN x truncated and clamped."
+    match x <= Float.fromInt(lo)
+        true -> lo
+        false -> truncClampHi(x, hi)
+
+fn truncClampHi(x: Float, hi: Int) -> Int
+    ? "x truncated and clamped from above."
+    match x >= Float.fromInt(hi)
+        true -> hi
+        false -> truncInt(x)
+
+verify truncSat
+    truncSat(1.0e20, -2147483648, 2147483647) => 2147483647
+    truncSat(nan(), 0, 9) => 0
+    truncSat(-1.0e20, 0, 9) => 0
+
+verify truncClamp
+    truncClamp(3.7, 0, 9) => 3
+
+verify truncClampHi
+    truncClampHi(10.0, 9) => 9
+
+// ---- dispatch ----
+
+fn unary(op: Int, a: Val) -> Result<Val, String>
+    ? "A numeric instruction that pops one operand. abs, neg and reinterpretation of a NaN work on its bits."
+    match a
+        Val.NaN64(b) -> nanUnary(op, b, a)
+        Val.NaN32(b) -> nanUnary(op, b, a)
+        _ -> unaryNum(op, a)
+
+fn nanUnary(op: Int, b: Int, a: Val) -> Result<Val, String>
+    ? "The bit-level unaries on a NaN; anything else reads it as a plain NaN."
+    match op
+        153 -> Result.Ok(Val.NaN64(Bits.and(b, 9223372036854775807)))
+        154 -> Result.Ok(Val.NaN64(Bits.xor(b, minI64)))
+        189 -> Result.Ok(Val.I64(b))
+        139 -> Result.Ok(Val.NaN32(Bits.and(b, 2147483647)))
+        140 -> Result.Ok(Val.NaN32(Bits.xor(b, -2147483648)))
+        188 -> Result.Ok(Val.I32(b))
+        _ -> unaryNum(op, a)
+
+verify nanUnary
+    nanUnary(154, 9221120237041090561, Val.NaN64(9221120237041090561)) => Result.Ok(Val.NaN64(-2251799813685247))
+    nanUnary(153, -1, Val.NaN64(-1)) => Result.Ok(Val.NaN64(9223372036854775807))
+    nanUnary(188, -1, Val.NaN32(-1)) => Result.Ok(Val.I32(-1))
+    nanUnary(140, 2143289345, Val.NaN32(2143289345)) => Result.Ok(Val.NaN32(-4194303))
+
+fn unaryNum(op: Int, a: Val) -> Result<Val, String>
+    ? "A unary numeric instruction on its numeric reading."
+    match op < 167
+        true -> unaryArith(op, a)
+        false -> convert(op, a)
+
+verify unary
+    unary(69, Val.I32(0)) => Result.Ok(Val.I32(1))
+    unary(167, Val.I64(4294967297)) => Result.Ok(Val.I32(1))
+
+fn unaryArith(op: Int, a: Val) -> Result<Val, String>
+    ? "eqz, clz, ctz, popcnt and the f64 unaries."
+    x = Value.i32(a)
+    f = Value.f64v(a)
+    match op
+        69 -> Result.Ok(b2i(x == 0))
+        80 -> Result.Ok(b2i(x == 0))
+        103 -> Result.Ok(Val.I32(clz(u32(x), 32)))
+        104 -> Result.Ok(Val.I32(ctz(u32(x), 32)))
+        105 -> Result.Ok(Val.I32(Bits.popCount(x, 32)))
+        121 -> Result.Ok(Val.I64(clz(u64(x), 64)))
+        122 -> Result.Ok(Val.I64(ctz(u64(x), 64)))
+        123 -> Result.Ok(Val.I64(Bits.popCount(x, 64)))
+        153 -> Result.Ok(Val.F64(Float.abs(f)))
+        154 -> Result.Ok(Val.F64(f * -1.0))
+        155 -> Result.Ok(Val.F64(fceil(f)))
+        156 -> Result.Ok(Val.F64(ffloor(f)))
+        157 -> Result.Ok(Val.F64(ftrunc(f)))
+        158 -> Result.Ok(Val.F64(fnearest(f)))
+        159 -> Result.Ok(Val.F64(Float.sqrt(f)))
+        _ -> f32Unary(op, f)
+
+verify unaryArith
+    unaryArith(103, Val.I32(1)) => Result.Ok(Val.I32(31))
+    unaryArith(123, Val.I64(-1)) => Result.Ok(Val.I64(64))
+    unaryArith(156, Val.F64(1.5)) => Result.Ok(Val.F64(1.0))
+    unaryArith(139, Val.F32(-1.0)) => Result.Ok(Val.F32(1.0))
+
+fn convert(op: Int, a: Val) -> Result<Val, String>
+    ? "Conversions, reinterpretations and sign extensions."
+    x = Value.i32(a)
+    f = Value.f64v(a)
+    match op
+        167 -> Result.Ok(Val.I32(wrap32(x)))
+        170 -> Result.Ok(Val.I32(truncTo(f, -2147483648, 2147483647)?))
+        171 -> Result.Ok(Val.I32(wrap32(truncTo(f, 0, 4294967295)?)))
+        172 -> Result.Ok(Val.I64(x))
+        173 -> Result.Ok(Val.I64(u32(x)))
+        176 -> Result.Ok(Val.I64(truncTo(f, minI64, 9223372036854775807)?))
+        177 -> Result.Ok(Val.I64(wrap64(truncTo(f, 0, maxU64)?)))
+        183 -> Result.Ok(Val.F64(Float.fromInt(x)))
+        184 -> Result.Ok(Val.F64(Float.fromInt(u32(x))))
+        185 -> Result.Ok(Val.F64(Float.fromInt(x)))
+        186 -> Result.Ok(Val.F64(Float.fromInt(u64(x))))
+        189 -> Result.Ok(Val.I64(f64ToBits(f)))
+        191 -> Result.Ok(f64Val(x))
+        192 -> Result.Ok(Val.I32(ext(x, 8)))
+        193 -> Result.Ok(Val.I32(ext(x, 16)))
+        194 -> Result.Ok(Val.I64(ext(x, 8)))
+        195 -> Result.Ok(Val.I64(ext(x, 16)))
+        196 -> Result.Ok(Val.I64(ext(x, 32)))
+        64514 -> Result.Ok(Val.I32(truncSat(f, -2147483648, 2147483647)))
+        64515 -> Result.Ok(Val.I32(wrap32(truncSat(f, 0, 4294967295))))
+        64518 -> Result.Ok(Val.I64(truncSat(f, minI64, 9223372036854775807)))
+        64519 -> Result.Ok(Val.I64(wrap64(truncSat(f, 0, maxU64))))
+        _ -> convertF32(op, x, f)
+
+verify convert
+    convert(173, Val.I32(-1)) => Result.Ok(Val.I64(4294967295))
+    convert(172, Val.I32(-1)) => Result.Ok(Val.I64(-1))
+    convert(192, Val.I32(128)) => Result.Ok(Val.I32(-128))
+    convert(64519, Val.F64(1.0e30)) => Result.Ok(Val.I64(-1))
+    convert(189, Val.F64(1.0)) => Result.Ok(Val.I64(4607182418800017408))
+    convert(170, Val.F64(3.9)) => Result.Ok(Val.I32(3))
+    convert(178, Val.I32(1)) => Result.Ok(Val.F32(1.0))
+
+fn binary(op: Int, a: Val, b: Val) -> Result<Val, String>
+    ? "A numeric instruction that pops two operands; a was pushed first. copysign touching a NaN works on bits."
+    match Bool.and(Bool.or(op == 166, op == 152), Bool.or(isNanVal(a), isNanVal(b)))
+        true -> Result.Ok(copysignBits(op, a, b))
+        false -> binaryNum(op, a, b)
+
+verify binaryNum
+    binaryNum(106, Val.I32(1), Val.I32(2)) => Result.Ok(Val.I32(3))
+
+fn isNanVal(v: Val) -> Bool
+    ? "Whether a value is a NaN with its bits kept."
+    match v
+        Val.NaN64(_) -> true
+        Val.NaN32(_) -> true
+        _ -> false
+
+fn copysignBits(op: Int, a: Val, b: Val) -> Val
+    ? "copysign on bit patterns: a's magnitude bits with b's sign bit."
+    match op == 166
+        true -> f64Val(Bits.or(Bits.and(bits64(a), 9223372036854775807), Bits.and(bits64(b), minI64)))
+        false -> f32Val(Bits.or(Bits.and(bits32(a), 2147483647), Bits.and(bits32(b), -2147483648)))
+
+verify isNanVal
+    isNanVal(Val.NaN32(1)) => true
+    isNanVal(Val.F32(1.0)) => false
+
+verify copysignBits
+    copysignBits(166, Val.NaN64(9221120237041090561), Val.F64(-1.0)) => Val.NaN64(-2251799813685247)
+    copysignBits(152, Val.F32(2.0), Val.NaN32(-4194304)) => Val.F32(-2.0)
+
+verify unaryNum
+    unaryNum(69, Val.I32(0)) => Result.Ok(Val.I32(1))
+
+fn binaryNum(op: Int, a: Val, b: Val) -> Result<Val, String>
+    ? "A binary numeric instruction on the numeric readings."
+    match op < 103
+        true -> compare(op, a, b)
+        false -> binArith(op, a, b)
+
+verify binary
+    binary(72, Val.I32(-1), Val.I32(0)) => Result.Ok(Val.I32(1))
+    binary(73, Val.I32(-1), Val.I32(0)) => Result.Ok(Val.I32(0))
+    binary(106, Val.I32(2147483647), Val.I32(1)) => Result.Ok(Val.I32(-2147483648))
+
+fn compare(op: Int, a: Val, b: Val) -> Result<Val, String>
+    ? "The integer and f64 comparisons."
+    x = Value.i32(a)
+    y = Value.i32(b)
+    match op < 91
+        true -> Result.Ok(b2i(icmp(op, x, y)))
+        false -> fcmp(op, Value.f64v(a), Value.f64v(b))
+
+verify compare
+    compare(81, Val.I64(3), Val.I64(3)) => Result.Ok(Val.I32(1))
+    compare(99, Val.F64(1.0), Val.F64(2.0)) => Result.Ok(Val.I32(1))
+    compare(94, Val.F32(1.5), Val.F32(1.0)) => Result.Ok(Val.I32(1))
+
+fn icmp(op: Int, x: Int, y: Int) -> Bool
+    ? "An integer comparison; opcodes 70-79 are i32 and 81-90 the same for i64."
+    match op
+        70 -> x == y
+        71 -> x != y
+        72 -> x < y
+        73 -> u32(x) < u32(y)
+        74 -> x > y
+        75 -> u32(x) > u32(y)
+        76 -> x <= y
+        77 -> u32(x) <= u32(y)
+        78 -> x >= y
+        79 -> u32(x) >= u32(y)
+        81 -> x == y
+        82 -> x != y
+        83 -> x < y
+        84 -> u64(x) < u64(y)
+        85 -> x > y
+        86 -> u64(x) > u64(y)
+        87 -> x <= y
+        88 -> u64(x) <= u64(y)
+        89 -> x >= y
+        90 -> u64(x) >= u64(y)
+        _ -> false
+
+verify icmp
+    icmp(84, -1, 0) => false
+    icmp(83, -1, 0) => true
+    icmp(77, 3, -3) => true
+
+fn fcmp(op: Int, x: Float, y: Float) -> Result<Val, String>
+    ? "An f64 comparison, or an f32 one (91-96), which compares the same way."
+    match op
+        97 -> Result.Ok(b2i(x == y))
+        98 -> Result.Ok(b2i(x != y))
+        99 -> Result.Ok(b2i(x < y))
+        100 -> Result.Ok(b2i(x > y))
+        101 -> Result.Ok(b2i(x <= y))
+        102 -> Result.Ok(b2i(x >= y))
+        _ -> fcmpF32(op, x, y)
+
+verify fcmp
+    fcmp(98, nan(), nan()) => Result.Ok(Val.I32(1))
+    fcmp(97, nan(), nan()) => Result.Ok(Val.I32(0))
+    fcmp(91, 1.0, 1.0) => Result.Ok(Val.I32(1))
+
+fn binArith(op: Int, a: Val, b: Val) -> Result<Val, String>
+    ? "i32 arithmetic (106-120), i64 arithmetic (124-138) and f64 arithmetic (160-166)."
+    match op < 124
+        true -> i32Arith(op, Value.i32(a), Value.i32(b))
+        false -> binArithHigh(op, a, b)
+
+verify binArith
+    binArith(108, Val.I32(65536), Val.I32(65536)) => Result.Ok(Val.I32(0))
+
+fn binArithHigh(op: Int, a: Val, b: Val) -> Result<Val, String>
+    ? "i64 or f64 arithmetic."
+    match op < 139
+        true -> i64Arith(op, Value.i64(a), Value.i64(b))
+        false -> f64Arith(op, Value.f64v(a), Value.f64v(b))
+
+verify binArithHigh
+    binArithHigh(124, Val.I64(9223372036854775807), Val.I64(1)) => Result.Ok(Val.I64(-9223372036854775808))
+    binArithHigh(160, Val.F64(1.5), Val.F64(2.0)) => Result.Ok(Val.F64(3.5))
+
+fn i32Arith(op: Int, x: Int, y: Int) -> Result<Val, String>
+    ? "The i32 arithmetic and bitwise operations."
+    k = Bits.and(y, 31)
+    match op
+        106 -> Result.Ok(Val.I32(wrap32(x + y)))
+        107 -> Result.Ok(Val.I32(wrap32(x - y)))
+        108 -> Result.Ok(Val.I32(wrap32(x * y)))
+        109 -> Result.Ok(wrapI32(divS(x, y, -2147483648)?))
+        110 -> Result.Ok(wrapI32(divU(u32(x), u32(y))?))
+        111 -> Result.Ok(wrapI32(remS(x, y)?))
+        112 -> Result.Ok(wrapI32(remU(u32(x), u32(y))?))
+        113 -> Result.Ok(Val.I32(Bits.and(x, y)))
+        114 -> Result.Ok(Val.I32(Bits.or(x, y)))
+        115 -> Result.Ok(Val.I32(Bits.xor(x, y)))
+        116 -> Result.Ok(Val.I32(wrap32(x * pow2(k))))
+        117 -> Result.Ok(Val.I32(shr(x, k)))
+        118 -> Result.Ok(Val.I32(wrap32(shr(u32(x), k))))
+        119 -> Result.Ok(Val.I32(wrap32(rotl(u32(x), k, 32))))
+        120 -> Result.Ok(Val.I32(wrap32(rotl(u32(x), Bits.and(32 - k, 31), 32))))
+        _ -> Result.Err("unsupported numeric instruction {op}")
+
+verify i32Arith
+    i32Arith(109, 7, 0) => Result.Err("integer divide by zero")
+    i32Arith(109, -2147483648, -1) => Result.Err("integer overflow")
+    i32Arith(110, -1, 2) => Result.Ok(Val.I32(2147483647))
+    i32Arith(111, -7, 2) => Result.Ok(Val.I32(-1))
+    i32Arith(111, -2147483648, -1) => Result.Ok(Val.I32(0))
+    i32Arith(116, 1, 33) => Result.Ok(Val.I32(2))
+    i32Arith(118, -1, 28) => Result.Ok(Val.I32(15))
+    i32Arith(117, -16, 2) => Result.Ok(Val.I32(-4))
+    i32Arith(120, 1, 1) => Result.Ok(Val.I32(-2147483648))
+    i32Arith(119, -2147483648, 1) => Result.Ok(Val.I32(1))
+
+fn wrapI32(x: Int) -> Val
+    ? "A wrapped i32 value."
+    Val.I32(wrap32(x))
+
+verify wrapI32
+    wrapI32(4294967295) => Val.I32(-1)
+
+fn wrapI64(x: Int) -> Val
+    ? "A wrapped i64 value."
+    Val.I64(wrap64(x))
+
+verify wrapI64
+    wrapI64(18446744073709551615) => Val.I64(-1)
+
+fn divS(x: Int, y: Int, min: Int) -> Result<Int, String>
+    ? "Signed division, trapping on zero and on min / -1."
+    match y == 0
+        true -> Result.Err("integer divide by zero")
+        false -> divSOk(x, y, min)
+
+fn divSOk(x: Int, y: Int, min: Int) -> Result<Int, String>
+    ? "Signed division by a non-zero y."
+    match Bool.and(x == min, y == -1)
+        true -> Result.Err("integer overflow")
+        false -> Result.Ok(tdiv(x, y))
+
+fn divU(x: Int, y: Int) -> Result<Int, String>
+    ? "Unsigned division, trapping on zero."
+    match y == 0
+        true -> Result.Err("integer divide by zero")
+        false -> Result.Ok(udiv(x, y))
+
+fn remS(x: Int, y: Int) -> Result<Int, String>
+    ? "Signed remainder, trapping on zero."
+    match y == 0
+        true -> Result.Err("integer divide by zero")
+        false -> Result.Ok(trem(x, y))
+
+fn remU(x: Int, y: Int) -> Result<Int, String>
+    ? "Unsigned remainder, trapping on zero."
+    match y == 0
+        true -> Result.Err("integer divide by zero")
+        false -> Result.Ok(umod(x, y))
+
+verify divS
+    divS(-7, 2, -2147483648) => Result.Ok(-3)
+
+verify divSOk
+    divSOk(-8, -1, -8) => Result.Err("integer overflow")
+
+verify divU
+    divU(7, 0) => Result.Err("integer divide by zero")
+    divU(7, 2) => Result.Ok(3)
+
+verify remS
+    remS(7, 0) => Result.Err("integer divide by zero")
+
+verify remU
+    remU(7, 0) => Result.Err("integer divide by zero")
+    remU(7, 4) => Result.Ok(3)
+
+fn i64Arith(op: Int, x: Int, y: Int) -> Result<Val, String>
+    ? "The i64 arithmetic and bitwise operations."
+    k = Bits.and(y, 63)
+    match op
+        124 -> Result.Ok(Val.I64(wrap64(x + y)))
+        125 -> Result.Ok(Val.I64(wrap64(x - y)))
+        126 -> Result.Ok(Val.I64(wrap64(x * y)))
+        127 -> Result.Ok(wrapI64(divS(x, y, minI64)?))
+        128 -> Result.Ok(wrapI64(divU(u64(x), u64(y))?))
+        129 -> Result.Ok(wrapI64(remS(x, y)?))
+        130 -> Result.Ok(wrapI64(remU(u64(x), u64(y))?))
+        131 -> Result.Ok(Val.I64(Bits.and(x, y)))
+        132 -> Result.Ok(Val.I64(Bits.or(x, y)))
+        133 -> Result.Ok(Val.I64(Bits.xor(x, y)))
+        134 -> Result.Ok(Val.I64(wrap64(x * pow2(k))))
+        135 -> Result.Ok(Val.I64(shr(x, k)))
+        136 -> Result.Ok(Val.I64(wrap64(shr(u64(x), k))))
+        137 -> Result.Ok(Val.I64(wrap64(rotl(u64(x), k, 64))))
+        138 -> Result.Ok(Val.I64(wrap64(rotl(u64(x), Bits.and(64 - k, 63), 64))))
+        _ -> Result.Err("unsupported numeric instruction {op}")
+
+verify i64Arith
+    i64Arith(126, 4294967296, 4294967296) => Result.Ok(Val.I64(0))
+    i64Arith(136, -1, 60) => Result.Ok(Val.I64(15))
+    i64Arith(128, -1, 2) => Result.Ok(Val.I64(9223372036854775807))
+    i64Arith(134, 1, 63) => Result.Ok(Val.I64(-9223372036854775808))
+    i64Arith(127, 1, 0) => Result.Err("integer divide by zero")
+    i64Arith(137, -9223372036854775808, 1) => Result.Ok(Val.I64(1))
+
+fn f64Arith(op: Int, x: Float, y: Float) -> Result<Val, String>
+    ? "f64 arithmetic; f32 arithmetic is not supported."
+    match op
+        160 -> Result.Ok(Val.F64(x + y))
+        161 -> Result.Ok(Val.F64(x - y))
+        162 -> Result.Ok(Val.F64(x * y))
+        163 -> Result.Ok(Val.F64(x / y))
+        164 -> Result.Ok(Val.F64(fmin(x, y)))
+        165 -> Result.Ok(Val.F64(fmax(x, y)))
+        166 -> Result.Ok(Val.F64(copysign(x, y)))
+        _ -> f32Arith(op, x, y)
+
+verify f64Arith
+    f64Arith(163, 1.0, 4.0) => Result.Ok(Val.F64(0.25))
+    f64Arith(166, 3.0, -1.0) => Result.Ok(Val.F64(-3.0))
+    f64Arith(146, 3.0, -1.0) => Result.Ok(Val.F32(2.0))
+
+// ---- f32 ----
+
+fn f32Max() -> Float
+    ? "2^128, the first magnitude that rounds to infinity once f32 runs out of exponent."
+    p2f(127) * 2.0
+
+verify f32Max
+    f32Max() > 1000000.0 => true
+
+fn roundF32(x: Float) -> Float
+    ? "x rounded to the nearest f32, ties to even, with f32's subnormals and overflow to infinity."
+    match Bool.or(isNan(x), Bool.or(x == 0.0, Float.abs(x) == inf()))
+        true -> x
+        false -> withSign(roundMagF32(Float.abs(x)), isNeg(x))
+
+fn withSign(a: Float, neg: Bool) -> Float
+    ? "a, negated when neg."
+    match neg
+        true -> a * -1.0
+        false -> a
+
+fn roundMagF32(a: Float) -> Float
+    ? "A positive finite magnitude rounded to f32: to a multiple of the quantum of its binade, never finer than 2^-149."
+    e = Int.max(expOf(a, -1074, 1023), -126)
+    q = p2f(e - 23)
+    r = Float.fromInt(roundEven(a / q)) * q
+    match r >= f32Max()
+        true -> inf()
+        false -> r
+
+fn roundEven(m: Float) -> Int
+    ? "A non-negative float below 2^53 rounded to a whole number, ties to even."
+    f = Float.floor(m)
+    d = m - Float.fromInt(f)
+    match d == 0.5
+        true -> f + umod(f, 2)
+        false -> roundNotTie(d, f)
+
+fn roundNotTie(d: Float, f: Int) -> Int
+    ? "f or f + 1, away from a tie."
+    match d < 0.5
+        true -> f
+        false -> f + 1
+
+verify roundF32
+    roundF32(1.0) => 1.0
+    roundF32(0.1) => 0.10000000149011612
+    roundF32(16777217.0) => 16777216.0
+    roundF32(16777219.0) => 16777220.0
+    roundF32(-0.1) => -0.10000000149011612
+    roundF32(p2f(128)) => inf()
+    roundF32(p2f(-150)) => 0.0
+    roundF32(p2f(-149) * 0.75) => p2f(-149)
+
+verify withSign
+    withSign(1.0, true) => -1.0
+
+verify roundMagF32
+    roundMagF32(3.0) => 3.0
+
+verify roundEven
+    roundEven(2.5) => 2
+    roundEven(3.5) => 4
+    roundEven(3.2) => 3
+
+verify roundNotTie
+    roundNotTie(0.7, 1) => 2
+
+fn intToF32(n: Int) -> Float
+    ? "An integer rounded straight to f32, ties to even."
+    match Int.abs(n) < 16777216
+        true -> Float.fromInt(n)
+        false -> withSign(bigIntF32(Int.abs(n)), n < 0)
+
+fn bigIntF32(a: Int) -> Float
+    ? "A positive integer of more than 24 bits rounded to 24 significant bits."
+    k = bitLen(a, 0) - 24
+    q = pow2(k)
+    lo = umod(a, q)
+    hi = udiv(a, q)
+    half = udiv(q, 2)
+    m = bigRound(hi, lo, half)
+    roundF32(Float.fromInt(m) * p2f(k))
+
+fn bigRound(hi: Int, lo: Int, half: Int) -> Int
+    ? "hi rounded by the remainder lo against half the quantum, ties to even."
+    match lo == half
+        true -> hi + umod(hi, 2)
+        false -> bigRoundNotTie(hi, lo > half)
+
+fn bigRoundNotTie(hi: Int, up: Bool) -> Int
+    ? "hi, or hi + 1 when the remainder is past half."
+    match up
+        true -> hi + 1
+        false -> hi
+
+verify intToF32
+    intToF32(16777217) => 16777216.0
+    intToF32(16777219) => 16777220.0
+    intToF32(-3) => -3.0
+    intToF32(9223372036854775807) => 9223372036854775808.0
+
+verify bigIntF32
+    bigIntF32(33554435) => 33554436.0
+
+verify bigRound
+    bigRound(5, 4, 4) => 6
+    bigRound(4, 4, 4) => 4
+
+verify bigRoundNotTie
+    bigRoundNotTie(4, true) => 5
+
+fn f32FromBits(b: Int) -> Float
+    ? "The f32 whose bit pattern is the low 32 bits of b."
+    u = u32(b)
+    e = Bits.and(shr(u, 23), 255)
+    frac = Bits.and(u, 8388607)
+    mag = magF32(e, frac)
+    withSign(mag, u >= 2147483648)
+
+fn magF32(e: Int, frac: Int) -> Float
+    ? "The magnitude an f32 exponent field and fraction encode."
+    match e
+        255 -> nanOrInf(frac)
+        0 -> Float.fromInt(frac) * p2f(-149)
+        _ -> Float.fromInt(frac + 8388608) * p2f(e - 150)
+
+verify f32FromBits
+    f32FromBits(1065353216) => 1.0
+    f32FromBits(-1073741824) => -2.0
+    f32FromBits(2139095040) => inf()
+    f32FromBits(1) => p2f(-149)
+
+verify magF32
+    magF32(127, 0) => 1.0
+
+fn f32ToBits(x: Float) -> Int
+    ? "The bit pattern of an f32 value as a signed 32-bit integer; every NaN reads as the canonical one."
+    match isNan(x)
+        true -> 2143289344
+        false -> wrap32(signBit32(x) + magBits32(Float.abs(x)))
+
+fn signBit32(x: Float) -> Int
+    ? "The f32 sign bit's weight when x is negative."
+    match isNeg(x)
+        true -> 2147483648
+        false -> 0
+
+fn magBits32(a: Float) -> Int
+    ? "The bits of a non-negative f32 below the sign."
+    match a == inf()
+        true -> 2139095040
+        false -> finiteBits32(a)
+
+fn finiteBits32(a: Float) -> Int
+    ? "The bits of a finite non-negative f32."
+    match a < p2f(-126)
+        true -> Float.round(a * p2f(149))
+        false -> normalBits32(a, expOf(a, -126, 127))
+
+fn normalBits32(a: Float, e: Int) -> Int
+    ? "The bits of a normal f32 a with 2^e <= a < 2^(e+1)."
+    m = Float.round(a * p2f(0 - e) * p2f(23))
+    (e + 127) * 8388608 + m - 8388608
+
+verify f32ToBits
+    f32ToBits(1.0) => 1065353216
+    f32ToBits(-2.0) => -1073741824
+    f32ToBits(inf()) => 2139095040
+    f32ToBits(p2f(-149)) => 1
+    f32ToBits(0.0 * -1.0) => -2147483648
+
+verify f32ToBits law roundTrip
+    given b: Int = [0, 1, 8388607, 8388608, 1065353216, 1036831949, -1073741824, 2139095039]
+    f32ToBits(f32FromBits(b)) => b
+
+verify signBit32
+    signBit32(-1.0) => 2147483648
+
+verify magBits32
+    magBits32(inf()) => 2139095040
+
+verify finiteBits32
+    finiteBits32(0.0) => 0
+
+verify normalBits32
+    normalBits32(1.0, 0) => 1065353216
+
+fn f32v(x: Float) -> Val
+    ? "An f32 value, rounded."
+    Val.F32(roundF32(x))
+
+verify f32v
+    f32v(0.1) => Val.F32(0.10000000149011612)
+
+fn f32Unary(op: Int, f: Float) -> Result<Val, String>
+    ? "The f32 unaries: abs, neg, ceil, floor, trunc, nearest, sqrt."
+    match op
+        139 -> Result.Ok(Val.F32(Float.abs(f)))
+        140 -> Result.Ok(Val.F32(f * -1.0))
+        141 -> Result.Ok(Val.F32(fceil(f)))
+        142 -> Result.Ok(Val.F32(ffloor(f)))
+        143 -> Result.Ok(Val.F32(ftrunc(f)))
+        144 -> Result.Ok(Val.F32(fnearest(f)))
+        145 -> Result.Ok(f32v(Float.sqrt(f)))
+        _ -> Result.Err("unsupported numeric instruction {op}")
+
+verify f32Unary
+    f32Unary(145, 2.0) => Result.Ok(Val.F32(1.4142135381698608))
+    f32Unary(140, 1.5) => Result.Ok(Val.F32(-1.5))
+    f32Unary(1, 1.5) => Result.Err("unsupported numeric instruction 1")
+
+fn f32Arith(op: Int, x: Float, y: Float) -> Result<Val, String>
+    ? "f32 arithmetic, rounded to f32."
+    match op
+        146 -> Result.Ok(f32v(x + y))
+        147 -> Result.Ok(f32v(x - y))
+        148 -> Result.Ok(f32v(x * y))
+        149 -> Result.Ok(f32v(x / y))
+        150 -> Result.Ok(Val.F32(fmin(x, y)))
+        151 -> Result.Ok(Val.F32(fmax(x, y)))
+        152 -> Result.Ok(Val.F32(copysign(x, y)))
+        _ -> Result.Err("unsupported numeric instruction {op}")
+
+verify f32Arith
+    f32Arith(146, 0.10000000149011612, 0.20000000298023224) => Result.Ok(Val.F32(0.30000001192092896))
+    f32Arith(149, 1.0, 3.0) => Result.Ok(Val.F32(0.3333333432674408))
+    f32Arith(1, 1.0, 3.0) => Result.Err("unsupported numeric instruction 1")
+
+fn fcmpF32(op: Int, x: Float, y: Float) -> Result<Val, String>
+    ? "The f32 comparisons."
+    match op
+        91 -> Result.Ok(b2i(x == y))
+        92 -> Result.Ok(b2i(x != y))
+        93 -> Result.Ok(b2i(x < y))
+        94 -> Result.Ok(b2i(x > y))
+        95 -> Result.Ok(b2i(x <= y))
+        96 -> Result.Ok(b2i(x >= y))
+        _ -> Result.Err("unsupported numeric instruction {op}")
+
+verify fcmpF32
+    fcmpF32(93, 1.0, 2.0) => Result.Ok(Val.I32(1))
+    fcmpF32(1, 1.0, 2.0) => Result.Err("unsupported numeric instruction 1")
+
+fn convertF32(op: Int, x: Int, f: Float) -> Result<Val, String>
+    ? "Conversions to and from f32."
+    match op
+        168 -> Result.Ok(Val.I32(truncTo(f, -2147483648, 2147483647)?))
+        169 -> Result.Ok(Val.I32(wrap32(truncTo(f, 0, 4294967295)?)))
+        174 -> Result.Ok(Val.I64(truncTo(f, minI64, 9223372036854775807)?))
+        175 -> Result.Ok(Val.I64(wrap64(truncTo(f, 0, maxU64)?)))
+        178 -> Result.Ok(Val.F32(intToF32(x)))
+        179 -> Result.Ok(Val.F32(intToF32(u32(x))))
+        180 -> Result.Ok(Val.F32(intToF32(x)))
+        181 -> Result.Ok(Val.F32(intToF32(u64(x))))
+        182 -> Result.Ok(f32v(f))
+        187 -> Result.Ok(Val.F64(f))
+        188 -> Result.Ok(Val.I32(f32ToBits(f)))
+        190 -> Result.Ok(f32Val(x))
+        64512 -> Result.Ok(Val.I32(truncSat(f, -2147483648, 2147483647)))
+        64513 -> Result.Ok(Val.I32(wrap32(truncSat(f, 0, 4294967295))))
+        64516 -> Result.Ok(Val.I64(truncSat(f, minI64, 9223372036854775807)))
+        64517 -> Result.Ok(Val.I64(wrap64(truncSat(f, 0, maxU64))))
+        _ -> Result.Err("unsupported numeric instruction {op}")
+
+verify convertF32
+    convertF32(179, -1, 0.0) => Result.Ok(Val.F32(4294967296.0))
+    convertF32(188, 0, 1.0) => Result.Ok(Val.I32(1065353216))
+    convertF32(190, 1065353216, 0.0) => Result.Ok(Val.F32(1.0))
+    convertF32(182, 0, 0.1) => Result.Ok(Val.F32(0.10000000149011612))
+    convertF32(168, 0, 2147483648.0) => Result.Err("integer overflow")
+    convertF32(1, 0, 0.0) => Result.Err("unsupported numeric instruction 1")
+
+// ---- bit patterns as values ----
+
+fn f64Val(b: Int) -> Val
+    ? "The f64 value of a 64-bit pattern, keeping a NaN's bits."
+    u = u64(wrap64(b))
+    match Bool.and(Bits.and(shr(u, 52), 2047) == 2047, Bits.and(u, 4503599627370495) != 0)
+        true -> Val.NaN64(wrap64(b))
+        false -> Val.F64(f64FromBits(wrap64(b)))
+
+fn f32Val(b: Int) -> Val
+    ? "The f32 value of a 32-bit pattern, keeping a NaN's bits."
+    u = u32(b)
+    match Bool.and(Bits.and(shr(u, 23), 255) == 255, Bits.and(u, 8388607) != 0)
+        true -> Val.NaN32(wrap32(b))
+        false -> Val.F32(f32FromBits(b))
+
+fn bits64(v: Val) -> Int
+    ? "The bit pattern of an f64 value."
+    match v
+        Val.NaN64(b) -> b
+        _ -> f64ToBits(Value.f64v(v))
+
+fn bits32(v: Val) -> Int
+    ? "The bit pattern of an f32 value."
+    match v
+        Val.NaN32(b) -> b
+        _ -> f32ToBits(Value.f64v(v))
+
+verify f64Val
+    f64Val(4607182418800017408) => Val.F64(1.0)
+    f64Val(-1) => Val.NaN64(-1)
+    f64Val(18446744073709551615) => Val.NaN64(-1)
+    f64Val(9218868437227405312) => Val.F64(inf())
+
+verify f32Val
+    f32Val(1065353216) => Val.F32(1.0)
+    f32Val(4294967295) => Val.NaN32(-1)
+    f32Val(2139095040) => Val.F32(inf())
+
+verify bits64
+    bits64(Val.NaN64(-3)) => -3
+    bits64(Val.F64(1.0)) => 4607182418800017408
+
+verify bits32
+    bits32(Val.NaN32(-3)) => -3
+    bits32(Val.F32(1.0)) => 1065353216

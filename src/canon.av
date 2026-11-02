@@ -1,0 +1,182 @@
+module Canon
+    intent =
+        "Iso-recursive type canonicalization. Two type indices denote the same"
+        "type when their rec groups are structurally identical and they sit at"
+        "the same position in them. A group is written as a key in which a"
+        "reference into the group is relative to its start and a reference out"
+        "of it is the canonical index of its target; the first group with a"
+        "key is the canonical one. Field mutability is part of the key."
+    exposes [canonicalize]
+    depends [Ast]
+    effects []
+
+fn canonicalize(types: Vector<SubType>) -> Vector<Int>
+    ? "The canonical index of every type index."
+    Vector.fromList(groups(List.fromVector(types), 0, {}, []))
+
+verify canonicalize
+    canonicalize(Vector.fromList([])) => Vector.fromList([])
+    canonicalize(Vector.fromList([SubType(comp = Comp.ArrayT(ValType.I8), supers = [], final = true, group = 0, muts = []), SubType(comp = Comp.ArrayT(ValType.I8), supers = [], final = true, group = 1, muts = [])])) => Vector.fromList([0, 0])
+    canonicalize(Vector.fromList([SubType(comp = Comp.ArrayT(ValType.I8), supers = [], final = true, group = 0, muts = []), SubType(comp = Comp.ArrayT(ValType.I16), supers = [], final = true, group = 1, muts = [])])) => Vector.fromList([0, 1])
+    canonicalize(Vector.fromList([SubType(comp = Comp.ArrayT(ValType.I8), supers = [], final = true, group = 0, muts = []), SubType(comp = Comp.ArrayT(ValType.I8), supers = [], final = false, group = 1, muts = [])])) => Vector.fromList([0, 1])
+
+verify canonicalize law selfRefGroupsMatch
+    given a: Int = [0, 1]
+    Option.withDefault(Vector.get(canonicalize(Vector.fromList([SubType(comp = Comp.ArrayT(ValType.Ref(true, 0)), supers = [], final = true, group = 0, muts = []), SubType(comp = Comp.ArrayT(ValType.Ref(true, 1)), supers = [], final = true, group = 1, muts = [])])), a), -1) => 0
+
+fn groups(ts: List<SubType>, start: Int, seen: Map<String, Int>, acc: List<Int>) -> List<Int>
+    ? "Canonical indices group by group; acc holds those of earlier types, last first."
+    match ts
+        [] -> List.reverse(acc)
+        [t, .._] -> oneGroup(ts, start, groupLen(ts, t.group, 0), seen, acc)
+
+fn groupLen(ts: List<SubType>, g: Int, n: Int) -> Int
+    ? "How many types at the front of ts belong to group g."
+    match ts
+        [] -> n
+        [t, ..rest] -> groupLenNext(t.group == g, rest, g, n)
+
+fn groupLenNext(same: Bool, rest: List<SubType>, g: Int, n: Int) -> Int
+    ? "Counts one more member while the group lasts."
+    match same
+        true -> groupLen(rest, g, n + 1)
+        false -> n
+
+verify groups
+    groups([], 0, {}, []) => []
+
+verify groupLen
+    groupLen([SubType(comp = Comp.ArrayT(ValType.I8), supers = [], final = true, group = 3, muts = [])], 3, 0) => 1
+
+verify groupLenNext
+    groupLenNext(false, [], 0, 2) => 2
+
+fn oneGroup(ts: List<SubType>, start: Int, n: Int, seen: Map<String, Int>, acc: List<Int>) -> List<Int>
+    ? "Canonicalizes the group of n types at start and goes on after it."
+    members = List.take(ts, n)
+    canonSoFar = Vector.fromList(List.reverse(acc))
+    k = String.join(memberKeys(members, start, n, canonSoFar, []), ";")
+    base = Option.withDefault(Map.get(seen, k), start)
+    groups(List.drop(ts, n), start + n, Map.set(seen, k, base), List.concat(List.reverse(range(base, n, [])), acc))
+
+fn range(base: Int, n: Int, acc: List<Int>) -> List<Int>
+    ? "base, base + 1, ..., base + n - 1."
+    match n <= 0
+        true -> acc
+        false -> range(base, n - 1, List.prepend(base + n - 1, acc))
+
+verify oneGroup
+    oneGroup([SubType(comp = Comp.ArrayT(ValType.I8), supers = [], final = true, group = 0, muts = [])], 0, 1, {}, []) => [0]
+
+verify range
+    range(3, 2, []) => [3, 4]
+
+fn memberKeys(ms: List<SubType>, start: Int, n: Int, canon: Vector<Int>, acc: List<String>) -> List<String>
+    ? "The key of each member of a group."
+    match ms
+        [] -> List.reverse(acc)
+        [m, ..rest] -> memberKeys(rest, start, n, canon, List.prepend(subKey(m, start, n, canon), acc))
+
+fn subKey(m: SubType, start: Int, n: Int, canon: Vector<Int>) -> String
+    ? "The key of one subtype: finality, supertypes and its composite type."
+    fin = match m.final
+        true -> "F"
+        false -> "O"
+    "{fin}<{String.join(refKeys(m.supers, start, n, canon, []), ",")}>{compKey(m.comp, start, n, canon)}{mutKey(m.muts, "")}"
+
+fn mutKey(ms: List<Bool>, acc: String) -> String
+    ? "Field mutability as m (mutable) and c (constant), one letter per field."
+    match ms
+        [] -> acc
+        [b, ..rest] -> mutKey(rest, "{acc}{mutLetter(b)}")
+
+fn mutLetter(b: Bool) -> String
+    ? "m for a mutable field, c for a constant one."
+    match b
+        true -> "m"
+        false -> "c"
+
+verify mutKey
+    mutKey([true, false], "") => "mc"
+
+verify mutLetter
+    mutLetter(true) => "m"
+
+fn refKeys(xs: List<Int>, start: Int, n: Int, canon: Vector<Int>, acc: List<String>) -> List<String>
+    ? "The keys of type indices."
+    match xs
+        [] -> List.reverse(acc)
+        [x, ..rest] -> refKeys(rest, start, n, canon, List.prepend(idxKey(x, start, n, canon), acc))
+
+fn idxKey(x: Int, start: Int, n: Int, canon: Vector<Int>) -> String
+    ? "A type index as it appears in a key: relative inside the group, canonical outside, abstract when negative."
+    match x < 0
+        true -> "a{0 - x}"
+        false -> idxKeyOf(x, start, n, canon)
+
+fn idxKeyOf(x: Int, start: Int, n: Int, canon: Vector<Int>) -> String
+    ? "A concrete type index in a key."
+    match Bool.and(x >= start, x < start + n)
+        true -> "r{x - start}"
+        false -> "c{Option.withDefault(Vector.get(canon, x), x)}"
+
+fn compKey(c: Comp, start: Int, n: Int, canon: Vector<Int>) -> String
+    ? "The key of a composite type."
+    match c
+        Comp.FuncT(ps, rs) -> "func({tysKey(ps, start, n, canon, [])})({tysKey(rs, start, n, canon, [])})"
+        Comp.StructT(fs) -> "struct({tysKey(List.fromVector(fs), start, n, canon, [])})"
+        Comp.ArrayT(e) -> "array({tyKey(e, start, n, canon)})"
+
+fn tysKey(ts: List<ValType>, start: Int, n: Int, canon: Vector<Int>, acc: List<String>) -> String
+    ? "The keys of value types, comma-separated."
+    match ts
+        [] -> String.join(List.reverse(acc), ",")
+        [t, ..rest] -> tysKey(rest, start, n, canon, List.prepend(tyKey(t, start, n, canon), acc))
+
+fn tyKey(t: ValType, start: Int, n: Int, canon: Vector<Int>) -> String
+    ? "The key of a value or storage type."
+    match t
+        ValType.I32 -> "i32"
+        ValType.I64 -> "i64"
+        ValType.F32 -> "f32"
+        ValType.F64 -> "f64"
+        ValType.V128 -> "v128"
+        ValType.I8 -> "i8"
+        ValType.I16 -> "i16"
+        ValType.Ref(nl, h) -> "ref{nullKey(nl)}{idxKey(h, start, n, canon)}"
+
+fn nullKey(nl: Bool) -> String
+    ? "A marker for a nullable reference."
+    match nl
+        true -> "?"
+        false -> ""
+
+verify memberKeys
+    memberKeys([], 0, 0, Vector.fromList([]), []) => []
+
+verify subKey
+    subKey(SubType(comp = Comp.ArrayT(ValType.I8), supers = [], final = true, group = 0, muts = []), 0, 1, Vector.fromList([])) => "F<>array(i8)"
+
+verify refKeys
+    refKeys([0, 5], 0, 1, Vector.fromList([0, 1, 2, 3, 4, 2]), []) => ["r0", "c2"]
+
+verify idxKey
+    idxKey(-16, 0, 1, Vector.fromList([])) => "a16"
+
+verify idxKeyOf
+    idxKeyOf(3, 2, 2, Vector.fromList([])) => "r1"
+
+verify compKey
+    compKey(Comp.FuncT([ValType.I32], []), 0, 0, Vector.fromList([])) => "func(i32)()"
+    compKey(Comp.StructT(Vector.fromList([ValType.I64])), 0, 0, Vector.fromList([])) => "struct(i64)"
+
+verify tysKey
+    tysKey([ValType.I32, ValType.F64], 0, 0, Vector.fromList([]), []) => "i32,f64"
+
+verify tyKey
+    tyKey(ValType.Ref(true, -18), 0, 0, Vector.fromList([])) => "ref?a18"
+    tyKey(ValType.Ref(false, 0), 0, 1, Vector.fromList([])) => "refr0"
+
+verify nullKey
+    nullKey(true) => "?"
+    nullKey(false) => ""

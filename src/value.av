@@ -1,0 +1,89 @@
+module Value
+    intent =
+        "Run-time values of the interpreter. An i32 is held as a signed Int in"
+        "-2^31..2^31-1 and an i64 as a signed Int in -2^63..2^63-1, so every"
+        "value stays a machine word in Aver; the unsigned reading is computed"
+        "where an instruction needs it. A reference to a struct or an array is"
+        "its address on the heap; externref and anyref share one representation,"
+        "so the conversions between them change nothing. A NaN keeps its bit"
+        "pattern as NaN32 or NaN64, since Aver's Float cannot carry a payload."
+        "A v128 is one unsigned Int below 2^128, lane 0 in the lowest bits."
+    exposes [Val, defaultOf, i32, i64, f64v, isNull]
+    depends [Ast]
+    effects []
+
+type Val
+    I32(Int)
+    I64(Int)
+    F32(Float)
+    F64(Float)
+    Null
+    Ref(Int)
+    I31(Int)
+    Func(Int)
+    Host(Int)
+    NaN32(Int)
+    NaN64(Int)
+    V128(Int)
+
+fn defaultOf(t: ValType) -> Val
+    ? "The default value of a type: zero for numbers, null for references."
+    match t
+        ValType.I64 -> Val.I64(0)
+        ValType.F32 -> Val.F32(0.0)
+        ValType.F64 -> Val.F64(0.0)
+        ValType.Ref(_, _) -> Val.Null
+        ValType.V128 -> Val.V128(0)
+        _ -> Val.I32(0)
+
+verify defaultOf
+    defaultOf(ValType.I64) => Val.I64(0)
+    defaultOf(ValType.Ref(true, -16)) => Val.Null
+    defaultOf(ValType.I8) => Val.I32(0)
+    defaultOf(ValType.F32) => Val.F32(0.0)
+    defaultOf(ValType.F64) => Val.F64(0.0)
+    defaultOf(ValType.V128) => Val.V128(0)
+
+fn i32(v: Val) -> Int
+    ? "The integer an i32 or i64 value holds; anything else reads as zero, which validation rules out."
+    match v
+        Val.I32(x) -> x
+        Val.I64(x) -> x
+        Val.I31(x) -> x
+        _ -> 0
+
+verify i32
+    i32(Val.I32(-4)) => -4
+    i32(Val.I64(9)) => 9
+    i32(Val.Null) => 0
+
+fn i64(v: Val) -> Int
+    ? "Same reading as i32, named for the call sites that expect an i64."
+    i32(v)
+
+verify i64
+    i64(Val.I64(-1)) => -1
+
+fn f64v(v: Val) -> Float
+    ? "The float an f32 or f64 value holds."
+    match v
+        Val.F64(x) -> x
+        Val.F32(x) -> x
+        Val.NaN32(_) -> 0.0 / 0.0
+        Val.NaN64(_) -> 0.0 / 0.0
+        _ -> 0.0
+
+verify f64v
+    f64v(Val.F64(1.5)) => 1.5
+    f64v(Val.I32(1)) => 0.0
+    f64v(Val.NaN64(-1)) == f64v(Val.NaN64(-1)) => false
+
+fn isNull(v: Val) -> Bool
+    ? "Whether a reference is null."
+    match v
+        Val.Null -> true
+        _ -> false
+
+verify isNull
+    isNull(Val.Null) => true
+    isNull(Val.Ref(0)) => false

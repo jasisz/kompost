@@ -1,0 +1,522 @@
+module Main
+    intent =
+        "Kompost's command line: kompost FILE.wasm [ARGS...] runs _start with"
+        "ARGS as the program's arguments; kompost --invoke NAME FILE.wasm [INTS...]"
+        "runs one export with integer arguments and prints its results;"
+        "kompost --validate FILE.wasm only checks the module; kompost --script"
+        "FILE.wasm SCRIPT runs the invocations listed in SCRIPT one after another on"
+        "one instance (for spec tests, see bin/wast) and prints each one's results"
+        "as typed bit patterns. Decodes and"
+        "validates the module, instantiates it, runs its start function and answers the"
+        "module's calls to the host, the one Aver's wasm-gc output imports:"
+        "strings leave as references to arrays of octets on Kompost's heap, and"
+        "come in through the module's own __rt_string_from_lm."
+    depends [Ast, Value, Num, Decode, Valid, Exec, Kompost, Arr, Mem, Bytes]
+    effects [Args.get, Console.print, Console.error, Disk.readBytes, Disk.readBytesAt, Disk.readText]
+
+fn main() -> Int
+    ? "Runs the file and ends with 0, or 1 after a trap or an error."
+    ! [Args.get, Console.print, Console.error, Disk.readBytes, Disk.readBytesAt, Disk.readText]
+    match Args.get()
+        ["--validate", path] -> report(checkFile(path))
+        ["--script", path, script] -> report(runScript(path, script))
+        ["--stats", path, ..rest] -> report(statsOf(runFileStore(path, "_start", [], rest)))
+        ["--invoke", entry, path, ..rest] -> report(runFile(path, entry, rest, []))
+        [path, ..rest] -> report(runFile(path, "_start", [], rest))
+        _ -> usage()
+
+fn usage() -> Int
+    ? "Prints how to call Kompost."
+    ! [Console.error]
+    Console.error("usage: kompost FILE.wasm [ARGS...] | kompost --invoke NAME FILE.wasm [ARGS...] | kompost --validate FILE.wasm")
+    2
+
+fn report(r: Result<List<Val>, String>) -> Int
+    ? "Prints the export's results, or the error; the exit status says which."
+    ! [Console.print, Console.error]
+    match r
+        Result.Ok([]) -> 0
+        Result.Ok(vs) -> printed(vs)
+        Result.Err(e) -> failed(e)
+
+fn printed(vs: List<Val>) -> Int
+    ? "Prints results, one per line; references print as nothing."
+    ! [Console.print]
+    Console.print(String.join(showAll(vs, []), "\n"))
+    0
+
+fn failed(e: String) -> Int
+    ? "Prints an error."
+    ! [Console.error]
+    Console.error("kompost: {e}")
+    1
+
+fn showAll(vs: List<Val>, acc: List<String>) -> List<String>
+    ? "Every value as text."
+    match vs
+        [] -> List.reverse(acc)
+        [v, ..rest] -> showAll(rest, List.prepend(show(v), acc))
+
+verify showAll
+    showAll([Val.I32(1), Val.Null], []) => ["1", ""]
+
+fn show(v: Val) -> String
+    ? "A value as text."
+    match v
+        Val.I32(n) -> "{n}"
+        Val.I64(n) -> "{n}"
+        Val.F64(d) -> "{d}"
+        Val.F32(d) -> showF32(d)
+        Val.NaN32(_) -> "nan"
+        Val.NaN64(_) -> "nan"
+        _ -> ""
+
+verify show
+    show(Val.I64(-3)) => "-3"
+    show(Val.Ref(2)) => ""
+
+fn runFile(path: String, entry: String, args: List<String>, pargs: List<String>) -> Result<List<Val>, String>
+    ? "Reads, decodes, instantiates and runs; pargs are the program's own arguments."
+    ! [Console.print, Disk.readBytes, Disk.readBytesAt]
+    b = Disk.readBytes(path)?
+    m = Decode.decode(Vector.fromList(Bytes.octets(b)))?
+    shapes = invalid(Valid.validate(m))?
+    ready = Exec.instantiate(m, spectestGlobals(), shapes)?
+    s = runStart(ready, m.start, pargs)?
+    fi = Result.fromOption(Exec.exportFunc(m, entry), "no exported function {entry}")?
+    _ = arityOk(List.len(args), List.len(paramsOf(ready.x, fi)), entry)?
+    out = drive(ready.x, Exec.invoke(ready.x, s, fi, intArgs(ready.x, fi, args, 0, [])), pargs)?
+    Result.Ok(out.vs)
+
+fn runScript(path: String, script: String) -> Result<List<Val>, String>
+    ? "Instantiates the module once and runs each line of the script on it: invoke, a tab, the export's name, then its arguments, each after a tab. Every line prints ok and the results, or trap and the message; a trap keeps the store as it was before the call."
+    ! [Console.print, Disk.readBytes, Disk.readBytesAt, Disk.readText]
+    b = Disk.readBytes(path)?
+    m = Decode.decode(Vector.fromList(Bytes.octets(b)))?
+    shapes = invalid(Valid.validate(m))?
+    ready = Exec.instantiate(m, spectestGlobals(), shapes)?
+    s = runStart(ready, m.start, [])?
+    text = Disk.readText(script)?
+    done = scriptLines(ready.x, s, String.split(text, "\n"))
+    Result.Ok([])
+
+fn scriptLines(x: Inst, s: Store, lines: List<String>) -> Store
+    ? "Runs the script's lines in order, each on the store the one before left."
+    ! [Console.print, Disk.readBytes, Disk.readBytesAt]
+    match lines
+        [] -> s
+        [l, ..rest] -> scriptLines(x, scriptLine(x, s, String.split(l, "\t")), rest)
+
+fn scriptLine(x: Inst, s: Store, ws: List<String>) -> Store
+    ? "One line: an invocation, or anything else, which is skipped."
+    ! [Console.print, Disk.readBytes, Disk.readBytesAt]
+    match ws
+        ["invoke", name, ..args] -> invokeLine(x, s, Exec.exportFunc(x.m, name), args)
+        _ -> s
+
+fn invokeLine(x: Inst, s: Store, fo: Option<Int>, args: List<String>) -> Store
+    ? "Calls the export with the arguments read by their type prefixes."
+    ! [Console.print, Disk.readBytes, Disk.readBytesAt]
+    match fo
+        Option.None -> scriptSays("error\tno such export", s)
+        Option.Some(fi) -> answer(s, drive(x, Exec.invoke(x, s, fi, scriptArgs(args, [])), []))
+
+fn answer(s: Store, r: Result<Ran, String>) -> Store
+    ? "Prints a call's results as typed bits and goes on with its store, or prints the trap and keeps s."
+    ! [Console.print]
+    match r
+        Result.Ok(ran) -> scriptSays(String.join(List.prepend("ok", bitsAll(ran.vs, [])), "\t"), ran.s)
+        Result.Err(e) -> scriptSays("trap\t{e}", s)
+
+fn scriptSays(line: String, s: Store) -> Store
+    ? "Prints a line and hands the store on."
+    ! [Console.print]
+    Console.print(line)
+    s
+
+fn scriptArgs(args: List<String>, acc: List<Val>) -> List<Val>
+    ? "Script arguments as values."
+    match args
+        [] -> List.reverse(acc)
+        [a, ..rest] -> scriptArgs(rest, List.prepend(scriptArg(String.split(a, ":")), acc))
+
+fn scriptArg(parts: List<String>) -> Val
+    ? "One argument: i32:, i64:, f32:, f64: or v128: and its bits as an unsigned number, null, or extern: and a host value."
+    match parts
+        ["i32", n] -> Val.I32(Num.wrap32(bitsOf(n)))
+        ["i64", n] -> Val.I64(Num.wrap64(bitsOf(n)))
+        ["f32", n] -> Num.f32Val(bitsOf(n))
+        ["f64", n] -> Num.f64Val(bitsOf(n))
+        ["v128", n] -> Val.V128(bitsOf(n))
+        ["extern", n] -> Val.Host(bitsOf(n))
+        _ -> Val.Null
+
+fn bitsOf(n: String) -> Int
+    ? "A decimal number, 0 when it is not one."
+    Result.withDefault(Int.fromString(n), 0)
+
+fn bitsAll(vs: List<Val>, acc: List<String>) -> List<String>
+    ? "Each value as its type and bits."
+    match vs
+        [] -> List.reverse(acc)
+        [v, ..rest] -> bitsAll(rest, List.prepend(bitsText(v), acc))
+
+fn bitsText(v: Val) -> String
+    ? "A value as its type and bit pattern: numbers unsigned, references by kind."
+    match v
+        Val.I32(n) -> "i32:{Num.u32(n)}"
+        Val.I64(n) -> "i64:{Num.u64(n)}"
+        Val.F32(_) -> "f32:{Num.bits32(v)}"
+        Val.NaN32(_) -> "f32:{Num.bits32(v)}"
+        Val.F64(_) -> "f64:{Num.bits64(v)}"
+        Val.NaN64(_) -> "f64:{Num.bits64(v)}"
+        Val.V128(n) -> "v128:{n}"
+        Val.Null -> "null"
+        Val.Host(n) -> "extern:{n}"
+        Val.Func(_) -> "func"
+        _ -> "ref"
+
+verify scriptArg
+    scriptArg(["i32", "4294967295"]) => Val.I32(-1)
+    scriptArg(["v128", "5"]) => Val.V128(5)
+    scriptArg(["null"]) => Val.Null
+
+verify bitsOf
+    bitsOf("x") => 0
+
+verify bitsAll
+    bitsAll([Val.I32(-1), Val.Null], []) => ["i32:4294967295", "null"]
+
+verify bitsText
+    bitsText(Val.F32(1.0)) => "f32:1065353216"
+    bitsText(Val.Ref(3)) => "ref"
+
+verify scriptArgs
+    scriptArgs(["i64:1", "extern:2"], []) => [Val.I64(1), Val.Host(2)]
+
+fn runFileStore(path: String, entry: String, args: List<String>, pargs: List<String>) -> Result<Ran, String>
+    ? "Like runFile, keeping the store the run ends with."
+    ! [Console.print, Disk.readBytes, Disk.readBytesAt]
+    b = Disk.readBytes(path)?
+    m = Decode.decode(Vector.fromList(Bytes.octets(b)))?
+    shapes = invalid(Valid.validate(m))?
+    ready = Exec.instantiate(m, spectestGlobals(), shapes)?
+    s = runStart(ready, m.start, pargs)?
+    fi = Result.fromOption(Exec.exportFunc(m, entry), "no exported function {entry}")?
+    drive(ready.x, Exec.invoke(ready.x, s, fi, intArgs(ready.x, fi, args, 0, [])), pargs)
+
+fn statsOf(r: Result<Ran, String>) -> Result<List<Val>, String>
+    ? "How many instructions ran and how many objects the heap ends with, as results to print."
+    match r
+        Result.Ok(ran) -> Result.Ok([Val.I64(ran.s.steps), Val.I64(ran.s.heap.live), Val.I64(ran.s.heap.next)])
+        Result.Err(e) -> Result.Err(e)
+
+fn runStart(ready: Ready, start: Int, pargs: List<String>) -> Result<Store, String>
+    ? "Runs the start function when the module has one."
+    ! [Console.print, Disk.readBytesAt]
+    match start < 0
+        true -> Result.Ok(ready.s)
+        false -> startDone(drive(ready.x, Exec.invoke(ready.x, ready.s, start, []), pargs)?)
+
+fn startDone(r: Ran) -> Result<Store, String>
+    ? "The store after the start function."
+    Result.Ok(r.s)
+
+fn intArgs(x: Inst, fi: Int, args: List<String>, k: Int, acc: List<Val>) -> List<Val>
+    ? "Command-line arguments as values of the export's parameter types."
+    match args
+        [] -> List.reverse(acc)
+        [a, ..rest] -> intArgs(x, fi, rest, k + 1, List.prepend(argOf(paramType(x, fi, k), a), acc))
+
+fn paramType(x: Inst, fi: Int, k: Int) -> ValType
+    ? "The type of parameter k of function fi."
+    match Vector.get(x.fns, fi)
+        Option.Some(g) -> nthType(List.drop(Ast.funcParams(x.m, g.ty), k))
+        Option.None -> ValType.I32
+
+fn nthType(ts: List<ValType>) -> ValType
+    ? "The first type of a list, or i32 for an empty one."
+    match ts
+        [t, .._] -> t
+        [] -> ValType.I32
+
+verify nthType
+    nthType([ValType.I64]) => ValType.I64
+    nthType([]) => ValType.I32
+
+fn argOf(t: ValType, a: String) -> Val
+    ? "An argument read as a value of type t: integers wrap to their width, so -1 and 4294967295 are the same i32."
+    n = Result.withDefault(Int.fromString(a), 0)
+    match t
+        ValType.I64 -> Val.I64(Num.wrap64(n))
+        ValType.F64 -> Val.F64(Result.withDefault(Float.fromString(a), Float.fromInt(n)))
+        _ -> Val.I32(Num.wrap32(n))
+
+verify argOf
+    argOf(ValType.I64, "5") => Val.I64(5)
+    argOf(ValType.I32, "x") => Val.I32(0)
+    argOf(ValType.I32, "4294967295") => Val.I32(-1)
+    argOf(ValType.F64, "1.5") => Val.F64(1.5)
+
+record Ran
+    vs: List<Val>
+    s: Store
+
+fn drive(x: Inst, out: Outcome, pargs: List<String>) -> Result<Ran, String>
+    ? "Runs the machine to the end, answering each call to the host."
+    ! [Console.print, Disk.readBytesAt]
+    match out
+        Outcome.Done(vs, s) -> Result.Ok(Ran(vs = vs, s = s))
+        Outcome.Trap(e) -> Result.Err("trap: {e}")
+        Outcome.Host(fi, args, tail, mach) -> answered(x, mach, tail, host(x, fi, args, pin(mach, args), pargs)?, pargs)
+
+fn answered(x: Inst, mach: Machine, tail: Bool, a: Ran, pargs: List<String>) -> Result<Ran, String>
+    ? "Resumes the machine with the host's answer and the store the host left, unpinning what the call pinned."
+    ! [Console.print, Disk.readBytesAt]
+    drive(x, Exec.resume(x, Machine.update(mach, store = Store.update(a.s, pinned = mach.store.pinned)), a.vs, tail), pargs)
+
+fn pin(mach: Machine, args: List<Val>) -> Store
+    ? "The store the host works on: everything the suspended machine and the call's arguments hold stays alive if the host runs the guest again."
+    Store.update(mach.store, pinned = List.concat(args, List.concat(Exec.machineRoots(mach), mach.store.pinned)))
+
+fn host(x: Inst, fi: Int, args: List<Val>, s: Store, pargs: List<String>) -> Result<Ran, String>
+    ? "Answers one call to an imported function."
+    ! [Console.print, Disk.readBytesAt]
+    match Vector.get(x.fns, fi)
+        Option.Some(g) -> hostCall(x, g.mod, g.name, args, s, pargs)
+        Option.None -> Result.Err("call to undefined import {fi}")
+
+fn hostCall(x: Inst, md: String, nm: String, args: List<Val>, s: Store, pargs: List<String>) -> Result<Ran, String>
+    ? "The host functions Kompost provides, all from the aver module."
+    ! [Console.print, Disk.readBytesAt]
+    match md
+        "aver" -> averCall(x, nm, args, s, pargs)
+        "spectest" -> Result.Ok(Ran(vs = [], s = s))
+        _ -> Result.Err("unsupported import {md}.{nm}")
+
+fn averCall(x: Inst, nm: String, args: List<Val>, s: Store, pargs: List<String>) -> Result<Ran, String>
+    ? "Aver's host imports: console, arguments, and the record/replay group markers, which do nothing when not recording."
+    ! [Console.print, Disk.readBytesAt]
+    match nm
+        "console_print" -> consolePrint(args, s)
+        "args_len" -> Result.Ok(Ran(vs = [Val.I64(List.len(pargs))], s = s))
+        "args_get" -> argGet(x, args, s, pargs)
+        "disk_read_bytes_at" -> diskRead(x, args, s, pargs)
+        "record_enter_group" -> Result.Ok(Ran(vs = [], s = s))
+        "record_set_branch" -> Result.Ok(Ran(vs = [], s = s))
+        "record_exit_group" -> Result.Ok(Ran(vs = [], s = s))
+        _ -> Result.Err("unsupported import aver.{nm}")
+
+fn argGet(x: Inst, args: List<Val>, s: Store, pargs: List<String>) -> Result<Ran, String>
+    ? "The program argument at the index asked for, as a guest string."
+    ! [Console.print, Disk.readBytesAt]
+    k = Value.i64(nthVal(args))
+    fromHost(x, s, nthText(List.drop(pargs, k)), pargs)
+
+fn nthText(xs: List<String>) -> String
+    ? "The first text of a list, or empty."
+    match xs
+        [t, .._] -> t
+        [] -> ""
+
+verify nthText
+    nthText(["a", "b"]) => "a"
+    nthText([]) => ""
+
+fn fromHost(x: Inst, s: Store, t: String, pargs: List<String>) -> Result<Ran, String>
+    ? "A host string made a guest string: its octets are written at address 0 of linear memory, grown if need be, and the module's __rt_string_from_lm wraps them."
+    ! [Console.print, Disk.readBytesAt]
+    viaMemory(x, s, Bytes.octets(String.toUtf8(t)), "__rt_string_from_lm", pargs)
+
+fn viaMemory(x: Inst, s: Store, bs: List<Int>, export: String, pargs: List<String>) -> Result<Ran, String>
+    ? "Writes octets at address 0 of linear memory, grown if need be, and calls the module's export that wraps n octets from there into a value."
+    ! [Console.print, Disk.readBytesAt]
+    n = List.len(bs)
+    fi = Result.fromOption(Exec.exportFunc(x.m, export), "module has no {export}")?
+    s2 = Store.update(s, mem = Exec.writeMem(s.mem, 0, bs), pages = Int.max(s.pages, pagesFor(n)))
+    drive(x, Exec.invoke(x, s2, fi, [Val.I32(n)]), pargs)
+
+fn diskRead(x: Inst, args: List<Val>, s: Store, pargs: List<String>) -> Result<Ran, String>
+    ? "Disk.readBytesAt: the path is a guest string, the offset and length are Aver Ints; the answer is the module's own Result of Bytes, built through its factories."
+    ! [Console.print, Disk.readBytesAt]
+    match args
+        [Val.Ref(p), off, len, .._] -> diskReadAt(x, textAt(s, p)?, guestInt(s, off)?, guestInt(s, len)?, s, pargs)
+        _ -> Result.Err("disk_read_bytes_at: unexpected arguments")
+
+fn diskReadAt(x: Inst, path: String, off: Int, len: Int, s: Store, pargs: List<String>) -> Result<Ran, String>
+    ? "Reads and hands the octets, or the error, back to the guest."
+    ! [Console.print, Disk.readBytesAt]
+    match Disk.readBytesAt(path, off, len)
+        Result.Ok(b) -> bytesViaMemory(x, s, b, pargs)
+        Result.Err(e) -> diskErr(x, s, e, pargs)
+
+fn bytesViaMemory(x: Inst, s: Store, b: Bytes, pargs: List<String>) -> Result<Ran, String>
+    ? "Octets read from disk handed to the guest: written into linear memory straight from the Bytes, then wrapped by the module's Result factory."
+    ! [Console.print, Disk.readBytesAt]
+    n = Bytes.len(b)
+    fi = Result.fromOption(Exec.exportFunc(x.m, "__rt_result_bytes_string_ok_from_lm"), "module has no __rt_result_bytes_string_ok_from_lm")?
+    s2 = Store.update(s, mem = Mem.writeBytes(s.mem, 0, b), pages = Int.max(s.pages, pagesFor(n)))
+    drive(x, Exec.invoke(x, s2, fi, [Val.I32(n)]), pargs)
+
+fn diskErr(x: Inst, s: Store, e: String, pargs: List<String>) -> Result<Ran, String>
+    ? "The guest's Result.Err of a host message."
+    ! [Console.print, Disk.readBytesAt]
+    r = fromHost(x, s, e, pargs)?
+    fi = Result.fromOption(Exec.exportFunc(x.m, "__rt_result_bytes_string_err"), "module has no __rt_result_bytes_string_err")?
+    drive(x, Exec.invoke(x, r.s, fi, r.vs), pargs)
+
+fn guestInt(s: Store, v: Val) -> Result<Int, String>
+    ? "An Aver Int as the guest holds it: a struct of a small value, a magnitude for big ones, and a sign. Only small ones are needed for offsets and lengths."
+    match v
+        Val.Ref(a) -> guestIntOf(Kompost.get(s.heap, a))
+        Val.I64(n) -> Result.Ok(n)
+        _ -> Result.Err("not an Int")
+
+fn guestIntOf(o: Obj) -> Result<Int, String>
+    ? "The small value of a guest Int struct."
+    match o
+        Obj.Free -> Result.Err("not an Int")
+        Obj.Array(_, _) -> Result.Err("not an Int")
+        _ -> guestSmall(Option.Some(Kompost.fieldAt(o, 0)), Option.Some(Kompost.fieldAt(o, 1)))
+
+fn guestSmall(small: Option<Val>, mag: Option<Val>) -> Result<Int, String>
+    ? "The small value, when there is no magnitude."
+    match mag
+        Option.Some(Val.Null) -> Result.Ok(Value.i64(Option.withDefault(small, Val.I64(0))))
+        _ -> Result.Err("Int too large for an offset")
+
+verify guestSmall
+    guestSmall(Option.Some(Val.I64(7)), Option.Some(Val.Null)) => Result.Ok(7)
+    guestSmall(Option.Some(Val.I64(7)), Option.Some(Val.Ref(1))) => Result.Err("Int too large for an offset")
+
+fn pagesFor(n: Int) -> Int
+    ? "The pages of 64 KiB needed to hold n octets."
+    Int.div(n + 65535, 65536)
+
+verify pagesFor
+    pagesFor(1) => 1
+    pagesFor(65537) => 2
+
+fn consolePrint(args: List<Val>, s: Store) -> Result<Ran, String>
+    ? "Prints the string its first argument refers to."
+    ! [Console.print, Disk.readBytesAt]
+    match args
+        [Val.Ref(a), .._] -> printText(textAt(s, a)?, s)
+        _ -> printText("", s)
+
+fn printText(t: String, s: Store) -> Result<Ran, String>
+    ? "Prints a line and answers with no results."
+    ! [Console.print, Disk.readBytesAt]
+    Console.print(t)
+    Result.Ok(Ran(vs = [], s = s))
+
+fn textAt(s: Store, a: Int) -> Result<String, String>
+    ? "The text an array of octets on the heap holds."
+    match Kompost.arr(s.heap, a)
+        Option.Some(vs) -> String.fromUtf8(Bytes.fromList(octetsOf(Arr.toList(vs), []))?)
+        _ -> Result.Err("console_print: not a string")
+
+fn octetsOf(vs: List<Val>, acc: List<Int>) -> List<Int>
+    ? "The octets of an array of i8."
+    match vs
+        [] -> List.reverse(acc)
+        [v, ..rest] -> octetsOf(rest, List.prepend(Value.i32(v), acc))
+
+verify octetsOf
+    octetsOf([Val.I32(104), Val.I32(105)], []) => [104, 105]
+
+fn nthVal(vs: List<Val>) -> Val
+    ? "The first value of a list, or an i64 zero."
+    match vs
+        [v, .._] -> v
+        [] -> Val.I64(0)
+
+verify nthVal
+    nthVal([]) => Val.I64(0)
+    nthVal([Val.I64(3)]) => Val.I64(3)
+
+fn paramsOf(x: Inst, fi: Int) -> List<ValType>
+    ? "The parameter types of function fi."
+    match Vector.get(x.fns, fi)
+        Option.Some(g) -> Ast.funcParams(x.m, g.ty)
+        Option.None -> []
+
+fn arityOk(given: Int, wanted: Int, entry: String) -> Result<Unit, String>
+    ? "Refuses a run whose argument count does not match the export, rather than defaulting the rest."
+    match given == wanted
+        true -> Result.Ok(Unit)
+        false -> Result.Err("{entry} takes {wanted} arguments, {given} given")
+
+verify arityOk
+    arityOk(1, 1, "f") => Result.Ok(Unit)
+    arityOk(0, 1, "f") => Result.Err("f takes 1 arguments, 0 given")
+
+fn showF32(x: Float) -> String
+    ? "An f32 as the shortest decimal that reads back as the same f32, the way engines print it."
+    match Bool.or(x != x, Bool.or(x == 0.0, Float.abs(x) > 3.5e38))
+        true -> "{x}"
+        false -> shortestF32(x, decExp(Float.abs(x), 0), 1)
+
+fn decExp(a: Float, k: Int) -> Int
+    ? "The k with 10^k <= a < 10^(k+1), found by stepping from a guess."
+    match a < Float.pow(10.0, Float.fromInt(k))
+        true -> decExp(a, k - 1)
+        false -> decExpUp(a, k)
+
+fn decExpUp(a: Float, k: Int) -> Int
+    ? "Steps k up while 10^(k+1) is still at most a."
+    match a >= Float.pow(10.0, Float.fromInt(k + 1))
+        true -> decExpUp(a, k + 1)
+        false -> k
+
+fn shortestF32(x: Float, k: Int, digits: Int) -> String
+    ? "x with as few significant digits as read back to it; nine always do."
+    e = k - digits + 1
+    m = Float.round(x / Float.pow(10.0, Float.fromInt(e)))
+    c = Result.withDefault(Float.fromString("{m}e{e}"), x)
+    match Bool.or(Num.roundF32(c) == x, digits >= 9)
+        true -> "{c}"
+        false -> shortestF32(x, k, digits + 1)
+
+verify showF32
+    showF32(77.69999694824219) => "77.7"
+    showF32(1003.1416015625) => "1003.1416"
+    showF32(0.00000011920928955078125) => "0.00000011920929"
+    showF32(-2147483648.0) => "-2147483600"
+    showF32(1.0) => "1"
+    showF32(0.0) => "0"
+
+verify decExp
+    decExp(77.7, 0) => 1
+    decExp(0.5, 0) => -1
+
+verify decExpUp
+    decExpUp(1000.0, 0) => 3
+
+verify shortestF32
+    shortestF32(77.69999694824219, 1, 1) => "77.7"
+
+fn spectestGlobals() -> Map<String, Val>
+    ? "The globals the spec testsuite's host module provides. A reference result prints as nothing: engines compare references by status only."
+    {"spectest.global_i32" => Val.I32(666), "spectest.global_i64" => Val.I64(666), "spectest.global_f32" => Val.F32(Num.roundF32(666.6)), "spectest.global_f64" => Val.F64(666.6)}
+
+verify spectestGlobals
+    Map.get(spectestGlobals(), "spectest.global_i32") => Option.Some(Val.I32(666))
+
+fn checkFile(path: String) -> Result<List<Val>, String>
+    ? "Decodes and validates a module without running it."
+    ! [Disk.readBytes]
+    b = Disk.readBytes(path)?
+    m = Decode.decode(Vector.fromList(Bytes.octets(b)))?
+    ok = invalid(Valid.validate(m))?
+    Result.Ok([])
+
+fn invalid(r: Result<Vector<Shape>, String>) -> Result<Vector<Shape>, String>
+    ? "A validation failure, said to be one."
+    match r
+        Result.Ok(u) -> Result.Ok(u)
+        Result.Err(e) -> Result.Err("invalid module: {e}")
+
+verify invalid
+    invalid(Result.Err("type mismatch")) => Result.Err("invalid module: type mismatch")
+    invalid(Result.Ok(Vector.fromList([]))) => Result.Ok(Vector.fromList([]))

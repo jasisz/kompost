@@ -1,0 +1,34 @@
+module Main
+    intent = "Allocates far more than it keeps, so the heap must be composted."
+    effects [Console.print]
+
+fn build(n: Int, acc: List<Int>) -> List<Int>
+    ? "n down to 1, as a fresh list."
+    match n <= 0
+        true -> acc
+        false -> build(n - 1, List.prepend(n, acc))
+
+verify build
+    build(2, []) => [1, 2]
+
+fn sum(xs: List<Int>, acc: Int) -> Int
+    ? "The sum of a list."
+    match xs
+        [] -> acc
+        [x, ..rest] -> sum(rest, acc + x)
+
+verify sum
+    sum([1, 2], 0) => 3
+
+fn rounds(k: Int, acc: Int) -> Int
+    ? "k rounds of building and summing a list of a thousand."
+    match k <= 0
+        true -> acc
+        false -> rounds(k - 1, acc + sum(build(1000, []), 0))
+
+verify rounds
+    rounds(1, 0) => 500500
+
+fn main() -> Unit
+    ! [Console.print]
+    Console.print("churn {rounds(300, 0)}")

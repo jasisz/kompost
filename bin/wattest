@@ -1,0 +1,20 @@
+#!/bin/sh
+# Hand-written tests in tests/wat: each module's export main runs in
+# Wasmtime (the oracle) and in Kompost; results, or the trap message, must
+# match.
+root=$(cd "$(dirname "$0")/.." && pwd)
+[ -x "$root/.aver-tool/bin/aver" ] && PATH="$root/.aver-tool/bin:$PATH"
+kompost="${KOMPOST:-$root/.build/target/release/kompost}"
+work="$root/.build/wattest"; mkdir -p "$work"
+pass=0; fail=0
+for f in "${@:-$root/tests/wat/*.wat}"; do for w in $f; do
+  name=$(basename "$w" .wat)
+  wasm-tools parse "$w" -o "$work/$name.wasm" || { echo "FAIL $name (does not assemble)"; fail=$((fail+1)); continue; }
+  want=$(sed -n 's/^;; expect: //p' "$w")
+  [ -n "$want" ] || want=$(wasmtime run -W gc=y,function-references=y,tail-call=y --invoke main "$work/$name.wasm" 2>&1 | grep -v '^warning' | sed -n 's/.*wasm trap: \(.*\)/trap: \1/p; /^-\{0,1\}[0-9]/p')
+  got=$("$kompost" --invoke main "$work/$name.wasm" 2>&1 | sed 's/^kompost: //')
+  if [ "$want" = "$got" ]; then pass=$((pass+1)); echo "ok   $name"
+  else fail=$((fail+1)); echo "FAIL $name"; echo "  want: $want" | head -5; echo "  got:  $got" | head -5; fi
+done; done
+echo "$pass passed, $fail failed"
+[ "$fail" = 0 ]

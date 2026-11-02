@@ -1,0 +1,11 @@
+#!/bin/sh
+# Compiles Kompost to a native binary at .build/target/release/kompost.
+# The aver on PATH may point at a deleted aver-rt checkout; .aver-rt holds
+# the runtime of the commit it was installed from (see bin/fetch-rt).
+set -e
+root=$(cd "$(dirname "$0")/.." && pwd)
+[ -x "$root/.aver-tool/bin/aver" ] && PATH="$root/.aver-tool/bin:$PATH"
+export AVER_RUNTIME_PATH="${AVER_RUNTIME_PATH:-$root/.aver-rt/aver-rt}"
+aver compile "$root/src/main.av" --module-root "$root/src" -o "$root/.build" --name kompost >/dev/null
+cd "$root/.build" && cargo build --release -j "${JOBS:-4}" --quiet
+echo "$root/.build/target/release/kompost"

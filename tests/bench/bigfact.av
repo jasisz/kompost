@@ -1,0 +1,23 @@
+module Main
+    intent = "Big integers: a factorial whose digits fill arrays."
+    effects [Console.print]
+
+fn fact(n: Int, acc: Int) -> Int
+    ? "n! times acc."
+    match n <= 1
+        true -> acc
+        false -> fact(n - 1, acc * n)
+
+verify fact
+    fact(5, 1) => 120
+
+fn digits(x: Int) -> Int
+    ? "How many decimal digits x has."
+    String.len(String.fromInt(x))
+
+verify digits
+    digits(120) => 3
+
+fn main() -> Unit
+    ! [Console.print]
+    Console.print("1500! has {digits(fact(1500, 1))} digits")

@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Kompost">
+  <title>Kompost</title>
+  <!-- tile -->
+  <rect x="8" y="8" width="240" height="240" rx="44" fill="#f4ecdc"/>
+  <!-- sprout -->
+  <path d="M128 200 C 128 150, 126 118, 130 92" fill="none" stroke="#3f7d3a" stroke-width="9" stroke-linecap="round"/>
+  <path d="M129 112 C 104 116, 76 104, 64 72 C 98 64, 124 82, 129 112 Z" fill="#5ba84f"/>
+  <path d="M129 112 C 106 104, 86 92, 70 76" fill="none" stroke="#3f7d3a" stroke-width="3.5" stroke-linecap="round"/>
+  <path d="M131 94 C 150 70, 182 58, 204 66 C 200 98, 166 112, 131 94 Z" fill="#7cc46a"/>
+  <path d="M131 94 C 152 86, 176 76, 198 69" fill="none" stroke="#3f7d3a" stroke-width="3.5" stroke-linecap="round"/>
+  <!-- heap: three layers of soil, the darkest at the bottom -->
+  <clipPath id="tile"><rect x="8" y="8" width="240" height="240" rx="44"/></clipPath>
+  <g clip-path="url(#tile)">
+    <path d="M-10 250 C 30 150, 226 150, 266 250 Z" fill="#c9a36b"/>
+    <path d="M-10 262 C 34 178, 222 178, 266 262 Z" fill="#8a5a2b"/>
+    <path d="M-10 274 C 40 206, 216 206, 266 274 Z" fill="#4e3218"/>
+    <!-- bits in the soil: octets rotting into something new -->
+    <rect x="70" y="214" width="14" height="14" rx="3" fill="#c9a36b" transform="rotate(-14 77 221)"/>
+    <rect x="160" y="222" width="12" height="12" rx="3" fill="#c9a36b" transform="rotate(18 166 228)"/>
+    <rect x="118" y="190" width="11" height="11" rx="2.5" fill="#4e3218" transform="rotate(8 123 195)"/>
+    <rect x="186" y="196" width="10" height="10" rx="2.5" fill="#4e3218" transform="rotate(-20 191 201)"/>
+    <rect x="92" y="188" width="9" height="9" rx="2" fill="#8a5a2b" transform="rotate(25 96 192)"/>
+  </g>
+</svg>

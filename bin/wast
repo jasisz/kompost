@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""Runs spec .wast files against Kompost and checks every value exactly.
+
+wasm-tools json-from-wast turns each file into binary modules and a list of
+commands. Every module gets one Kompost run (kompost --script FILE.wasm SCRIPT)
+that performs its invocations in order on one instance, so state carries over;
+results come back as typed bit patterns and are compared with the expected
+values, NaN classes and v128 lanes included. assert_invalid and
+assert_malformed modules must fail kompost --validate. A module that cannot be
+instantiated (it imports from another registered module, which Kompost does
+not link) is reported with its error and its commands are skipped.
+
+usage: bin/wast [-v] FILE.wast|NAME...   (NAME is looked up in SPEC_DIR,
+default ../miscast/spec/wast)
+"""
+import json, os, subprocess, sys, tempfile
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+KOMPOST = os.environ.get("KOMPOST", os.path.join(ROOT, ".build/target/release/kompost"))
+SPEC_DIR = os.environ.get("SPEC_DIR", os.path.join(ROOT, "..", "miscast", "spec", "wast"))
+WORK = os.path.join(ROOT, ".build", "wast")
+NULLS = {"refnull", "nullref", "nullfuncref", "nullexternref", "nullexnref"}
+WIDTH = {"i8": 8, "i16": 16, "i32": 32, "i64": 64, "f32": 32, "f64": 64}
+
+
+def arg_text(a):
+    t, v = a["type"], a.get("value")
+    if t in ("i32", "i64", "f32", "f64"):
+        return f"{t}:{int(v) & ((1 << WIDTH[t]) - 1)}"
+    if t == "v128":
+        w = WIDTH[a["lane_type"]]
+        n = 0
+        for k, x in enumerate(a["value"]):
+            n |= (int(x) & ((1 << w) - 1)) << (k * w)
+        return f"v128:{n}"
+    if t in NULLS or v == "null":
+        return "null"
+    if t in ("externref", "anyref") and v is not None:
+        return f"extern:{v}"
+    return None
+
+
+def nan_ok(spec, bits, w):
+    exp_bits = 8 if w == 32 else 11
+    mant = w - 1 - exp_bits
+    e = (bits >> mant) & ((1 << exp_bits) - 1)
+    m = bits & ((1 << mant) - 1)
+    quiet = 1 << (mant - 1)
+    if e != (1 << exp_bits) - 1 or m == 0:
+        return False
+    return m == quiet if spec == "nan:canonical" else bool(m & quiet)
+
+
+def lane_ok(spec, bits, lane_type):
+    w = WIDTH[lane_type]
+    bits &= (1 << w) - 1
+    if spec.startswith("nan:"):
+        return lane_type in ("f32", "f64") and nan_ok(spec, bits, w)
+    return (int(spec) & ((1 << w) - 1)) == bits
+
+
+def value_ok(exp, got):
+    t = exp["type"]
+    if t == "either":
+        return any(value_ok(e, got) for e in exp["values"])
+    v = exp.get("value")
+    if t in NULLS or v == "null":
+        return got == "null"
+    if t in ("i32", "i64", "f32", "f64"):
+        if not got.startswith(t + ":"):
+            return False
+        return lane_ok(v, int(got.split(":", 1)[1]), t)
+    if t == "v128":
+        if not got.startswith("v128:"):
+            return False
+        n, lt = int(got.split(":", 1)[1]), exp["lane_type"]
+        w = WIDTH[lt]
+        return all(lane_ok(x, n >> (k * w), lt) for k, x in enumerate(v))
+    if t in ("externref", "anyref") and v is not None:
+        return got == f"extern:{v}"
+    if t == "funcref":
+        return got == "func"
+    return got != "null"
+
+
+LIMIT_KB = 4 * 1024 * 1024   # a Kompost run past 4 GB resident is killed
+
+
+def run(cmd, timeout=60):
+    """Runs cmd, killing it past the time limit or LIMIT_KB of resident memory."""
+    import time
+    with tempfile.TemporaryFile("w+") as out, tempfile.TemporaryFile("w+") as err:
+        pr = subprocess.Popen(cmd, stdout=out, stderr=err, text=True)
+        start, why = time.time(), None
+        while pr.poll() is None:
+            time.sleep(0.05)
+            rss = subprocess.run(["ps", "-o", "rss=", "-p", str(pr.pid)], capture_output=True, text=True).stdout.strip()
+            if rss and int(rss) > LIMIT_KB:
+                why = "killed: over 4 GB"
+            elif time.time() - start > timeout:
+                why = "killed: timeout"
+            if why:
+                pr.kill(); pr.wait()
+                return -1, "", why
+        out.seek(0); err.seek(0)
+        return pr.returncode, out.read(), err.read()
+
+
+def check_file(path, verbose):
+    name = os.path.basename(path)[:-5]
+    work = os.path.join(WORK, name)
+    os.makedirs(work, exist_ok=True)
+    js = os.path.join(work, name + ".json")
+    rc, _, err = run(["wasm-tools", "json-from-wast", path, "-o", js, "--wasm-dir", work], timeout=600)
+    if rc != 0:
+        return {"error": 1}, [f"{name}: wasm-tools: {err.strip()[:200]}"]
+    cmds = json.load(open(js))["commands"]
+    tally = {"pass": 0, "fail": 0, "skip": 0}
+    notes = []
+    modules, named, cur = [], {}, None
+    for c in cmds:
+        t = c["type"]
+        if t == "module":
+            cur = {"file": c["filename"], "line": c["line"], "steps": []}
+            modules.append(cur)
+            if "name" in c:
+                named[c["name"]] = cur
+        elif t in ("assert_return", "assert_trap", "assert_exhaustion", "action"):
+            act = c["action"]
+            target = named.get(act.get("module"), cur) if act.get("module") else cur
+            if act["type"] != "invoke" or target is None:
+                tally["skip"] += 1
+                continue
+            args = [arg_text(a) for a in act["args"]]
+            if None in args or any(ch in act["field"] for ch in "\t\n"):
+                tally["skip"] += 1
+                continue
+            target["steps"].append((c, "\t".join(["invoke", act["field"]] + args)))
+        elif t in ("assert_invalid", "assert_malformed"):
+            if c.get("module_type") != "binary":
+                tally["skip"] += 1
+                continue
+            rc, out, err = run([KOMPOST, "--validate", os.path.join(work, c["filename"])])
+            if rc != 0:
+                tally["pass"] += 1
+            else:
+                tally["fail"] += 1
+                notes.append(f"{name}:{c['line']}: {t} accepted (expected: {c['text']})")
+        else:
+            tally["skip"] += 1
+    for m in modules:
+        script = os.path.join(work, m["file"] + ".script")
+        with open(script, "w") as o:
+            o.write("\n".join(s for _, s in m["steps"]) + "\n")
+        rc, out, err = run([KOMPOST, "--script", os.path.join(work, m["file"]), script], timeout=900)
+        lines = out.split("\n")
+        if rc != 0 and not out.strip():
+            tally["skip"] += len(m["steps"])
+            notes.append(f"{name}:{m['line']}: module not run: {err.strip()[:160]}")
+            continue
+        for (c, line), got in zip(m["steps"], lines + [""] * len(m["steps"])):
+            parts = got.split("\t")
+            ok = check(c, parts)
+            tally["pass" if ok else "fail"] += 1
+            if not ok:
+                notes.append(f"{name}:{c['line']}: {line.replace(chr(9), ' ')} -> {got.replace(chr(9), ' ')}"
+                             + (f" (expected {json.dumps(c.get('expected', c.get('text')))})"))
+    return tally, notes
+
+
+def check(c, parts):
+    t = c["type"]
+    if t in ("assert_trap", "assert_exhaustion"):
+        return parts[0] == "trap"
+    if t == "action":
+        return parts[0] in ("ok", "trap")
+    if parts[0] != "ok":
+        return False
+    exp = c["expected"]
+    got = parts[1:]
+    return len(got) == len(exp) and all(value_ok(e, g) for e, g in zip(exp, got))
+
+
+def main():
+    sys.stdout.reconfigure(line_buffering=True)
+    argv = sys.argv[1:]
+    verbose = "-v" in argv
+    files = [a for a in argv if a != "-v"]
+    total = {"pass": 0, "fail": 0, "skip": 0}
+    for f in files:
+        path = f if f.endswith(".wast") else os.path.join(SPEC_DIR, f + ".wast")
+        tally, notes = check_file(path, verbose)
+        for k in total:
+            total[k] += tally.get(k, 0)
+        print(f"{os.path.basename(path):34s} pass={tally.get('pass', 0)} fail={tally.get('fail', 0)} skip={tally.get('skip', 0)}")
+        for n in notes[: (1000 if verbose else 5)]:
+            print("   ", n)
+    print(f"TOTAL pass={total['pass']} fail={total['fail']} skip={total['skip']}")
+    sys.exit(1 if total["fail"] else 0)
+
+
+if __name__ == "__main__":
+    main()

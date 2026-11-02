@@ -1,0 +1,421 @@
+module Kompost
+    intent =
+        "The heap and its garbage collector: what nothing reachable refers to"
+        "rots back into free addresses. Objects sit in slots, in chunks of 65536"
+        "kept in a map from chunk number to a Vector, so reading one is an index"
+        "and writing one takes its chunk out of the map, writes it in place and"
+        "puts it back. A struct of up to four fields holds them in its own node"
+        "(S0 to S4), a larger one in a Vector. An array's object holds only its"
+        "type and length; its elements live in their own map (address to Arr),"
+        "since taking a collection out of a sum held in a map copies it on the"
+        "next write. A collection marks from the roots, then frees every"
+        "unmarked slot in place and puts its address on the free list, which"
+        "allocation takes from first: a freed address is unreachable, so"
+        "reusing it cannot be told apart from a fresh one."
+    exposes [Obj, Heap, Placed, empty, get, arr, alloc, nextAddr, allocAt, put, setElem, setElems, mkStruct, fieldAt, withField, fieldsOf, typeOf, collect]
+    depends [Value, Arr]
+    effects []
+
+type Obj
+    Free
+    Struct(Int, Vector<Val>)
+    S0(Int)
+    S1(Int, Val)
+    S2(Int, Val, Val)
+    S3(Int, Val, Val, Val)
+    S4(Int, Val, Val, Val, Val)
+    Array(Int, Int)
+
+record Heap
+    chunks: Map<Int, Vector<Obj>>
+    arrs: Map<Int, Arr>
+    free: List<Int>
+    next: Int
+    live: Int
+
+record Placed
+    h: Heap
+    a: Int
+
+fn empty() -> Heap
+    ? "A heap with nothing on it."
+    Heap(chunks = {}, arrs = {}, free = [], next = 0, live = 0)
+
+verify empty
+    empty().live => 0
+
+// ---- structs ----
+
+fn mkStruct(t: Int, vs: List<Val>) -> Obj
+    ? "A struct of type t with the given fields, inline when there are at most four."
+    match vs
+        [] -> Obj.S0(t)
+        [a] -> Obj.S1(t, a)
+        [a, b] -> Obj.S2(t, a, b)
+        [a, b, c] -> Obj.S3(t, a, b, c)
+        [a, b, c, d] -> Obj.S4(t, a, b, c, d)
+        _ -> Obj.Struct(t, Vector.fromList(vs))
+
+verify mkStruct
+    mkStruct(1, [Val.I32(2)]) => Obj.S1(1, Val.I32(2))
+    mkStruct(1, [Val.Null, Val.Null, Val.Null, Val.Null, Val.Null]) => Obj.Struct(1, Vector.fromList([Val.Null, Val.Null, Val.Null, Val.Null, Val.Null]))
+
+fn fieldsOf(o: Obj) -> List<Val>
+    ? "A struct's fields in order; none for anything else."
+    match o
+        Obj.S0(_) -> []
+        Obj.S1(_, a) -> [a]
+        Obj.S2(_, a, b) -> [a, b]
+        Obj.S3(_, a, b, c) -> [a, b, c]
+        Obj.S4(_, a, b, c, d) -> [a, b, c, d]
+        Obj.Struct(_, vs) -> List.fromVector(vs)
+        _ -> []
+
+verify fieldsOf
+    fieldsOf(Obj.S2(0, Val.I32(1), Val.Null)) => [Val.I32(1), Val.Null]
+    fieldsOf(Obj.Free) => []
+
+fn fieldAt(o: Obj, k: Int) -> Val
+    ? "Field k of a struct, null when there is none."
+    match o
+        Obj.S1(_, a) -> a
+        Obj.S2(_, a, b) -> pick2(k, a, b)
+        Obj.S3(_, a, b, c) -> pick3(k, a, b, c)
+        Obj.S4(_, a, b, c, d) -> pick4(k, a, b, c, d)
+        Obj.Struct(_, vs) -> Option.withDefault(Vector.get(vs, k), Val.Null)
+        _ -> Val.Null
+
+fn pick2(k: Int, a: Val, b: Val) -> Val
+    ? "The k-th of two."
+    match k
+        0 -> a
+        _ -> b
+
+fn pick3(k: Int, a: Val, b: Val, c: Val) -> Val
+    ? "The k-th of three."
+    match k
+        0 -> a
+        1 -> b
+        _ -> c
+
+fn pick4(k: Int, a: Val, b: Val, c: Val, d: Val) -> Val
+    ? "The k-th of four."
+    match k
+        0 -> a
+        1 -> b
+        2 -> c
+        _ -> d
+
+verify fieldAt
+    fieldAt(Obj.S3(0, Val.I32(1), Val.I32(2), Val.I32(3)), 1) => Val.I32(2)
+    fieldAt(Obj.Struct(0, Vector.fromList([Val.I32(7)])), 0) => Val.I32(7)
+    fieldAt(Obj.Free, 0) => Val.Null
+
+verify pick2
+    pick2(1, Val.I32(1), Val.I32(2)) => Val.I32(2)
+
+verify pick3
+    pick3(2, Val.I32(1), Val.I32(2), Val.I32(3)) => Val.I32(3)
+
+verify pick4
+    pick4(3, Val.I32(1), Val.I32(2), Val.I32(3), Val.I32(4)) => Val.I32(4)
+
+fn withField(o: Obj, k: Int, v: Val) -> Obj
+    ? "The struct with field k replaced."
+    match o
+        Obj.Struct(t, vs) -> Obj.Struct(t, Option.withDefault(Vector.set(vs, k, v), vs))
+        _ -> mkStruct(typeOf(o), replaced(fieldsOf(o), k, v, []))
+
+fn replaced(vs: List<Val>, k: Int, v: Val, acc: List<Val>) -> List<Val>
+    ? "vs with element k replaced by v."
+    match vs
+        [] -> List.reverse(acc)
+        [a, ..rest] -> replaced(rest, k - 1, v, List.prepend(pickFirst(k == 0, v, a), acc))
+
+fn pickFirst(c: Bool, a: Val, b: Val) -> Val
+    ? "a when c holds, else b."
+    match c
+        true -> a
+        false -> b
+
+verify withField
+    withField(Obj.S2(5, Val.I32(1), Val.I32(2)), 1, Val.Null) => Obj.S2(5, Val.I32(1), Val.Null)
+    withField(Obj.Struct(5, Vector.fromList([Val.I32(1)])), 0, Val.Null) => Obj.Struct(5, Vector.fromList([Val.Null]))
+
+verify replaced
+    replaced([Val.I32(1), Val.I32(2)], 0, Val.Null, []) => [Val.Null, Val.I32(2)]
+
+verify pickFirst
+    pickFirst(false, Val.Null, Val.I32(1)) => Val.I32(1)
+
+fn typeOf(o: Obj) -> Int
+    ? "The type index of an object, -1 for a free slot."
+    match o
+        Obj.Free -> -1
+        Obj.Struct(t, _) -> t
+        Obj.S0(t) -> t
+        Obj.S1(t, _) -> t
+        Obj.S2(t, _, _) -> t
+        Obj.S3(t, _, _, _) -> t
+        Obj.S4(t, _, _, _, _) -> t
+        Obj.Array(t, _) -> t
+
+verify typeOf
+    typeOf(Obj.S0(4)) => 4
+    typeOf(Obj.Free) => -1
+    typeOf(Obj.Array(2, 9)) => 2
+
+// ---- slots ----
+
+fn get(h: Heap, a: Int) -> Obj
+    ? "The object at address a, Free when there is none."
+    match Map.get(h.chunks, Int.div(a, 65536))
+        Option.Some(c) -> Option.withDefault(Vector.get(c, Int.mod(a, 65536)), Obj.Free)
+        Option.None -> Obj.Free
+
+fn arr(h: Heap, a: Int) -> Option<Arr>
+    ? "The elements of the array at a."
+    Map.get(h.arrs, a)
+
+fn chunkOf(o: Option<Vector<Obj>>) -> Vector<Obj>
+    ? "A chunk, or a fresh one of free slots."
+    match o
+        Option.Some(c) -> c
+        Option.None -> Vector.new(65536, Obj.Free)
+
+fn setSlot(chunks: Map<Int, Vector<Obj>>, a: Int, o: Obj) -> Map<Int, Vector<Obj>>
+    ? "The chunks with slot a holding o; the chunk is taken out of the map, written in place and put back."
+    ci = Int.div(a, 65536)
+    c = chunkOf(Map.get(chunks, ci))
+    Map.set(Map.remove(chunks, ci), ci, Option.withDefault(Vector.set(c, Int.mod(a, 65536), o), c))
+
+fn put(h: Heap, a: Int, o: Obj) -> Heap
+    ? "The heap with the object at a replaced."
+    Heap.update(h, chunks = setSlot(h.chunks, a, o))
+
+fn alloc(h: Heap, o: Obj, elems: Option<Arr>) -> Placed
+    ? "A new object, at a freed address when there is one, and an array's elements beside it."
+    match h.free
+        [a, ..rest] -> placeAt(Heap.update(h, free = rest), a, o, elems)
+        [] -> allocFresh(h, o, elems)
+
+fn nextAddr(h: Heap) -> Int
+    ? "The address the next allocation takes: a freed one when there is one, else a fresh one."
+    match h.free
+        [a, .._] -> a
+        [] -> h.next
+
+fn allocAt(h: Heap, a: Int, o: Obj, elems: Option<Arr>) -> Heap
+    ? "The heap with o at a, the address nextAddr gave; for callers that must not hold the heap twice."
+    match h.free
+        [_, ..rest] -> placeAt(Heap.update(h, free = rest), a, o, elems).h
+        [] -> placeAt(Heap.update(h, next = a + 1), a, o, elems).h
+
+verify nextAddr
+    nextAddr(empty()) => 0
+    nextAddr(Heap.update(empty(), free = [4])) => 4
+
+verify allocAt
+    get(allocAt(empty(), 0, Obj.S0(3), Option.None), 0) => Obj.S0(3)
+
+fn allocFresh(h: Heap, o: Obj, elems: Option<Arr>) -> Placed
+    ? "A new object at the next address never used. The address is read before the heap is handed on, so the heap is moved, not cloned."
+    a = h.next
+    placeAt(Heap.update(h, next = a + 1), a, o, elems)
+
+verify allocFresh
+    allocFresh(empty(), Obj.S0(1), Option.None).a => 0
+
+fn placeAt(h: Heap, a: Int, o: Obj, elems: Option<Arr>) -> Placed
+    ? "Puts the object at a."
+    Placed(h = Heap.update(h, chunks = setSlot(h.chunks, a, o), arrs = putArr(h.arrs, a, elems), live = h.live + 1), a = a)
+
+fn putArr(arrs: Map<Int, Arr>, a: Int, elems: Option<Arr>) -> Map<Int, Arr>
+    ? "The arrays with a new array's elements at a."
+    match elems
+        Option.Some(e) -> Map.set(arrs, a, e)
+        Option.None -> arrs
+
+verify get
+    get(empty(), 3) => Obj.Free
+    get(alloc(empty(), Obj.S0(1), Option.None).h, 0) => Obj.S0(1)
+
+verify arr
+    arr(empty(), 0) => Option.None
+
+verify chunkOf
+    Vector.len(chunkOf(Option.None)) => 65536
+
+verify setSlot
+    Map.len(setSlot({}, 70000, Obj.S0(1))) => 1
+
+verify put
+    get(put(empty(), 2, Obj.S0(7)), 2) => Obj.S0(7)
+
+verify alloc
+    alloc(alloc(empty(), Obj.S0(1), Option.None).h, Obj.S0(2), Option.None).a => 1
+    alloc(Heap.update(empty(), free = [5]), Obj.S0(1), Option.None).a => 5
+
+verify placeAt
+    placeAt(empty(), 0, Obj.S0(1), Option.None).h.live => 1
+
+verify putArr
+    Map.len(putArr({}, 1, Option.Some(Arr.Flat(Vector.fromList([]))))) => 1
+
+// ---- array elements ----
+
+fn arrOf(o: Option<Arr>) -> Arr
+    ? "The elements found, handed on whole."
+    match o
+        Option.Some(e) -> e
+        Option.None -> Arr.Flat(Vector.fromList([]))
+
+fn setElem(h: Heap, a: Int, k: Int, v: Val) -> Heap
+    ? "The heap with element k of the array at a replaced; the elements leave their map while they are written, so the write is in place."
+    Heap.update(h, arrs = writeArr(h.arrs, a, k, v))
+
+fn writeArr(arrs: Map<Int, Arr>, a: Int, k: Int, v: Val) -> Map<Int, Arr>
+    ? "Writes element k of the array at a."
+    e = arrOf(Map.get(arrs, a))
+    Map.set(Map.remove(arrs, a), a, written(Arr.set(e, k, v)))
+
+fn written(r: Option<Arr>) -> Arr
+    ? "An array after a write the caller checked was in bounds."
+    match r
+        Option.Some(e) -> e
+        Option.None -> Arr.Flat(Vector.fromList([]))
+
+fn setElems(h: Heap, a: Int, k: Int, vs: List<Val>) -> Heap
+    ? "The heap with vs written into the array at a from element k, in place."
+    Heap.update(h, arrs = writeArrList(h.arrs, a, k, vs))
+
+fn writeArrList(arrs: Map<Int, Arr>, a: Int, k: Int, vs: List<Val>) -> Map<Int, Arr>
+    ? "Writes vs into the array at a from element k."
+    e = arrOf(Map.get(arrs, a))
+    Map.set(Map.remove(arrs, a), a, Arr.writeList(e, k, vs))
+
+verify arrOf
+    arrOf(Option.None) => Arr.Flat(Vector.fromList([]))
+
+verify setElem
+    arr(setElem(Heap.update(empty(), arrs = {0 => Arr.Flat(Vector.fromList([Val.Null]))}), 0, 0, Val.I32(1)), 0) => Option.Some(Arr.Flat(Vector.fromList([Val.I32(1)])))
+
+verify writeArr
+    writeArr({0 => Arr.Flat(Vector.fromList([Val.Null]))}, 0, 0, Val.I32(1)) => {0 => Arr.Flat(Vector.fromList([Val.I32(1)]))}
+
+verify written
+    written(Option.None) => Arr.Flat(Vector.fromList([]))
+
+verify setElems
+    arr(setElems(Heap.update(empty(), arrs = {0 => Arr.Flat(Vector.fromList([Val.Null, Val.Null]))}), 0, 1, [Val.I32(2)]), 0) => Option.Some(Arr.Flat(Vector.fromList([Val.Null, Val.I32(2)])))
+
+verify writeArrList
+    writeArrList({0 => Arr.Flat(Vector.fromList([Val.Null]))}, 0, 0, [Val.I32(2)]) => {0 => Arr.Flat(Vector.fromList([Val.I32(2)]))}
+
+// ---- the collector ----
+
+fn collect(h: Heap, roots: List<Val>) -> Heap
+    ? "The heap with every object the roots cannot reach freed."
+    sweepChunks(h, mark(h, roots, {}), Map.keys(h.chunks))
+
+verify collect
+    collect(alloc(alloc(empty(), Obj.S0(1), Option.None).h, Obj.S1(1, Val.Ref(0)), Option.None).h, [Val.Ref(1)]).live => 2
+    collect(alloc(alloc(empty(), Obj.S0(1), Option.None).h, Obj.S0(1), Option.None).h, [Val.Ref(1)]).free => [0]
+    collect(alloc(empty(), Obj.Array(1, 1), Option.Some(Arr.Flat(Vector.fromList([Val.Null])))).h, []).arrs => {}
+
+verify collect law keepsRoots
+    given a: Int = [0, 1, 2]
+    get(collect(alloc(alloc(alloc(empty(), Obj.S0(1), Option.None).h, Obj.S1(1, Val.Ref(0)), Option.None).h, Obj.S0(1), Option.None).h, [Val.Ref(a)]), a) != Obj.Free => true
+
+fn mark(h: Heap, todo: List<Val>, seen: Map<Int, Unit>) -> Map<Int, Unit>
+    ? "Every address reachable from the values still to visit, added to seen."
+    match todo
+        [] -> seen
+        [Val.Ref(a), ..rest] -> markRef(h, a, rest, seen)
+        [_, ..rest] -> mark(h, rest, seen)
+
+fn markRef(h: Heap, a: Int, rest: List<Val>, seen: Map<Int, Unit>) -> Map<Int, Unit>
+    ? "Visits the object at a unless it was already seen."
+    match Map.has(seen, a)
+        true -> mark(h, rest, seen)
+        false -> mark(h, pushRefs(children(h, a), rest), Map.set(seen, a, Unit))
+
+fn children(h: Heap, a: Int) -> List<Val>
+    ? "The values the object at a holds: a struct's fields, an array's elements (none for a packed one, which holds numbers)."
+    match get(h, a)
+        Obj.Array(_, _) -> arrRefs(arr(h, a))
+        o -> fieldsOf(o)
+
+fn arrRefs(o: Option<Arr>) -> List<Val>
+    ? "The elements of an array that may hold references."
+    match o
+        Option.Some(Arr.Packed(_, _, _)) -> []
+        Option.Some(e) -> Arr.toList(e)
+        Option.None -> []
+
+fn pushRefs(vs: List<Val>, todo: List<Val>) -> List<Val>
+    ? "The references among vs in front of todo; other values are dropped here so the work list holds only references."
+    match vs
+        [] -> todo
+        [Val.Ref(a), ..rest] -> pushRefs(rest, List.prepend(Val.Ref(a), todo))
+        [_, ..rest] -> pushRefs(rest, todo)
+
+fn sweepChunks(h: Heap, seen: Map<Int, Unit>, cis: List<Int>) -> Heap
+    ? "Frees the unmarked slots of every chunk."
+    match cis
+        [] -> h
+        [ci, ..rest] -> sweepChunks(sweepChunk(h, seen, ci), seen, rest)
+
+fn sweepChunk(h: Heap, seen: Map<Int, Unit>, ci: Int) -> Heap
+    ? "Frees the unmarked slots of chunk ci; the chunk is taken out of the map while it is swept."
+    c = chunkOf(Map.get(h.chunks, ci))
+    r = sweepSlots(c, seen, ci * 65536, 0, Int.min(65536, h.next - ci * 65536), h.free, h.arrs, 0)
+    Heap.update(h, chunks = Map.set(Map.remove(h.chunks, ci), ci, r.c), free = r.free, arrs = r.arrs, live = h.live - r.freed)
+
+record Swept
+    c: Vector<Obj>
+    free: List<Int>
+    arrs: Map<Int, Arr>
+    freed: Int
+
+fn sweepSlots(c: Vector<Obj>, seen: Map<Int, Unit>, base: Int, k: Int, n: Int, free: List<Int>, arrs: Map<Int, Arr>, freed: Int) -> Swept
+    ? "Frees slots k..n of a chunk whose first address is base."
+    match k >= n
+        true -> Swept(c = c, free = free, arrs = arrs, freed = freed)
+        false -> sweepSlot(c, seen, base, k, n, free, arrs, freed, Option.withDefault(Vector.get(c, k), Obj.Free))
+
+fn sweepSlot(c: Vector<Obj>, seen: Map<Int, Unit>, base: Int, k: Int, n: Int, free: List<Int>, arrs: Map<Int, Arr>, freed: Int, o: Obj) -> Swept
+    ? "Frees slot k when it holds an object nothing marked."
+    match Bool.or(o == Obj.Free, Map.has(seen, base + k))
+        true -> sweepSlots(c, seen, base, k + 1, n, free, arrs, freed)
+        false -> sweepSlots(Option.withDefault(Vector.set(c, k, Obj.Free), c), seen, base, k + 1, n, List.prepend(base + k, free), Map.remove(arrs, base + k), freed + 1)
+
+verify mark
+    mark(alloc(empty(), Obj.S1(0, Val.Ref(0)), Option.None).h, [Val.Ref(0)], {}) => {0 => Unit}
+    mark(empty(), [Val.I32(1)], {}) => {}
+
+verify markRef
+    markRef(empty(), 3, [], {3 => Unit}) => {3 => Unit}
+
+verify children
+    children(alloc(empty(), Obj.Array(0, 1), Option.Some(Arr.Flat(Vector.fromList([Val.Null])))).h, 0) => [Val.Null]
+    children(empty(), 0) => []
+
+verify arrRefs
+    arrRefs(Option.Some(Arr.Packed({}, 0, 8))) => []
+    arrRefs(Option.None) => []
+
+verify pushRefs
+    pushRefs([Val.I32(1), Val.Ref(4)], []) => [Val.Ref(4)]
+
+verify sweepChunks
+    sweepChunks(empty(), {}, []).live => 0
+
+verify sweepChunk
+    sweepChunk(alloc(empty(), Obj.S0(1), Option.None).h, {}, 0).live => 0
+
+verify sweepSlots
+    sweepSlots(Vector.fromList([Obj.S0(1)]), {0 => Unit}, 0, 0, 1, [], {}, 0).freed => 0
+
+verify sweepSlot
+    sweepSlot(Vector.fromList([Obj.S0(1)]), {}, 0, 0, 1, [], {}, 0, Obj.S0(1)).free => [0]

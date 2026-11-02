@@ -1,0 +1,7 @@
+.build/
+target/
+*.wasm
+!tests/wasm/*.wasm
+.aver-rt/
+.aver-tool/
+.DS_Store

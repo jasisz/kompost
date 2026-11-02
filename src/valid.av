@@ -1,0 +1,2089 @@
+module Valid
+    intent =
+        "Validation: a module is refused before anything runs when its types,"
+        "constant expressions or function bodies do not type-check. Bodies are"
+        "checked with the algorithm of the specification's appendix: a stack of"
+        "operand types where an unknown type stands for anything after"
+        "unreachable code, and a stack of control frames. Reference types follow"
+        "the GC proposal's subtyping, with concrete types compared through their"
+        "declared supertypes and iso-recursive canonicalization."
+    exposes [validate, valSub, heapSub]
+    depends [Ast, Simd]
+    effects []
+
+type Opd
+    T(ValType)
+    Bot
+
+record Ctrl
+    kind: Int
+    start: List<ValType>
+    end: List<ValType>
+    height: Int
+    unreach: Bool
+    inits: Map<Int, Unit>
+
+record V
+    stack: List<Opd>
+    height: Int
+    ctrls: List<Ctrl>
+    inits: Map<Int, Unit>
+    maxH: Int
+
+record PV
+    o: Opd
+    v: V
+
+record Cx
+    m: Module
+    locals: Vector<ValType>
+    ret: List<ValType>
+    fnTypes: Vector<Int>
+    refs: Map<Int, Unit>
+    globals: Vector<Global>
+    tables: Vector<ValType>
+    elemTypes: Vector<ValType>
+
+// ---- types and subtyping ----
+
+fn i32t() -> ValType
+    ? "The i32 type, for brevity."
+    ValType.I32
+
+verify i32t
+    i32t() => ValType.I32
+
+fn unpacked(t: ValType) -> ValType
+    ? "A storage type as the value type it reads as."
+    match t
+        ValType.I8 -> ValType.I32
+        ValType.I16 -> ValType.I32
+        _ -> t
+
+verify unpacked
+    unpacked(ValType.I8) => ValType.I32
+    unpacked(ValType.I64) => ValType.I64
+
+fn defaultable(t: ValType) -> Bool
+    ? "Whether a type has a default value: numbers and nullable references."
+    match t
+        ValType.Ref(n, _) -> n
+        _ -> true
+
+verify defaultable
+    defaultable(ValType.Ref(false, -18)) => false
+    defaultable(ValType.Ref(true, -18)) => true
+    defaultable(ValType.F64) => true
+
+fn isRef(t: ValType) -> Bool
+    ? "Whether a type is a reference type."
+    match t
+        ValType.Ref(_, _) -> true
+        _ -> false
+
+verify isRef
+    isRef(ValType.Ref(true, 0)) => true
+    isRef(ValType.I32) => false
+
+fn compOf(m: Module, t: Int) -> Option<Comp>
+    ? "The composite type at index t, when t is in range."
+    match Vector.get(m.types, t)
+        Option.Some(st) -> Option.Some(st.comp)
+        Option.None -> Option.None
+
+verify compOf
+    compOf(Ast.emptyModule(), 0) => Option.None
+
+fn kindOf(m: Module, t: Int) -> Int
+    ? "0 for a function type, 1 for a struct, 2 for an array, -1 for no type."
+    match compOf(m, t)
+        Option.Some(Comp.FuncT(_, _)) -> 0
+        Option.Some(Comp.StructT(_)) -> 1
+        Option.Some(Comp.ArrayT(_)) -> 2
+        Option.None -> -1
+
+verify kindOf
+    kindOf(Ast.emptyModule(), 0) => -1
+
+fn top(m: Module, h: Int) -> Int
+    ? "The top of the hierarchy a heap type belongs to: func, extern, any or exn."
+    match h >= 0
+        true -> topConcrete(kindOf(m, h))
+        false -> topAbstract(h)
+
+fn topConcrete(k: Int) -> Int
+    ? "The top of a concrete type's hierarchy."
+    match k
+        0 -> -16
+        _ -> -18
+
+fn topAbstract(h: Int) -> Int
+    ? "The top of an abstract type's hierarchy; the codes are matched negated."
+    match 0 - h
+        16 -> -16
+        13 -> -16
+        17 -> -17
+        14 -> -17
+        23 -> -23
+        12 -> -23
+        _ -> -18
+
+verify top
+    top(Ast.emptyModule(), -13) => -16
+    top(Ast.emptyModule(), -20) => -18
+    top(Ast.emptyModule(), -14) => -17
+
+verify topConcrete
+    topConcrete(0) => -16
+    topConcrete(1) => -18
+
+verify topAbstract
+    topAbstract(-12) => -23
+    topAbstract(-15) => -18
+
+fn bottom(t: Int) -> Int
+    ? "The bottom of the hierarchy with top t."
+    match 0 - t
+        16 -> -13
+        17 -> -14
+        23 -> -12
+        _ -> -15
+
+verify bottom
+    bottom(-16) => -13
+    bottom(-18) => -15
+
+fn canonOf(m: Module, t: Int) -> Int
+    ? "The canonical index of type t."
+    Option.withDefault(Vector.get(m.canon, t), t)
+
+verify canonOf
+    canonOf(Ast.emptyModule(), 3) => 3
+
+fn superOf(m: Module, t: Int) -> Int
+    ? "The declared supertype of type t, or -1."
+    match Vector.get(m.types, t)
+        Option.Some(st) -> firstOr(st.supers, -1)
+        Option.None -> -1
+
+fn firstOr(xs: List<Int>, d: Int) -> Int
+    ? "The first of a list, or d."
+    match xs
+        [x, .._] -> x
+        [] -> d
+
+verify superOf
+    superOf(Ast.emptyModule(), 0) => -1
+
+verify firstOr
+    firstOr([4], 0) => 4
+    firstOr([], 7) => 7
+
+fn concreteSub(m: Module, a: Int, b: Int, fuel: Int) -> Bool
+    ? "Whether concrete type a is b, up to canonicalization, or reaches it through declared supertypes."
+    match canonOf(m, a) == canonOf(m, b)
+        true -> true
+        false -> concreteSubUp(m, superOf(m, a), b, fuel)
+
+fn concreteSubUp(m: Module, s: Int, b: Int, fuel: Int) -> Bool
+    ? "Continues concreteSub from a's supertype s."
+    match Bool.or(s < 0, fuel <= 0)
+        true -> false
+        false -> concreteSub(m, s, b, fuel - 1)
+
+verify concreteSub
+    concreteSub(Ast.emptyModule(), 1, 1, 64) => true
+    concreteSub(Module.update(Ast.emptyModule(), types = Vector.fromList([SubType(comp = Comp.StructT(Vector.fromList([])), supers = [], final = false, group = 0, muts = []), SubType(comp = Comp.StructT(Vector.fromList([])), supers = [0], final = true, group = 1, muts = [])])), 1, 0, 64) => true
+
+verify concreteSubUp
+    concreteSubUp(Ast.emptyModule(), -1, 0, 64) => false
+
+fn heapSub(m: Module, a: Int, b: Int) -> Bool
+    ? "Whether heap type a is a subtype of heap type b."
+    match a == b
+        true -> true
+        false -> heapSubDiff(m, a, b)
+
+fn heapSubDiff(m: Module, a: Int, b: Int) -> Bool
+    ? "heapSub for two different heap types."
+    match Bool.and(a >= 0, b >= 0)
+        true -> concreteSub(m, a, b, 64)
+        false -> heapSubAbstract(m, a, b)
+
+fn heapSubAbstract(m: Module, a: Int, b: Int) -> Bool
+    ? "heapSub when at least one side is abstract: the bottom is below its whole hierarchy, the top above it, and the GC tower eq over i31, struct and array."
+    match top(m, a) == top(m, b)
+        false -> false
+        true -> heapSubSame(m, a, b)
+
+fn heapSubSame(m: Module, a: Int, b: Int) -> Bool
+    ? "heapSub inside one hierarchy."
+    match Bool.or(a == bottom(top(m, a)), b == top(m, b))
+        true -> true
+        false -> heapSubTower(m, a, b)
+
+fn heapSubTower(m: Module, a: Int, b: Int) -> Bool
+    ? "The remaining rules: eq over i31, struct, array and the concrete structs and arrays; struct over concrete structs; array over concrete arrays; func over concrete functions."
+    k = absKind(m, a)
+    match 0 - b
+        19 -> Bool.or(k == -20, Bool.or(k == -21, k == -22))
+        21 -> Bool.and(a >= 0, k == -21)
+        22 -> Bool.and(a >= 0, k == -22)
+        16 -> Bool.and(a >= 0, k == -16)
+        _ -> false
+
+fn absKind(m: Module, a: Int) -> Int
+    ? "The abstract type a concrete type sits directly under (func, struct or array); an abstract type itself."
+    match a >= 0
+        false -> a
+        true -> absOfKind(kindOf(m, a))
+
+fn absOfKind(k: Int) -> Int
+    ? "func, struct or array by composite kind."
+    match k
+        0 -> -16
+        1 -> -21
+        _ -> -22
+
+verify heapSub
+    heapSub(Ast.emptyModule(), -20, -18) => true
+    heapSub(Ast.emptyModule(), -20, -19) => true
+    heapSub(Ast.emptyModule(), -19, -20) => false
+    heapSub(Ast.emptyModule(), -15, -21) => true
+    heapSub(Ast.emptyModule(), -13, -18) => false
+    heapSub(Ast.emptyModule(), -14, -17) => true
+    heapSub(Module.update(Ast.emptyModule(), types = Vector.fromList([SubType(comp = Comp.StructT(Vector.fromList([])), supers = [], final = true, group = 0, muts = [])])), 0, -19) => true
+    heapSub(Module.update(Ast.emptyModule(), types = Vector.fromList([SubType(comp = Comp.FuncT([], []), supers = [], final = true, group = 0, muts = [])])), 0, -18) => false
+    heapSub(Module.update(Ast.emptyModule(), types = Vector.fromList([SubType(comp = Comp.FuncT([], []), supers = [], final = true, group = 0, muts = [])])), -13, 0) => true
+
+verify heapSubDiff
+    heapSubDiff(Ast.emptyModule(), -21, -19) => true
+
+verify heapSubAbstract
+    heapSubAbstract(Ast.emptyModule(), -16, -18) => false
+
+verify heapSubSame
+    heapSubSame(Ast.emptyModule(), -22, -18) => true
+
+verify heapSubTower
+    heapSubTower(Ast.emptyModule(), -21, -19) => true
+    heapSubTower(Ast.emptyModule(), -19, -21) => false
+
+verify absKind
+    absKind(Ast.emptyModule(), -20) => -20
+
+verify absOfKind
+    absOfKind(0) => -16
+    absOfKind(1) => -21
+    absOfKind(2) => -22
+
+fn valSub(m: Module, a: ValType, b: ValType) -> Bool
+    ? "Whether value type a is a subtype of b: numbers by equality, references by nullability and heap type."
+    match a
+        ValType.Ref(na, ha) -> refSub(m, na, ha, b)
+        _ -> a == b
+
+fn refSub(m: Module, na: Bool, ha: Int, b: ValType) -> Bool
+    ? "Whether reference type (na, ha) is a subtype of b."
+    match b
+        ValType.Ref(nb, hb) -> Bool.and(Bool.or(nb, Bool.not(na)), heapSub(m, ha, hb))
+        _ -> false
+
+verify valSub
+    valSub(Ast.emptyModule(), ValType.I32, ValType.I32) => true
+    valSub(Ast.emptyModule(), ValType.I32, ValType.I64) => false
+    valSub(Ast.emptyModule(), ValType.Ref(false, -20), ValType.Ref(true, -18)) => true
+    valSub(Ast.emptyModule(), ValType.Ref(true, -20), ValType.Ref(false, -18)) => false
+
+verify refSub
+    refSub(Ast.emptyModule(), false, -15, ValType.I32) => false
+
+fn valsSub(m: Module, a: List<ValType>, b: List<ValType>) -> Bool
+    ? "Pointwise subtyping of two lists of the same length."
+    match a
+        [] -> List.len(b) == 0
+        [x, ..xs] -> valsSubNext(m, x, xs, b)
+
+fn valsSubNext(m: Module, x: ValType, xs: List<ValType>, b: List<ValType>) -> Bool
+    ? "One step of valsSub."
+    match b
+        [] -> false
+        [y, ..ys] -> Bool.and(valSub(m, x, y), valsSub(m, xs, ys))
+
+verify valsSub
+    valsSub(Ast.emptyModule(), [ValType.I32], [ValType.I32]) => true
+    valsSub(Ast.emptyModule(), [ValType.I32], []) => false
+    valsSub(Ast.emptyModule(), [], [ValType.I32]) => false
+
+verify valsSubNext
+    valsSubNext(Ast.emptyModule(), ValType.I32, [], []) => false
+
+fn opdSub(m: Module, o: Opd, t: ValType) -> Bool
+    ? "Whether an operand matches a type; an unknown operand matches anything."
+    match o
+        Opd.Bot -> true
+        Opd.T(a) -> valSub(m, a, t)
+
+verify opdSub
+    opdSub(Ast.emptyModule(), Opd.Bot, ValType.I64) => true
+    opdSub(Ast.emptyModule(), Opd.T(ValType.I32), ValType.I64) => false
+
+fn heapOk(m: Module, h: Int) -> Bool
+    ? "Whether a heap type exists: a type index in range or a known abstract type."
+    match h >= 0
+        true -> h < Vector.len(m.types)
+        false -> Bool.and(h >= -23, h <= -12)
+
+verify heapOk
+    heapOk(Ast.emptyModule(), 0) => false
+    heapOk(Ast.emptyModule(), -18) => true
+    heapOk(Ast.emptyModule(), -40) => false
+
+fn typeOk(m: Module, t: ValType) -> Bool
+    ? "Whether a value type refers only to types that exist."
+    match t
+        ValType.Ref(_, h) -> heapOk(m, h)
+        _ -> true
+
+verify typeOk
+    typeOk(Ast.emptyModule(), ValType.Ref(true, 2)) => false
+    typeOk(Ast.emptyModule(), ValType.I32) => true
+
+fn typesOk(m: Module, ts: List<ValType>) -> Bool
+    ? "Whether every type of a list exists."
+    match ts
+        [] -> true
+        [t, ..rest] -> Bool.and(typeOk(m, t), typesOk(m, rest))
+
+verify typesOk
+    typesOk(Ast.emptyModule(), [ValType.I32, ValType.Ref(true, 0)]) => false
+
+// ---- the operand and control stacks ----
+
+fn err(msg: String) -> Result<V, String>
+    ? "A validation failure."
+    Result.Err(msg)
+
+verify err
+    err("x") => Result.Err("x")
+
+fn check(ok: Bool, msg: String, v: V) -> Result<V, String>
+    ? "v when ok holds, else the failure msg."
+    match ok
+        true -> Result.Ok(v)
+        false -> Result.Err(msg)
+
+verify check
+    check(false, "no", V(stack = [], height = 0, ctrls = [], inits = {}, maxH = 0)) => Result.Err("no")
+
+fn pushT(v: V, t: ValType) -> V
+    ? "v with a known type pushed; maxH remembers the highest the stack has been."
+    V.update(v, stack = List.prepend(Opd.T(t), v.stack), height = v.height + 1, maxH = Int.max(v.maxH, v.height + 1))
+
+fn pushO(v: V, o: Opd) -> V
+    ? "v with an operand pushed."
+    V.update(v, stack = List.prepend(o, v.stack), height = v.height + 1, maxH = Int.max(v.maxH, v.height + 1))
+
+fn pushTs(v: V, ts: List<ValType>) -> V
+    ? "v with types pushed in order, the last on top."
+    match ts
+        [] -> v
+        [t, ..rest] -> pushTs(pushT(v, t), rest)
+
+verify pushTs
+    pushTs(V(stack = [], height = 0, ctrls = [], inits = {}, maxH = 0), [ValType.I32, ValType.I64]).height => 2
+
+fn pop(v: V) -> Result<PV, String>
+    ? "The top operand: unknown once the frame's own operands are gone after unreachable code, a failure otherwise."
+    match v.ctrls
+        [] -> Result.Err("type mismatch: operand stack underflow")
+        [c, .._] -> popIn(v, c)
+
+fn popIn(v: V, c: Ctrl) -> Result<PV, String>
+    ? "pop with the innermost frame known."
+    match v.height <= c.height
+        true -> popEmpty(v, c)
+        false -> popTop(v)
+
+fn popEmpty(v: V, c: Ctrl) -> Result<PV, String>
+    ? "pop from a frame with no operands left."
+    match c.unreach
+        true -> Result.Ok(PV(o = Opd.Bot, v = v))
+        false -> Result.Err("type mismatch: operand stack underflow")
+
+fn popTop(v: V) -> Result<PV, String>
+    ? "pop of an operand that is there."
+    match v.stack
+        [o, ..rest] -> Result.Ok(PV(o = o, v = V.update(v, stack = rest, height = v.height - 1)))
+        [] -> Result.Err("type mismatch: operand stack underflow")
+
+fn popT(c: Cx, v: V, t: ValType) -> Result<V, String>
+    ? "Pops an operand that must match t."
+    r = pop(v)?
+    check(opdSub(c.m, r.o, t), "type mismatch: expected {tyName(t)}", r.v)
+
+fn popTs(c: Cx, v: V, ts: List<ValType>) -> Result<V, String>
+    ? "Pops operands matching ts, the last of ts on top."
+    popRev(c, v, List.reverse(ts))
+
+fn popRev(c: Cx, v: V, ts: List<ValType>) -> Result<V, String>
+    ? "Pops operands matching ts, the first of ts on top."
+    match ts
+        [] -> Result.Ok(v)
+        [t, ..rest] -> popRev(c, popT(c, v, t)?, rest)
+
+fn popRef(v: V) -> Result<PV, String>
+    ? "Pops an operand that must be a reference."
+    r = pop(v)?
+    match r.o
+        Opd.Bot -> Result.Ok(r)
+        Opd.T(ValType.Ref(_, _)) -> Result.Ok(r)
+        _ -> Result.Err("type mismatch: expected a reference")
+
+fn tyName(t: ValType) -> String
+    ? "A value type as text, for messages."
+    match t
+        ValType.I32 -> "i32"
+        ValType.I64 -> "i64"
+        ValType.F32 -> "f32"
+        ValType.F64 -> "f64"
+        ValType.V128 -> "v128"
+        ValType.I8 -> "i8"
+        ValType.I16 -> "i16"
+        ValType.Ref(n, h) -> "(ref {nullText(n)}{h})"
+
+fn nullText(n: Bool) -> String
+    ? "null for a nullable reference."
+    match n
+        true -> "null "
+        false -> ""
+
+verify tyName
+    tyName(ValType.Ref(true, -18)) => "(ref null -18)"
+    tyName(ValType.I32) => "i32"
+
+verify nullText
+    nullText(false) => ""
+
+fn unreachable(v: V) -> Result<V, String>
+    ? "The rest of the frame is unreachable: its operands are dropped and any type may be popped."
+    match v.ctrls
+        [] -> err("unreachable outside a frame")
+        [c, ..rest] -> Result.Ok(V.update(v, stack = List.drop(v.stack, v.height - c.height), height = c.height, ctrls = List.prepend(Ctrl.update(c, unreach = true), rest)))
+
+fn pushCtrl(v: V, kind: Int, start: List<ValType>, end: List<ValType>) -> V
+    ? "Opens a frame whose operands start as start."
+    pushTs(V.update(v, ctrls = List.prepend(Ctrl(kind = kind, start = start, end = end, height = v.height, unreach = false, inits = v.inits), v.ctrls)), start)
+
+record PC
+    c: Ctrl
+    v: V
+
+fn popCtrl(cx: Cx, v: V) -> Result<PC, String>
+    ? "Closes the innermost frame: its results must be exactly what is left on its part of the stack."
+    match v.ctrls
+        [] -> Result.Err("unexpected end")
+        [c, ..rest] -> popCtrlOf(cx, v, c, rest)
+
+fn popCtrlOf(cx: Cx, v: V, c: Ctrl, rest: List<Ctrl>) -> Result<PC, String>
+    ? "popCtrl once the frame is known."
+    v2 = popTs(cx, v, c.end)?
+    match v2.height == c.height
+        false -> Result.Err("type mismatch: values remain at the end of a block")
+        true -> Result.Ok(PC(c = c, v = V.update(v2, ctrls = rest, inits = c.inits)))
+
+fn labelTypes(c: Ctrl) -> List<ValType>
+    ? "What a branch to a frame carries: its parameters for a loop, its results otherwise."
+    match c.kind == 1
+        true -> c.start
+        false -> c.end
+
+verify labelTypes
+    labelTypes(Ctrl(kind = 1, start = [ValType.I32], end = [], height = 0, unreach = false, inits = {})) => [ValType.I32]
+    labelTypes(Ctrl(kind = 0, start = [ValType.I32], end = [], height = 0, unreach = false, inits = {})) => []
+
+fn label(v: V, d: Int) -> Result<List<ValType>, String>
+    ? "The types a branch to label d carries."
+    match List.drop(v.ctrls, d)
+        [c, .._] -> Result.Ok(labelTypes(c))
+        [] -> Result.Err("unknown label {d}")
+
+fn op(cx: Cx, v: V, ins: List<ValType>, outs: List<ValType>) -> Result<V, String>
+    ? "An instruction of fixed type ins -> outs."
+    Result.Ok(pushTs(popTs(cx, v, ins)?, outs))
+
+// ---- function bodies ----
+
+fn validateBody(cx: Cx, code: Vector<Instr>) -> Result<Unit, String>
+    ? "Checks code without parameters, as a constant expression is: a block of cx.ret ending with its own end."
+    h = bodyWithParams(cx, code, 0)?
+    Result.Ok(Unit)
+
+fn paramInits(n: Int, k: Int, acc: Map<Int, Unit>) -> Map<Int, Unit>
+    ? "The first n locals, the parameters, marked initialized."
+    match k >= n
+        true -> acc
+        false -> paramInits(n, k + 1, Map.set(acc, k, Unit))
+
+verify paramInits
+    paramInits(2, 0, {}) => {0 => Unit, 1 => Unit}
+
+fn bodyFrom(cx: Cx, code: Vector<Instr>, pc: Int, v: V, hs: List<Int>) -> Result<Shape, String>
+    ? "Checks instructions from pc on; the body is valid when its last end closes the function's frame exactly at the end of the code. hs collects the stack height before each instruction, the last first."
+    match Vector.get(code, pc)
+        Option.None -> bodyDone(v, hs)
+        Option.Some(i) -> bodyStep(cx, code, pc, v, i, hs)
+
+fn bodyStep(cx: Cx, code: Vector<Instr>, pc: Int, v: V, i: Instr, hs: List<Int>) -> Result<Shape, String>
+    ? "Checks instruction i at pc, noting the height before it; the height is read before v is handed on."
+    h = v.height
+    next = instr(cx, v, i)?
+    bodyFrom(cx, code, pc + 1, next, List.prepend(h, hs))
+
+verify bodyStep
+    bodyStep(context(Ast.emptyModule()), Vector.fromList([]), 0, V(stack = [], height = 0, ctrls = [], inits = {}, maxH = 0), Instr.Nop, []) => Result.Ok(Shape(maxH = 0, heights = Vector.fromList([0])))
+
+fn bodyDone(v: V, hs: List<Int>) -> Result<Shape, String>
+    ? "The body's end was reached: every frame must be closed. The answer is the highest the operand stack got and the height before each instruction."
+    match v.ctrls
+        [] -> Result.Ok(Shape(maxH = v.maxH, heights = Vector.fromList(List.reverse(hs))))
+        _ -> Result.Err("unexpected end of function body")
+
+fn instr(cx: Cx, v: V, i: Instr) -> Result<V, String>
+    ? "Checks one instruction against the operand and control stacks."
+    match i
+        Instr.Unreachable -> unreachable(v)
+        Instr.Nop -> Result.Ok(v)
+        Instr.Block(_, _, _, sg) -> blockOpen(cx, v, sg, 0)
+        Instr.Loop(_, sg) -> blockOpen(cx, v, sg, 1)
+        Instr.If(_, _, _, _, sg) -> blockOpen(cx, popT(cx, v, i32t())?, sg, 2)
+        Instr.Else -> elseInstr(cx, v)
+        Instr.TryTable(_, _, _, sg, cs) -> blockOpen(cx, catchesOk(cx, v, List.fromVector(cs))?, sg, 0)
+        Instr.Throw(t) -> unreachable(popTs(cx, v, tagParams(cx, t)?)?)
+        Instr.ThrowRef -> unreachable(popT(cx, v, ValType.Ref(true, -23))?)
+        Instr.Simd(o, imm, mem, off, al) -> simdValid(cx, v, o, imm, mem, off, al)
+        Instr.End -> endInstr(cx, v)
+        Instr.Br(d) -> unreachable(popTs(cx, v, label(v, d)?)?)
+        Instr.BrIf(d) -> brIf(cx, popT(cx, v, i32t())?, label(v, d)?)
+        Instr.BrTable(ls, d) -> brTable(cx, popT(cx, v, i32t())?, List.fromVector(ls), d)
+        Instr.Return -> unreachable(popTs(cx, v, cx.ret)?)
+        Instr.Call(fi) -> callFn(cx, v, fi, false)
+        Instr.ReturnCall(fi) -> callFn(cx, v, fi, true)
+        Instr.CallRef(t) -> callRef(cx, v, t, false)
+        Instr.ReturnCallRef(t) -> callRef(cx, v, t, true)
+        Instr.CallIndirect(t, tb) -> callIndirect(cx, v, t, tb, false)
+        Instr.ReturnCallIndirect(t, tb) -> callIndirect(cx, v, t, tb, true)
+        Instr.Drop -> dropInstr(v)
+        Instr.Select -> selectInstr(cx, popT(cx, v, i32t())?)
+        Instr.SelectT(ts) -> selectT(cx, v, ts)
+        Instr.LocalGet(k) -> localGet(cx, v, k)
+        Instr.LocalSet(k) -> localSet(cx, v, k, false)
+        Instr.LocalTee(k) -> localSet(cx, v, k, true)
+        Instr.GlobalGet(k) -> globalGet(cx, v, k)
+        Instr.GlobalSet(k) -> globalSet(cx, v, k)
+        _ -> instrMore(cx, v, i)
+
+fn instrMore(cx: Cx, v: V, i: Instr) -> Result<V, String>
+    ? "Numbers, memory and tables."
+    match i
+        Instr.I32Const(_) -> Result.Ok(pushT(v, ValType.I32))
+        Instr.I64Const(_) -> Result.Ok(pushT(v, ValType.I64))
+        Instr.F32Const(_) -> Result.Ok(pushT(v, ValType.F32))
+        Instr.F64Const(_) -> Result.Ok(pushT(v, ValType.F64))
+        Instr.Un(o) -> numOp(cx, v, o)
+        Instr.Bin(o) -> numOp(cx, v, o)
+        Instr.Load(o, off, a, mem) -> offsetOk(off, Ast.memIs64(cx.m, mem), memAccess(cx, v, o, a, mem, true))
+        Instr.Store(o, off, a, mem) -> offsetOk(off, Ast.memIs64(cx.m, mem), memAccess(cx, v, o, a, mem, false))
+        Instr.MemorySize(k) -> needMem(cx, k, Result.Ok(pushT(v, memAt(cx, k))))
+        Instr.MemoryGrow(k) -> needMem(cx, k, op(cx, v, [memAt(cx, k)], [memAt(cx, k)]))
+        Instr.MemoryCopy(a, b) -> needMem(cx, a, needMem(cx, b, op(cx, v, [memAt(cx, a), memAt(cx, b), narrower(memAt(cx, a), memAt(cx, b))], [])))
+        Instr.MemoryFill(k) -> needMem(cx, k, op(cx, v, [memAt(cx, k), i32t(), memAt(cx, k)], []))
+        Instr.MemoryInit(d, k) -> needData(cx, d, needMem(cx, k, op(cx, v, [memAt(cx, k), i32t(), i32t()], [])))
+        Instr.DataDrop(d) -> needData(cx, d, Result.Ok(v))
+        Instr.TableGet(t) -> withTable(cx, t, v, tableGet)
+        Instr.TableSet(t) -> withTable(cx, t, v, tableSet)
+        Instr.TableSize(t) -> withTable(cx, t, v, tableSize)
+        Instr.TableGrow(t) -> withTable(cx, t, v, tableGrow)
+        Instr.TableFill(t) -> withTable(cx, t, v, tableFill)
+        Instr.TableCopy(d, s) -> tableCopy(cx, v, d, s)
+        Instr.TableInit(e, t) -> tableInit(cx, v, e, t)
+        Instr.ElemDrop(e) -> check(e < Vector.len(cx.elemTypes), "unknown elem segment {e}", v)
+        _ -> instrRef(cx, v, i)
+
+fn instrRef(cx: Cx, v: V, i: Instr) -> Result<V, String>
+    ? "References and the GC instructions."
+    match i
+        Instr.RefNull(h) -> check(heapOk(cx.m, h), "unknown type {h}", pushT(v, ValType.Ref(true, h)))
+        Instr.RefIsNull -> refIsNull(v)
+        Instr.RefFunc(k) -> refFunc(cx, v, k)
+        Instr.RefEq -> op(cx, v, [ValType.Ref(true, -19), ValType.Ref(true, -19)], [i32t()])
+        Instr.RefAsNonNull -> refAsNonNull(v)
+        Instr.BrOnNull(d) -> brOnNull(cx, v, d)
+        Instr.BrOnNonNull(d) -> brOnNonNull(cx, v, d)
+        Instr.RefTest(n, h) -> refTest(cx, v, n, h, false)
+        Instr.RefCast(n, h) -> refTest(cx, v, n, h, true)
+        Instr.BrOnCast(d, fl, h1, h2) -> brOnCast(cx, v, d, fl, h1, h2, false)
+        Instr.BrOnCastFail(d, fl, h1, h2) -> brOnCast(cx, v, d, fl, h1, h2, true)
+        Instr.RefI31 -> op(cx, v, [i32t()], [ValType.Ref(false, -20)])
+        Instr.I31Get(_) -> op(cx, v, [ValType.Ref(true, -20)], [i32t()])
+        Instr.AnyConvertExtern -> convertRef(cx, v, -17, -18)
+        Instr.ExternConvertAny -> convertRef(cx, v, -18, -17)
+        _ -> instrGc(cx, v, i)
+
+fn instrGc(cx: Cx, v: V, i: Instr) -> Result<V, String>
+    ? "Structs and arrays."
+    match i
+        Instr.StructNew(t) -> structNew(cx, v, t, false)
+        Instr.StructNewDefault(t) -> structNew(cx, v, t, true)
+        Instr.StructGet(t, k, e) -> structGet(cx, v, t, k, e)
+        Instr.StructSet(t, k) -> structSet(cx, v, t, k)
+        Instr.ArrayNew(t) -> arrayNew(cx, v, t, 0, 0)
+        Instr.ArrayNewDefault(t) -> arrayNew(cx, v, t, 1, 0)
+        Instr.ArrayNewFixed(t, n) -> arrayNew(cx, v, t, 2, n)
+        Instr.ArrayNewData(t, d) -> arrayData(cx, v, t, d, false)
+        Instr.ArrayNewElem(t, e) -> arrayElem(cx, v, t, e, false)
+        Instr.ArrayGet(t, e) -> arrayGet(cx, v, t, e)
+        Instr.ArraySet(t) -> arraySet(cx, v, t)
+        Instr.ArrayLen -> op(cx, v, [ValType.Ref(true, -22)], [i32t()])
+        Instr.ArrayFill(t) -> arrayFill(cx, v, t)
+        Instr.ArrayCopy(t1, t2) -> arrayCopy(cx, v, t1, t2)
+        Instr.ArrayInitData(t, d) -> arrayData(cx, v, t, d, true)
+        Instr.ArrayInitElem(t, e) -> arrayElem(cx, v, t, e, true)
+        Instr.Bad(o) -> err("unknown instruction {o}")
+        _ -> err("unsupported instruction")
+
+// ---- control ----
+
+fn blockOpen(cx: Cx, v: V, sg: Sig, kind: Int) -> Result<V, String>
+    ? "block, loop or if: the block type must exist, its parameters are taken from the stack."
+    match Bool.or(sg.ty < 0, kindOf(cx.m, sg.ty) == 0)
+        false -> err("unknown type {sg.ty}")
+        true -> blockTyped(cx, v, sg, kind)
+
+fn blockTyped(cx: Cx, v: V, sg: Sig, kind: Int) -> Result<V, String>
+    ? "Opens the frame once the block type is known to be a function type."
+    match Bool.and(typesOk(cx.m, sg.params), typesOk(cx.m, sg.results))
+        false -> err("unknown type in block type")
+        true -> Result.Ok(pushCtrl(popTs(cx, v, sg.params)?, kind, sg.params, sg.results))
+
+fn simdValid(cx: Cx, v: V, o: Int, imm: Int, mem: Int, off: Int, al: Int) -> Result<V, String>
+    ? "A SIMD instruction: its lane immediates in range, then its memory access, then its operands."
+    ok = check1(lanesOk(o, imm), "invalid lane index")?
+    match Simd.isMem(o)
+        false -> op(cx, v, Simd.ins(o, ValType.I32), Simd.outs(o))
+        true -> simdMemValid(cx, v, o, mem, off, al)
+
+fn simdMemValid(cx: Cx, v: V, o: Int, mem: Int, off: Int, al: Int) -> Result<V, String>
+    ? "A SIMD load or store: the memory exists, the alignment is at most the access size, the offset fits."
+    ok1 = check1(mem < Ast.memCount(cx.m), "unknown memory {mem}")?
+    ok2 = check1(al <= Simd.alignMax(o), "alignment must not be larger than natural")?
+    offsetOk(off, Ast.memIs64(cx.m, mem), op(cx, v, Simd.ins(o, memAt(cx, mem)), Simd.outs(o)))
+
+fn lanesOk(o: Int, imm: Int) -> Bool
+    ? "A lane immediate below the lane count; each of a shuffle's 16 lanes below 32."
+    match o == 13
+        true -> shuffleOk(imm, 16)
+        false -> Bool.or(Simd.laneLimit(o) == 0, imm < Simd.laneLimit(o))
+
+fn shuffleOk(imm: Int, n: Int) -> Bool
+    ? "Whether the n lowest octets of imm are all below 32."
+    match n <= 0
+        true -> true
+        false -> Bool.and(Int.mod(imm, 256) < 32, shuffleOk(Int.div(imm, 256), n - 1))
+
+verify simdValid
+    simdValid(context(Ast.emptyModule()), V(stack = [], height = 0, ctrls = [], inits = {}, maxH = 0), 21, 16, 0, 0, 0) => Result.Err("invalid lane index")
+
+verify simdMemValid
+    simdMemValid(context(Ast.emptyModule()), V(stack = [], height = 0, ctrls = [], inits = {}, maxH = 0), 0, 0, 0, 0) => Result.Err("unknown memory 0")
+
+verify lanesOk
+    lanesOk(110, 99) => true
+    lanesOk(13, 31) => true
+    lanesOk(13, 32) => false
+
+verify shuffleOk
+    shuffleOk(8192, 16) => false
+
+fn tagParams(cx: Cx, t: Int) -> Result<List<ValType>, String>
+    ? "What tag t carries."
+    match t < List.len(cx.m.tags)
+        false -> Result.Err("unknown tag {t}")
+        true -> Result.Ok(Ast.funcParams(cx.m, Ast.tagType(cx.m, t)))
+
+fn catchesOk(cx: Cx, v: V, cs: List<Int>) -> Result<V, String>
+    ? "v when every catch clause (kind, tag, label) hands its label what it expects: the tag's values, then the exception for the _ref kinds."
+    match cs
+        [kind, t, l, ..rest] -> catchesNext(cx, v, catchOk(cx, v, kind, t, l), rest)
+        _ -> Result.Ok(v)
+
+fn catchesNext(cx: Cx, v: V, r: Result<Unit, String>, rest: List<Int>) -> Result<V, String>
+    ? "Goes on after one clause."
+    ok = r?
+    catchesOk(cx, v, rest)
+
+fn catchOk(cx: Cx, v: V, kind: Int, t: Int, l: Int) -> Result<Unit, String>
+    ? "One catch clause."
+    lt = label(v, l)?
+    vals = catchVals(cx, kind, t)?
+    check1(valsSub(cx.m, vals, lt), "type mismatch in catch clause")
+
+fn catchVals(cx: Cx, kind: Int, t: Int) -> Result<List<ValType>, String>
+    ? "What a clause of this kind hands its label."
+    match kind
+        0 -> tagParams(cx, t)
+        1 -> Result.Ok(List.concat(tagParams(cx, t)?, [ValType.Ref(false, -23)]))
+        2 -> Result.Ok([])
+        _ -> Result.Ok([ValType.Ref(false, -23)])
+
+verify tagParams
+    tagParams(context(Ast.emptyModule()), 0) => Result.Err("unknown tag 0")
+
+verify catchesOk
+    catchesOk(context(Ast.emptyModule()), V(stack = [], height = 0, ctrls = [], inits = {}, maxH = 0), []) => Result.Ok(V(stack = [], height = 0, ctrls = [], inits = {}, maxH = 0))
+
+verify catchesNext
+    catchesNext(context(Ast.emptyModule()), V(stack = [], height = 0, ctrls = [], inits = {}, maxH = 0), Result.Err("x"), []) => Result.Err("x")
+
+verify catchOk
+    catchOk(context(Ast.emptyModule()), V(stack = [], height = 0, ctrls = [], inits = {}, maxH = 0), 2, -1, 0) => Result.Err("unknown label 0")
+
+verify catchVals
+    catchVals(context(Ast.emptyModule()), 3, -1) => Result.Ok([ValType.Ref(false, -23)])
+
+fn tagsValid(m: Module, ts: List<Int>) -> Result<Unit, String>
+    ? "Each tag's type is a function type with no results."
+    match ts
+        [] -> Result.Ok(Unit)
+        [t, ..rest] -> tagsNext(m, kindOf(m, t) == 0, Ast.funcResults(m, t), rest)
+
+fn tagsNext(m: Module, isFn: Bool, rs: List<ValType>, rest: List<Int>) -> Result<Unit, String>
+    ? "One tag checked."
+    ok1 = check1(isFn, "unknown type")?
+    ok2 = check1(List.len(rs) == 0, "non-empty tag result type")?
+    tagsValid(m, rest)
+
+verify tagsValid
+    tagsValid(Ast.emptyModule(), [0]) => Result.Err("unknown type")
+
+verify tagsNext
+    tagsNext(Ast.emptyModule(), true, [ValType.I32], []) => Result.Err("non-empty tag result type")
+
+fn elseInstr(cx: Cx, v: V) -> Result<V, String>
+    ? "else closes the then arm of an if and opens its else arm with the same parameters."
+    r = popCtrl(cx, v)?
+    match r.c.kind == 2
+        false -> err("else without if")
+        true -> Result.Ok(pushCtrl(r.v, 3, r.c.start, r.c.end))
+
+fn endInstr(cx: Cx, v: V) -> Result<V, String>
+    ? "end closes a frame and leaves its results; an if without else must give back what it took."
+    r = popCtrl(cx, v)?
+    match Bool.and(r.c.kind == 2, Bool.not(valsSub(cx.m, r.c.start, r.c.end)))
+        true -> err("type mismatch: if without else must have matching parameters and results")
+        false -> Result.Ok(pushTs(r.v, r.c.end))
+
+fn brIf(cx: Cx, v: V, lt: List<ValType>) -> Result<V, String>
+    ? "br_if: the label's values are checked and stay."
+    Result.Ok(pushTs(popTs(cx, v, lt)?, lt))
+
+fn brTable(cx: Cx, v: V, ls: List<Int>, d: Int) -> Result<V, String>
+    ? "br_table: every label must take what the default takes, in number and type."
+    lt = label(v, d)?
+    ok1 = brTableEach(cx, v, ls, List.len(lt))?
+    unreachable(popTs(cx, v, lt)?)
+
+fn brTableEach(cx: Cx, v: V, ls: List<Int>, n: Int) -> Result<V, String>
+    ? "Checks each label of a br_table against the operands."
+    match ls
+        [] -> Result.Ok(v)
+        [l, ..rest] -> brTableOne(cx, v, label(v, l)?, rest, n)
+
+fn brTableOne(cx: Cx, v: V, lt: List<ValType>, rest: List<Int>, n: Int) -> Result<V, String>
+    ? "One label of a br_table: same arity as the default, operands match."
+    match List.len(lt) == n
+        false -> err("type mismatch: br_table labels of different arity")
+        true -> brTableNext(cx, v, popTs(cx, v, lt)?, rest, n)
+
+fn brTableNext(cx: Cx, v: V, checked: V, rest: List<Int>, n: Int) -> Result<V, String>
+    ? "Goes on to the next label from the unchanged stack."
+    brTableEach(cx, v, rest, n)
+
+fn fnSig(cx: Cx, fi: Int) -> Result<Sig, String>
+    ? "The signature of function fi."
+    t = Result.fromOption(Vector.get(cx.fnTypes, fi), "unknown function {fi}")?
+    Result.Ok(Sig(params = Ast.funcParams(cx.m, t), results = Ast.funcResults(cx.m, t), ty = t))
+
+fn typeSig(cx: Cx, t: Int) -> Result<Sig, String>
+    ? "The signature of function type t."
+    match kindOf(cx.m, t) == 0
+        false -> Result.Err("unknown type {t}: not a function type")
+        true -> Result.Ok(Sig(params = Ast.funcParams(cx.m, t), results = Ast.funcResults(cx.m, t), ty = t))
+
+fn applyCall(cx: Cx, v: V, sg: Sig, tail: Bool) -> Result<V, String>
+    ? "A call: parameters popped; a tail call's results must fit the caller's, the frame ends; otherwise the results are pushed."
+    v2 = popTs(cx, v, sg.params)?
+    match tail
+        false -> Result.Ok(pushTs(v2, sg.results))
+        true -> tailCheck(cx, v2, sg)
+
+fn tailCheck(cx: Cx, v: V, sg: Sig) -> Result<V, String>
+    ? "A tail call ends the frame: the callee's results must be the caller's."
+    match valsSub(cx.m, sg.results, cx.ret)
+        false -> err("type mismatch: tail call results")
+        true -> unreachable(v)
+
+fn callFn(cx: Cx, v: V, fi: Int, tail: Bool) -> Result<V, String>
+    ? "call and return_call."
+    applyCall(cx, v, fnSig(cx, fi)?, tail)
+
+fn callRef(cx: Cx, v: V, t: Int, tail: Bool) -> Result<V, String>
+    ? "call_ref and return_call_ref: a reference to type t, then its arguments."
+    sg = typeSig(cx, t)?
+    applyCall(cx, popT(cx, v, ValType.Ref(true, t))?, sg, tail)
+
+fn callIndirect(cx: Cx, v: V, t: Int, tb: Int, tail: Bool) -> Result<V, String>
+    ? "call_indirect: a table of function references, an index, then the arguments."
+    sg = typeSig(cx, t)?
+    et = Result.fromOption(Vector.get(cx.tables, tb), "unknown table {tb}")?
+    match valSub(cx.m, et, ValType.Ref(true, -16))
+        false -> err("type mismatch: call_indirect table is not of functions")
+        true -> applyCall(cx, popT(cx, v, tableAt(cx, tb))?, sg, tail)
+
+fn dropInstr(v: V) -> Result<V, String>
+    ? "drop: any operand."
+    r = pop(v)?
+    Result.Ok(r.v)
+
+fn selectInstr(cx: Cx, v: V) -> Result<V, String>
+    ? "select without a type: two numeric operands of one type."
+    b = pop(v)?
+    a = pop(b.v)?
+    selectJoin(a.v, a.o, b.o)
+
+fn selectJoin(v: V, a: Opd, b: Opd) -> Result<V, String>
+    ? "The type an untyped select leaves: the operands' common numeric type."
+    match a
+        Opd.Bot -> selectOne(v, b)
+        Opd.T(ta) -> selectBoth(v, ta, b)
+
+fn selectOne(v: V, b: Opd) -> Result<V, String>
+    ? "One operand unknown: the other decides, and must be numeric."
+    match b
+        Opd.Bot -> Result.Ok(pushO(v, Opd.Bot))
+        Opd.T(tb) -> check(Bool.not(isRef(tb)), "type mismatch: select needs a type for references", pushT(v, tb))
+
+fn selectBoth(v: V, ta: ValType, b: Opd) -> Result<V, String>
+    ? "Both operands known."
+    match b
+        Opd.Bot -> check(Bool.not(isRef(ta)), "type mismatch: select needs a type for references", pushT(v, ta))
+        Opd.T(tb) -> check(Bool.and(ta == tb, Bool.not(isRef(ta))), "type mismatch: select operands", pushT(v, ta))
+
+fn selectT(cx: Cx, v: V, ts: List<ValType>) -> Result<V, String>
+    ? "select with one explicit type."
+    match ts
+        [t] -> check(typeOk(cx.m, t), "unknown type", pushT(popT(cx, popT(cx, popT(cx, v, i32t())?, t)?, t)?, t))
+        _ -> err("invalid result arity for select")
+
+fn localType(cx: Cx, k: Int) -> Result<ValType, String>
+    ? "The type of local k."
+    Result.fromOption(Vector.get(cx.locals, k), "unknown local {k}")
+
+fn localGet(cx: Cx, v: V, k: Int) -> Result<V, String>
+    ? "local.get: a local without a default must have been set first."
+    t = localType(cx, k)?
+    check(Bool.or(defaultable(t), Map.has(v.inits, k)), "uninitialized local {k}", pushT(v, t))
+
+fn localSet(cx: Cx, v: V, k: Int, tee: Bool) -> Result<V, String>
+    ? "local.set and local.tee."
+    t = localType(cx, k)?
+    v2 = V.update(popT(cx, v, t)?, inits = Map.set(v.inits, k, Unit))
+    match tee
+        true -> Result.Ok(pushT(v2, t))
+        false -> Result.Ok(v2)
+
+fn globalGet(cx: Cx, v: V, k: Int) -> Result<V, String>
+    ? "global.get."
+    g = Result.fromOption(Vector.get(cx.globals, k), "unknown global {k}")?
+    Result.Ok(pushT(v, g.ty))
+
+fn globalSet(cx: Cx, v: V, k: Int) -> Result<V, String>
+    ? "global.set: only of a mutable global."
+    g = Result.fromOption(Vector.get(cx.globals, k), "unknown global {k}")?
+    match g.mut
+        false -> err("global is immutable")
+        true -> popT(cx, v, g.ty)
+
+// ---- numbers and memory ----
+
+record NT
+    ins: List<ValType>
+    outs: List<ValType>
+
+fn nt(ins: List<ValType>, outs: List<ValType>) -> NT
+    ? "A numeric instruction's type."
+    NT(ins = ins, outs = outs)
+
+verify nt
+    nt([], []) => NT(ins = [], outs = [])
+
+fn numOp(cx: Cx, v: V, o: Int) -> Result<V, String>
+    ? "A numeric instruction by its type."
+    t = numType(o)
+    op(cx, v, t.ins, t.outs)
+
+fn numType(o: Int) -> NT
+    ? "The type of a numeric opcode."
+    i = ValType.I32
+    l = ValType.I64
+    f = ValType.F32
+    d = ValType.F64
+    match o < 103
+        true -> cmpType(o, i, l, f, d)
+        false -> arithType(o, i, l, f, d)
+
+fn cmpType(o: Int, i: ValType, l: ValType, f: ValType, d: ValType) -> NT
+    ? "eqz and the comparisons."
+    match o
+        69 -> nt([i], [i])
+        80 -> nt([l], [i])
+        _ -> cmpBin(o, i, l, f, d)
+
+fn cmpBin(o: Int, i: ValType, l: ValType, f: ValType, d: ValType) -> NT
+    ? "The binary comparisons by operand type."
+    match o < 80
+        true -> nt([i, i], [i])
+        false -> cmpBinHigh(o, i, l, f, d)
+
+fn cmpBinHigh(o: Int, i: ValType, l: ValType, f: ValType, d: ValType) -> NT
+    ? "i64, f32 and f64 comparisons."
+    match o < 91
+        true -> nt([l, l], [i])
+        false -> cmpFloat(o < 97, i, f, d)
+
+fn cmpFloat(single: Bool, i: ValType, f: ValType, d: ValType) -> NT
+    ? "f32 or f64 comparisons."
+    match single
+        true -> nt([f, f], [i])
+        false -> nt([d, d], [i])
+
+fn arithType(o: Int, i: ValType, l: ValType, f: ValType, d: ValType) -> NT
+    ? "Arithmetic by range: i32 unary and binary, i64, f32, f64."
+    match o
+        103 -> nt([i], [i])
+        104 -> nt([i], [i])
+        105 -> nt([i], [i])
+        121 -> nt([l], [l])
+        122 -> nt([l], [l])
+        123 -> nt([l], [l])
+        _ -> arithRange(o, i, l, f, d)
+
+fn arithRange(o: Int, i: ValType, l: ValType, f: ValType, d: ValType) -> NT
+    ? "The binary and float ranges."
+    match o < 121
+        true -> nt([i, i], [i])
+        false -> arithRange2(o, i, l, f, d)
+
+fn arithRange2(o: Int, i: ValType, l: ValType, f: ValType, d: ValType) -> NT
+    ? "i64 binary, then the floats."
+    match o < 139
+        true -> nt([l, l], [l])
+        false -> floatRangeOf(o, i, l, f, d)
+
+fn floatRangeOf(o: Int, i: ValType, l: ValType, f: ValType, d: ValType) -> NT
+    ? "The float ranges proper."
+    match o < 146
+        true -> nt([f], [f])
+        false -> floatRange2(o, i, l, f, d)
+
+fn floatRange2(o: Int, i: ValType, l: ValType, f: ValType, d: ValType) -> NT
+    ? "f32 binary, then f64."
+    match o < 153
+        true -> nt([f, f], [f])
+        false -> floatRange3(o, i, l, f, d)
+
+fn floatRange3(o: Int, i: ValType, l: ValType, f: ValType, d: ValType) -> NT
+    ? "f64 unary and binary, then conversions."
+    match o < 160
+        true -> nt([d], [d])
+        false -> floatRange4(o, i, l, f, d)
+
+fn floatRange4(o: Int, i: ValType, l: ValType, f: ValType, d: ValType) -> NT
+    ? "f64 binary, then conversions."
+    match o < 167
+        true -> nt([d, d], [d])
+        false -> convType(o, i, l, f, d)
+
+fn convType(o: Int, i: ValType, l: ValType, f: ValType, d: ValType) -> NT
+    ? "The conversions, reinterpretations, sign extensions and saturating truncations."
+    match o
+        167 -> nt([l], [i])
+        168 -> nt([f], [i])
+        169 -> nt([f], [i])
+        170 -> nt([d], [i])
+        171 -> nt([d], [i])
+        172 -> nt([i], [l])
+        173 -> nt([i], [l])
+        174 -> nt([f], [l])
+        175 -> nt([f], [l])
+        176 -> nt([d], [l])
+        177 -> nt([d], [l])
+        178 -> nt([i], [f])
+        179 -> nt([i], [f])
+        180 -> nt([l], [f])
+        181 -> nt([l], [f])
+        182 -> nt([d], [f])
+        183 -> nt([i], [d])
+        184 -> nt([i], [d])
+        185 -> nt([l], [d])
+        186 -> nt([l], [d])
+        187 -> nt([f], [d])
+        188 -> nt([f], [i])
+        189 -> nt([d], [l])
+        190 -> nt([i], [f])
+        191 -> nt([l], [d])
+        192 -> nt([i], [i])
+        193 -> nt([i], [i])
+        194 -> nt([l], [l])
+        195 -> nt([l], [l])
+        196 -> nt([l], [l])
+        64512 -> nt([f], [i])
+        64513 -> nt([f], [i])
+        64514 -> nt([d], [i])
+        64515 -> nt([d], [i])
+        64516 -> nt([f], [l])
+        64517 -> nt([f], [l])
+        64518 -> nt([d], [l])
+        _ -> nt([d], [l])
+
+verify numType
+    numType(69) => NT(ins = [ValType.I32], outs = [ValType.I32])
+    numType(81) => NT(ins = [ValType.I64, ValType.I64], outs = [ValType.I32])
+    numType(91) => NT(ins = [ValType.F32, ValType.F32], outs = [ValType.I32])
+    numType(97) => NT(ins = [ValType.F64, ValType.F64], outs = [ValType.I32])
+    numType(106) => NT(ins = [ValType.I32, ValType.I32], outs = [ValType.I32])
+    numType(122) => NT(ins = [ValType.I64], outs = [ValType.I64])
+    numType(124) => NT(ins = [ValType.I64, ValType.I64], outs = [ValType.I64])
+    numType(139) => NT(ins = [ValType.F32], outs = [ValType.F32])
+    numType(146) => NT(ins = [ValType.F32, ValType.F32], outs = [ValType.F32])
+    numType(153) => NT(ins = [ValType.F64], outs = [ValType.F64])
+    numType(160) => NT(ins = [ValType.F64, ValType.F64], outs = [ValType.F64])
+    numType(167) => NT(ins = [ValType.I64], outs = [ValType.I32])
+    numType(191) => NT(ins = [ValType.I64], outs = [ValType.F64])
+    numType(64519) => NT(ins = [ValType.F64], outs = [ValType.I64])
+
+fn memType(o: Int) -> NT
+    ? "The value type a load pushes or a store pops, and its natural alignment exponent in ins' length (unused)."
+    match o
+        40 -> nt([], [ValType.I32])
+        41 -> nt([], [ValType.I64])
+        42 -> nt([], [ValType.F32])
+        43 -> nt([], [ValType.F64])
+        54 -> nt([], [ValType.I32])
+        55 -> nt([], [ValType.I64])
+        56 -> nt([], [ValType.F32])
+        57 -> nt([], [ValType.F64])
+        _ -> memTypeNarrow(o)
+
+fn memTypeNarrow(o: Int) -> NT
+    ? "The narrow loads and stores: i32 for 44-47 and 58-59, i64 otherwise."
+    match Bool.or(Bool.and(o >= 44, o <= 47), Bool.and(o >= 58, o <= 59))
+        true -> nt([], [ValType.I32])
+        false -> nt([], [ValType.I64])
+
+verify memType
+    memType(43) => NT(ins = [], outs = [ValType.F64])
+    memType(57) => NT(ins = [], outs = [ValType.F64])
+
+verify memTypeNarrow
+    memTypeNarrow(45) => NT(ins = [], outs = [ValType.I32])
+    memTypeNarrow(52) => NT(ins = [], outs = [ValType.I64])
+    memTypeNarrow(61) => NT(ins = [], outs = [ValType.I64])
+
+fn memWidthLog(o: Int) -> Int
+    ? "log2 of the access width in octets: the largest alignment allowed."
+    match o
+        41 -> 3
+        43 -> 3
+        55 -> 3
+        57 -> 3
+        44 -> 0
+        45 -> 0
+        48 -> 0
+        49 -> 0
+        58 -> 0
+        60 -> 0
+        46 -> 1
+        47 -> 1
+        50 -> 1
+        51 -> 1
+        59 -> 1
+        61 -> 1
+        _ -> 2
+
+verify memWidthLog
+    memWidthLog(41) => 3
+    memWidthLog(44) => 0
+    memWidthLog(59) => 1
+    memWidthLog(40) => 2
+
+fn memAccess(cx: Cx, v: V, o: Int, a: Int, mem: Int, isLoad: Bool) -> Result<V, String>
+    ? "A load or store: the memory must exist and the alignment must not exceed the access width."
+    t = firstType(memType(o).outs)
+    match mem < Ast.memCount(cx.m)
+        false -> err("unknown memory {mem}")
+        true -> memAligned(cx, v, t, Ast.addrType(Ast.memIs64(cx.m, mem)), a, memWidthLog(o), isLoad)
+
+fn firstType(ts: List<ValType>) -> ValType
+    ? "The first type of a list, i32 when empty."
+    match ts
+        [t, .._] -> t
+        [] -> ValType.I32
+
+verify firstType
+    firstType([]) => ValType.I32
+
+fn memAligned(cx: Cx, v: V, t: ValType, at: ValType, a: Int, w: Int, isLoad: Bool) -> Result<V, String>
+    ? "A load or store after the memory check; at is the memory's address type."
+    match a > w
+        true -> err("alignment must not be larger than natural")
+        false -> memOp(cx, v, t, at, isLoad)
+
+fn memOp(cx: Cx, v: V, t: ValType, at: ValType, isLoad: Bool) -> Result<V, String>
+    ? "The stack effect of a load or store."
+    match isLoad
+        true -> op(cx, v, [at], [t])
+        false -> op(cx, v, [at, t], [])
+
+fn offsetOk(off: Int, wide: Bool, r: Result<V, String>) -> Result<V, String>
+    ? "r when a memarg offset fits its memory: 32 bits, or 64 for a 64-bit memory."
+    match off <= pickInt(wide, 18446744073709551615, 4294967295)
+        true -> r
+        false -> Result.Err("offset out of range")
+
+fn pickInt(c: Bool, a: Int, b: Int) -> Int
+    ? "a when c holds, else b."
+    match c
+        true -> a
+        false -> b
+
+verify pickInt
+    pickInt(false, 1, 2) => 2
+
+verify offsetOk
+    offsetOk(4294967296, false, Result.Ok(V(stack = [], height = 0, ctrls = [], inits = {}, maxH = 0))) => Result.Err("offset out of range")
+
+fn memAt(cx: Cx, k: Int) -> ValType
+    ? "The address type of memory k."
+    Ast.addrType(Ast.memIs64(cx.m, k))
+
+fn tableAt(cx: Cx, t: Int) -> ValType
+    ? "The index type of table t."
+    Ast.addrType(Ast.tableIs64(cx.m, t))
+
+fn narrower(a: ValType, b: ValType) -> ValType
+    ? "The count type of a copy between two address types: i64 only when both are."
+    match a
+        ValType.I64 -> b
+        _ -> a
+
+verify memAt
+    memAt(context(Ast.emptyModule()), 0) => ValType.I32
+
+verify tableAt
+    tableAt(context(Module.update(Ast.emptyModule(), tables64 = [0])), 0) => ValType.I64
+
+verify narrower
+    narrower(ValType.I64, ValType.I32) => ValType.I32
+    narrower(ValType.I64, ValType.I64) => ValType.I64
+
+fn needMem(cx: Cx, k: Int, r: Result<V, String>) -> Result<V, String>
+    ? "r when the module has memory k."
+    match k < Ast.memCount(cx.m)
+        true -> r
+        false -> Result.Err("unknown memory {k}")
+
+fn needData(cx: Cx, d: Int, r: Result<V, String>) -> Result<V, String>
+    ? "r when the data count section exists and covers segment d."
+    match cx.m.dataCount < 0
+        true -> Result.Err("data count section required")
+        false -> needDataIn(cx, d, r)
+
+fn needDataIn(cx: Cx, d: Int, r: Result<V, String>) -> Result<V, String>
+    ? "r when segment d exists."
+    match d < cx.m.dataCount
+        true -> r
+        false -> Result.Err("unknown data segment {d}")
+
+// ---- tables ----
+
+fn withTable(cx: Cx, t: Int, v: V, k: Fn(Cx, V, ValType, ValType) -> Result<V, String>) -> Result<V, String>
+    ? "Runs a table instruction's check with the table's element type and index type."
+    match Vector.get(cx.tables, t)
+        Option.Some(et) -> k(cx, v, et, tableAt(cx, t))
+        Option.None -> err("unknown table {t}")
+
+fn tableGet(cx: Cx, v: V, et: ValType, at: ValType) -> Result<V, String>
+    ? "table.get."
+    op(cx, v, [at], [et])
+
+fn tableSet(cx: Cx, v: V, et: ValType, at: ValType) -> Result<V, String>
+    ? "table.set."
+    op(cx, v, [at, et], [])
+
+fn tableSize(cx: Cx, v: V, et: ValType, at: ValType) -> Result<V, String>
+    ? "table.size."
+    Result.Ok(pushT(v, at))
+
+fn tableGrow(cx: Cx, v: V, et: ValType, at: ValType) -> Result<V, String>
+    ? "table.grow."
+    op(cx, v, [et, at], [at])
+
+fn tableFill(cx: Cx, v: V, et: ValType, at: ValType) -> Result<V, String>
+    ? "table.fill."
+    op(cx, v, [at, et, at], [])
+
+fn tableCopy(cx: Cx, v: V, d: Int, s: Int) -> Result<V, String>
+    ? "table.copy: the source's elements must fit the destination."
+    dt = Result.fromOption(Vector.get(cx.tables, d), "unknown table {d}")?
+    st = Result.fromOption(Vector.get(cx.tables, s), "unknown table {s}")?
+    match valSub(cx.m, st, dt)
+        false -> err("type mismatch: table.copy")
+        true -> op(cx, v, [tableAt(cx, d), tableAt(cx, s), narrower(tableAt(cx, d), tableAt(cx, s))], [])
+
+fn tableInit(cx: Cx, v: V, e: Int, t: Int) -> Result<V, String>
+    ? "table.init: the segment's elements must fit the table."
+    tt = Result.fromOption(Vector.get(cx.tables, t), "unknown table {t}")?
+    et = Result.fromOption(Vector.get(cx.elemTypes, e), "unknown elem segment {e}")?
+    match valSub(cx.m, et, tt)
+        false -> err("type mismatch: table.init")
+        true -> op(cx, v, [tableAt(cx, t), i32t(), i32t()], [])
+
+// ---- references ----
+
+fn refIsNull(v: V) -> Result<V, String>
+    ? "ref.is_null: any reference."
+    r = popRef(v)?
+    Result.Ok(pushT(r.v, ValType.I32))
+
+fn refFunc(cx: Cx, v: V, k: Int) -> Result<V, String>
+    ? "ref.func: the function must exist and be declared outside function bodies."
+    t = Result.fromOption(Vector.get(cx.fnTypes, k), "unknown function {k}")?
+    check(Map.has(cx.refs, k), "undeclared function reference", pushT(v, ValType.Ref(false, t)))
+
+fn refAsNonNull(v: V) -> Result<V, String>
+    ? "ref.as_non_null."
+    r = popRef(v)?
+    Result.Ok(pushO(r.v, nonNull(r.o)))
+
+fn nonNull(o: Opd) -> Opd
+    ? "An operand's type made non-nullable."
+    match o
+        Opd.T(ValType.Ref(_, h)) -> Opd.T(ValType.Ref(false, h))
+        _ -> o
+
+verify nonNull
+    nonNull(Opd.T(ValType.Ref(true, -18))) => Opd.T(ValType.Ref(false, -18))
+    nonNull(Opd.Bot) => Opd.Bot
+
+fn brOnNull(cx: Cx, v: V, d: Int) -> Result<V, String>
+    ? "br_on_null: the label's values under a reference; the reference stays, non-null, when it does not branch."
+    lt = label(v, d)?
+    r = popRef(v)?
+    v2 = pushTs(popTs(cx, r.v, lt)?, lt)
+    Result.Ok(pushO(v2, nonNull(r.o)))
+
+fn brOnNonNull(cx: Cx, v: V, d: Int) -> Result<V, String>
+    ? "br_on_non_null: the label must end in a reference type the non-null operand fits."
+    lt = label(v, d)?
+    match List.reverse(lt)
+        [last, ..restRev] -> brOnNonNullWith(cx, v, last, List.reverse(restRev))
+        [] -> err("type mismatch: br_on_non_null label has no reference")
+
+fn brOnNonNullWith(cx: Cx, v: V, last: ValType, rest: List<ValType>) -> Result<V, String>
+    ? "br_on_non_null with the label's last type known."
+    r = popRef(v)?
+    match opdSub(cx.m, nonNull(r.o), last)
+        false -> err("type mismatch: br_on_non_null")
+        true -> Result.Ok(pushTs(popTs(cx, r.v, rest)?, rest))
+
+fn refTest(cx: Cx, v: V, n: Bool, h: Int, cast: Bool) -> Result<V, String>
+    ? "ref.test and ref.cast: the operand must be in the target's hierarchy."
+    r = popRef(v)?
+    match Bool.and(heapOk(cx.m, h), opdSub(cx.m, r.o, ValType.Ref(true, top(cx.m, h))))
+        false -> err("type mismatch: cast across hierarchies")
+        true -> Result.Ok(pushT(r.v, castResult(n, h, cast)))
+
+fn castResult(n: Bool, h: Int, cast: Bool) -> ValType
+    ? "i32 for a test, the target type for a cast."
+    match cast
+        true -> ValType.Ref(n, h)
+        false -> ValType.I32
+
+verify castResult
+    castResult(true, -19, false) => ValType.I32
+    castResult(true, -19, true) => ValType.Ref(true, -19)
+
+fn brOnCast(cx: Cx, v: V, d: Int, fl: Int, h1: Int, h2: Int, fail: Bool) -> Result<V, String>
+    ? "br_on_cast and br_on_cast_fail: the target type must be below the source type; the label takes the type the branch is taken with, the fall-through keeps the other."
+    rt1 = ValType.Ref(Bits.and(fl, 1) == 1, h1)
+    rt2 = ValType.Ref(Bits.and(fl, 2) == 2, h2)
+    diff = ValType.Ref(Bool.and(Bits.and(fl, 1) == 1, Bits.and(fl, 2) == 0), h1)
+    match Bool.and(Bool.and(heapOk(cx.m, h1), heapOk(cx.m, h2)), valSub(cx.m, rt2, rt1))
+        false -> err("type mismatch: br_on_cast target is not below its source")
+        true -> brOnCastLabel(cx, v, d, rt1, pickT(fail, diff, rt2), pickT(fail, rt2, diff))
+
+fn pickT(c: Bool, a: ValType, b: ValType) -> ValType
+    ? "a when c holds, else b."
+    match c
+        true -> a
+        false -> b
+
+verify pickT
+    pickT(true, ValType.I32, ValType.I64) => ValType.I32
+
+fn brOnCastLabel(cx: Cx, v: V, d: Int, rt1: ValType, branchT: ValType, stayT: ValType) -> Result<V, String>
+    ? "Checks a br_on_cast against its label."
+    lt = label(v, d)?
+    match List.reverse(lt)
+        [last, ..restRev] -> brOnCastWith(cx, v, rt1, branchT, stayT, last, List.reverse(restRev))
+        [] -> err("type mismatch: br_on_cast label has no reference")
+
+fn brOnCastWith(cx: Cx, v: V, rt1: ValType, branchT: ValType, stayT: ValType, last: ValType, rest: List<ValType>) -> Result<V, String>
+    ? "br_on_cast with the label's last type known."
+    match valSub(cx.m, branchT, last)
+        false -> err("type mismatch: br_on_cast label")
+        true -> Result.Ok(pushT(pushTs(popTs(cx, popT(cx, v, rt1)?, rest)?, rest), stayT))
+
+fn convertRef(cx: Cx, v: V, from: Int, to: Int) -> Result<V, String>
+    ? "any.convert_extern and extern.convert_any: keep nullability, change hierarchy."
+    r = popRef(v)?
+    match r.o
+        Opd.Bot -> Result.Ok(pushO(r.v, Opd.Bot))
+        Opd.T(ValType.Ref(n, h)) -> check(heapSub(cx.m, h, from), "type mismatch: conversion", pushT(r.v, ValType.Ref(n, to)))
+        _ -> err("type mismatch: conversion")
+
+// ---- structs and arrays ----
+
+fn structFieldsOf(cx: Cx, t: Int) -> Result<List<ValType>, String>
+    ? "The fields of struct type t."
+    match compOf(cx.m, t)
+        Option.Some(Comp.StructT(fs)) -> Result.Ok(List.fromVector(fs))
+        _ -> Result.Err("unknown type {t}: not a struct type")
+
+fn arrayElemOf(cx: Cx, t: Int) -> Result<ValType, String>
+    ? "The element type of array type t."
+    match compOf(cx.m, t)
+        Option.Some(Comp.ArrayT(e)) -> Result.Ok(e)
+        _ -> Result.Err("unknown type {t}: not an array type")
+
+fn mutAt(cx: Cx, t: Int, k: Int) -> Bool
+    ? "Whether field k of type t (element 0 of an array) is mutable."
+    match Vector.get(cx.m.types, t)
+        Option.Some(st) -> firstOrB(List.drop(st.muts, k))
+        Option.None -> false
+
+fn allDefaultable(ts: List<ValType>) -> Bool
+    ? "Whether every type has a default."
+    match ts
+        [] -> true
+        [t, ..rest] -> Bool.and(defaultable(t), allDefaultable(rest))
+
+verify allDefaultable
+    allDefaultable([ValType.I32, ValType.Ref(false, -18)]) => false
+
+fn unpackAll(ts: List<ValType>, acc: List<ValType>) -> List<ValType>
+    ? "Every storage type as the value type it reads as."
+    match ts
+        [] -> List.reverse(acc)
+        [t, ..rest] -> unpackAll(rest, List.prepend(unpacked(t), acc))
+
+verify unpackAll
+    unpackAll([ValType.I8], []) => [ValType.I32]
+
+fn structNew(cx: Cx, v: V, t: Int, dflt: Bool) -> Result<V, String>
+    ? "struct.new and struct.new_default."
+    fs = structFieldsOf(cx, t)?
+    match dflt
+        true -> check(allDefaultable(fs), "type mismatch: field is not defaultable", pushT(v, ValType.Ref(false, t)))
+        false -> op(cx, v, unpackAll(fs, []), [ValType.Ref(false, t)])
+
+fn structGet(cx: Cx, v: V, t: Int, k: Int, e: Int) -> Result<V, String>
+    ? "struct.get, get_s and get_u: a signed or unsigned read exactly when the field is packed."
+    fs = structFieldsOf(cx, t)?
+    ft = Result.fromOption(Vector.get(Vector.fromList(fs), k), "unknown field {k}")?
+    match Ast.isPacked(ft) == (e != 0)
+        false -> err("type mismatch: packed field access")
+        true -> op(cx, v, [ValType.Ref(true, t)], [unpacked(ft)])
+
+fn structSet(cx: Cx, v: V, t: Int, k: Int) -> Result<V, String>
+    ? "struct.set: only of a mutable field."
+    fs = structFieldsOf(cx, t)?
+    ft = Result.fromOption(Vector.get(Vector.fromList(fs), k), "unknown field {k}")?
+    match mutAt(cx, t, k)
+        false -> err("field is immutable")
+        true -> op(cx, v, [ValType.Ref(true, t), unpacked(ft)], [])
+
+fn arrayNew(cx: Cx, v: V, t: Int, kind: Int, n: Int) -> Result<V, String>
+    ? "array.new (0), array.new_default (1) and array.new_fixed (2)."
+    et = unpacked(arrayElemOf(cx, t)?)
+    out = [ValType.Ref(false, t)]
+    match kind
+        0 -> op(cx, v, [et, i32t()], out)
+        1 -> check(defaultable(et), "type mismatch: element is not defaultable", pushT(popT(cx, v, i32t())?, ValType.Ref(false, t)))
+        _ -> op(cx, v, repeatT(et, n, []), out)
+
+fn repeatT(t: ValType, n: Int, acc: List<ValType>) -> List<ValType>
+    ? "n copies of t."
+    match n <= 0
+        true -> acc
+        false -> repeatT(t, n - 1, List.prepend(t, acc))
+
+verify repeatT
+    repeatT(ValType.I32, 2, []) => [ValType.I32, ValType.I32]
+
+fn arrayData(cx: Cx, v: V, t: Int, d: Int, init: Bool) -> Result<V, String>
+    ? "array.new_data and array.init_data: numeric elements only, and the data count section."
+    et = arrayElemOf(cx, t)?
+    match isRef(et)
+        true -> err("type mismatch: array.new_data of references")
+        false -> needData(cx, d, arrayDataOp(cx, v, t, init))
+
+fn arrayDataOp(cx: Cx, v: V, t: Int, init: Bool) -> Result<V, String>
+    ? "The stack effect of array.new_data or array.init_data."
+    match init
+        false -> op(cx, v, [i32t(), i32t()], [ValType.Ref(false, t)])
+        true -> check(mutAt(cx, t, 0), "array is immutable", popTs(cx, v, [ValType.Ref(true, t), i32t(), i32t(), i32t()])?)
+
+fn arrayElem(cx: Cx, v: V, t: Int, e: Int, init: Bool) -> Result<V, String>
+    ? "array.new_elem and array.init_elem: the segment's elements must fit the array's."
+    et = arrayElemOf(cx, t)?
+    st = Result.fromOption(Vector.get(cx.elemTypes, e), "unknown elem segment {e}")?
+    match valSub(cx.m, st, et)
+        false -> err("type mismatch: array elements")
+        true -> arrayElemOp(cx, v, t, init)
+
+fn arrayElemOp(cx: Cx, v: V, t: Int, init: Bool) -> Result<V, String>
+    ? "The stack effect of array.new_elem or array.init_elem."
+    match init
+        false -> op(cx, v, [i32t(), i32t()], [ValType.Ref(false, t)])
+        true -> check(mutAt(cx, t, 0), "array is immutable", popTs(cx, v, [ValType.Ref(true, t), i32t(), i32t(), i32t()])?)
+
+fn arrayGet(cx: Cx, v: V, t: Int, e: Int) -> Result<V, String>
+    ? "array.get, get_s and get_u."
+    et = arrayElemOf(cx, t)?
+    match Ast.isPacked(et) == (e != 0)
+        false -> err("type mismatch: packed element access")
+        true -> op(cx, v, [ValType.Ref(true, t), i32t()], [unpacked(et)])
+
+fn arraySet(cx: Cx, v: V, t: Int) -> Result<V, String>
+    ? "array.set: only of a mutable array."
+    et = arrayElemOf(cx, t)?
+    match mutAt(cx, t, 0)
+        false -> err("array is immutable")
+        true -> op(cx, v, [ValType.Ref(true, t), i32t(), unpacked(et)], [])
+
+fn arrayFill(cx: Cx, v: V, t: Int) -> Result<V, String>
+    ? "array.fill."
+    et = arrayElemOf(cx, t)?
+    match mutAt(cx, t, 0)
+        false -> err("array is immutable")
+        true -> op(cx, v, [ValType.Ref(true, t), i32t(), unpacked(et), i32t()], [])
+
+fn arrayCopy(cx: Cx, v: V, t1: Int, t2: Int) -> Result<V, String>
+    ? "array.copy: into a mutable array, from one whose elements fit."
+    e1 = arrayElemOf(cx, t1)?
+    e2 = arrayElemOf(cx, t2)?
+    match Bool.and(mutAt(cx, t1, 0), storageSubM(cx.m, e2, e1))
+        false -> err("type mismatch: array.copy")
+        true -> op(cx, v, [ValType.Ref(true, t1), i32t(), ValType.Ref(true, t2), i32t(), i32t()], [])
+
+// ---- the module ----
+
+fn validate(m: Module) -> Result<Vector<Shape>, String>
+    ? "Checks the whole module. The answer is the shape of every function's body: its highest operand stack, which sizes its stack when it runs, and the height before each instruction, which resolves its branches."
+    ok1 = typesValid(m, List.fromVector(m.types), 0)?
+    cx = context(m)
+    ok2 = importsAndFuncs(cx, List.fromVector(m.funcs))?
+    ok3 = tablesValid(cx, m.tables, m.tableInits)?
+    ok4 = memValid(m)?
+    ok4b = tagsValid(m, m.tags)?
+    ok5 = globalsValid(cx, List.fromVector(m.globals), 0)?
+    ok6 = exportsValid(cx, m.exports, {})?
+    ok7 = startValid(cx)?
+    ok8 = elemsValid(cx, List.fromVector(m.elems))?
+    ok9 = datasValid(cx, List.fromVector(m.datas))?
+    ok10 = dataCountValid(m)?
+    bodiesValid(cx, List.fromVector(m.funcs), [])
+
+fn check1(ok: Bool, msg: String) -> Result<Unit, String>
+    ? "Unit when ok holds, else the failure msg."
+    match ok
+        true -> Result.Ok(Unit)
+        false -> Result.Err(msg)
+
+verify check1
+    check1(false, "x") => Result.Err("x")
+    check1(true, "x") => Result.Ok(Unit)
+
+fn context(m: Module) -> Cx
+    ? "What every body sees: function types, declared references, globals, tables and element types."
+    Cx(m = m, locals = Vector.fromList([]), ret = [], fnTypes = Vector.fromList(fnTypeList(List.fromVector(m.funcs), [])), refs = declaredRefs(m), globals = m.globals, tables = Vector.fromList(m.tables), elemTypes = Vector.fromList(elemTypeList(List.fromVector(m.elems), [])))
+
+fn fnTypeList(fs: List<Func>, acc: List<Int>) -> List<Int>
+    ? "The type index of every function."
+    match fs
+        [] -> List.reverse(acc)
+        [f, ..rest] -> fnTypeList(rest, List.prepend(fnTypeOf(f), acc))
+
+fn fnTypeOf(f: Func) -> Int
+    ? "A function's type index."
+    match f
+        Func.Imported(_, _, t) -> t
+        Func.Local(t, _, _) -> t
+
+verify fnTypeList
+    fnTypeList([Func.Imported("a", "b", 3)], []) => [3]
+
+verify fnTypeOf
+    fnTypeOf(Func.Local(2, Vector.fromList([]), Vector.fromList([]))) => 2
+
+fn elemTypeList(es: List<Elem>, acc: List<ValType>) -> List<ValType>
+    ? "The element type of every segment."
+    match es
+        [] -> List.reverse(acc)
+        [e, ..rest] -> elemTypeList(rest, List.prepend(e.ty, acc))
+
+verify elemTypeList
+    elemTypeList([], []) => []
+
+fn declaredRefs(m: Module) -> Map<Int, Unit>
+    ? "The functions ref.func may name in a body: those in element segments, exports, and global and table initializers."
+    a = refsInCodes(globalInits(List.fromVector(m.globals), []), {})
+    b = refsInCodes(elemCodes(List.fromVector(m.elems), []), a)
+    c = refsInCodes(m.tableInits, b)
+    exportRefs(m.exports, c)
+
+fn globalInits(gs: List<Global>, acc: List<Vector<Instr>>) -> List<Vector<Instr>>
+    ? "Every global's initializer."
+    match gs
+        [] -> acc
+        [g, ..rest] -> globalInits(rest, List.prepend(g.init, acc))
+
+verify globalInits
+    globalInits([], []) => []
+
+fn elemCodes(es: List<Elem>, acc: List<Vector<Instr>>) -> List<Vector<Instr>>
+    ? "Every item expression of the element segments."
+    match es
+        [] -> acc
+        [e, ..rest] -> elemCodes(rest, List.concat(e.items, acc))
+
+verify elemCodes
+    elemCodes([], []) => []
+
+fn refsInCodes(cs: List<Vector<Instr>>, acc: Map<Int, Unit>) -> Map<Int, Unit>
+    ? "acc with every function a ref.func in cs names."
+    match cs
+        [] -> acc
+        [c, ..rest] -> refsInCodes(rest, refsIn(List.fromVector(c), acc))
+
+verify refsInCodes
+    refsInCodes([Vector.fromList([Instr.RefFunc(1)])], {}) => {1 => Unit}
+
+fn refsIn(is: List<Instr>, acc: Map<Int, Unit>) -> Map<Int, Unit>
+    ? "acc with every function a ref.func in is names."
+    match is
+        [] -> acc
+        [Instr.RefFunc(k), ..rest] -> refsIn(rest, Map.set(acc, k, Unit))
+        [_, ..rest] -> refsIn(rest, acc)
+
+verify refsIn
+    refsIn([Instr.RefFunc(3), Instr.End], {}) => {3 => Unit}
+
+fn exportRefs(es: List<Export>, acc: Map<Int, Unit>) -> Map<Int, Unit>
+    ? "acc with every exported function."
+    match es
+        [] -> acc
+        [e, ..rest] -> exportRefs(rest, exportRef(e, acc))
+
+verify exportRefs
+    exportRefs([], {}) => {}
+
+fn exportRef(e: Export, acc: Map<Int, Unit>) -> Map<Int, Unit>
+    ? "acc with e's function when e exports one."
+    match e.kind == 0
+        true -> Map.set(acc, e.index, Unit)
+        false -> acc
+
+verify exportRef
+    exportRef(Export(name = "f", kind = 0, index = 2), {}) => {2 => Unit}
+    exportRef(Export(name = "m", kind = 2, index = 0), {}) => {}
+
+fn typesValid(m: Module, ts: List<SubType>, i: Int) -> Result<Unit, String>
+    ? "Each type: its references stay inside what is defined so far and its own rec group, its supertype comes earlier, is not final, and it matches it structurally."
+    match ts
+        [] -> Result.Ok(Unit)
+        [st, ..rest] -> typesValidNext(m, st, rest, i)
+
+fn typesValidNext(m: Module, st: SubType, rest: List<SubType>, i: Int) -> Result<Unit, String>
+    ? "Checks one type and goes on."
+    lim = groupEnd(m, st.group, i)
+    ok1 = check1(compRefsOk(st.comp, lim), "unknown type")?
+    ok2 = superValid(m, st, i)?
+    ok3 = check1(depth(m, i, 0) <= 63, "sub type: subtyping depth exceeds 63")?
+    typesValid(m, rest, i + 1)
+
+fn depth(m: Module, t: Int, d: Int) -> Int
+    ? "How many supertypes lie above type t, counting from d; stops past the limit so a cycle cannot loop."
+    s2 = superOf(m, t)
+    match Bool.or(s2 < 0, d > 64)
+        true -> d
+        false -> depth(m, s2, d + 1)
+
+verify depth
+    depth(Ast.emptyModule(), 0, 0) => 0
+    depth(Module.update(Ast.emptyModule(), types = Vector.fromList([SubType(comp = Comp.StructT(Vector.fromList([])), supers = [], final = false, group = 0, muts = []), SubType(comp = Comp.StructT(Vector.fromList([])), supers = [0], final = true, group = 1, muts = [])])), 1, 0) => 1
+
+fn groupEnd(m: Module, g: Int, i: Int) -> Int
+    ? "One past the last index of rec group g, which contains index i."
+    match Vector.get(m.types, i)
+        Option.Some(st) -> groupEndNext(m, g, i, st.group == g)
+        Option.None -> i
+
+fn groupEndNext(m: Module, g: Int, i: Int, same: Bool) -> Int
+    ? "Walks to the end of the group."
+    match same
+        true -> groupEnd(m, g, i + 1)
+        false -> i
+
+verify groupEnd
+    groupEnd(Ast.emptyModule(), 0, 0) => 0
+
+verify groupEndNext
+    groupEndNext(Ast.emptyModule(), 0, 3, false) => 3
+
+fn compRefsOk(c: Comp, lim: Int) -> Bool
+    ? "Whether every type index in a composite type is below lim."
+    match c
+        Comp.FuncT(ps, rs) -> Bool.and(refsBelow(ps, lim), refsBelow(rs, lim))
+        Comp.StructT(fs) -> refsBelow(List.fromVector(fs), lim)
+        Comp.ArrayT(e) -> refsBelow([e], lim)
+
+verify compRefsOk
+    compRefsOk(Comp.ArrayT(ValType.Ref(true, 1)), 1) => false
+
+fn refsBelow(ts: List<ValType>, lim: Int) -> Bool
+    ? "Whether every type index in ts is below lim, and every abstract type known."
+    match ts
+        [] -> true
+        [ValType.Ref(_, h), ..rest] -> Bool.and(refBelow(h, lim), refsBelow(rest, lim))
+        [_, ..rest] -> refsBelow(rest, lim)
+
+fn refBelow(h: Int, lim: Int) -> Bool
+    ? "Whether a heap type is a defined index or a known abstract type."
+    match h >= 0
+        true -> h < lim
+        false -> Bool.and(h >= -23, h <= -12)
+
+verify refsBelow
+    refsBelow([ValType.Ref(true, 3)], 3) => false
+    refsBelow([ValType.Ref(true, 2), ValType.I32], 3) => true
+
+verify refBelow
+    refBelow(-50, 3) => false
+
+fn superValid(m: Module, st: SubType, i: Int) -> Result<Unit, String>
+    ? "At most one supertype, defined before, not final, and matched structurally."
+    match st.supers
+        [] -> Result.Ok(Unit)
+        [s] -> superOne(m, st, s, i)
+        _ -> Result.Err("multiple supertypes")
+
+fn superOne(m: Module, st: SubType, s: Int, i: Int) -> Result<Unit, String>
+    ? "Checks the one declared supertype."
+    match Vector.get(m.types, s)
+        Option.None -> Result.Err("unknown type {s}")
+        Option.Some(sup) -> superFound(m, st, sup, s < i)
+
+fn superFound(m: Module, st: SubType, sup: SubType, earlier: Bool) -> Result<Unit, String>
+    ? "The supertype found: earlier, not final, structurally matched."
+    ok1 = check1(earlier, "unknown type: supertype must be defined first")?
+    ok2 = check1(Bool.not(sup.final), "sub type: cannot extend a final type")?
+    check1(compSub(m, st, sup), "sub type: does not match its supertype")
+
+fn compSub(m: Module, a: SubType, b: SubType) -> Bool
+    ? "Structural subtyping of composite types: functions contravariant in parameters and covariant in results, structs by a prefix of fields, arrays by their element."
+    match a.comp
+        Comp.FuncT(pa, ra) -> funcSub(m, pa, ra, b.comp)
+        Comp.StructT(fa) -> structSub(m, List.fromVector(fa), a.muts, b)
+        Comp.ArrayT(ea) -> arraySub(m, ea, a.muts, b)
+
+fn funcSub(m: Module, pa: List<ValType>, ra: List<ValType>, c: Comp) -> Bool
+    ? "Function subtyping."
+    match c
+        Comp.FuncT(pb, rb) -> Bool.and(valsSub(m, pb, pa), valsSub(m, ra, rb))
+        _ -> false
+
+verify funcSub
+    funcSub(Ast.emptyModule(), [ValType.Ref(true, -18)], [], Comp.FuncT([ValType.Ref(true, -20)], [])) => true
+    funcSub(Ast.emptyModule(), [], [], Comp.ArrayT(ValType.I8)) => false
+
+fn structSub(m: Module, fa: List<ValType>, ma: List<Bool>, b: SubType) -> Bool
+    ? "Struct subtyping: b's fields are a prefix of a's, each matching."
+    match b.comp
+        Comp.StructT(fb) -> fieldsSub(m, fa, ma, List.fromVector(fb), b.muts)
+        _ -> false
+
+fn arraySub(m: Module, ea: ValType, ma: List<Bool>, b: SubType) -> Bool
+    ? "Array subtyping by the element field."
+    match b.comp
+        Comp.ArrayT(eb) -> fieldsSub(m, [ea], ma, [eb], b.muts)
+        _ -> false
+
+fn fieldsSub(m: Module, fa: List<ValType>, ma: List<Bool>, fb: List<ValType>, mb: List<Bool>) -> Bool
+    ? "Every field of fb matched by the field of fa at the same place."
+    match fb
+        [] -> true
+        [tb, ..restB] -> fieldsSubNext(m, fa, ma, tb, restB, mb)
+
+fn fieldsSubNext(m: Module, fa: List<ValType>, ma: List<Bool>, tb: ValType, restB: List<ValType>, mb: List<Bool>) -> Bool
+    ? "One field pair."
+    match fa
+        [] -> false
+        [ta, ..restA] -> Bool.and(fieldSub(m, ta, firstOrB(ma), tb, firstOrB(mb)), fieldsSub(m, restA, List.drop(ma, 1), restB, List.drop(mb, 1)))
+
+verify fieldsSub
+    fieldsSub(Ast.emptyModule(), [ValType.I32, ValType.I64], [false, false], [ValType.I32], [false]) => true
+    fieldsSub(Ast.emptyModule(), [ValType.I32], [false], [ValType.I32, ValType.I64], [false, false]) => false
+
+fn firstOrB(bs: List<Bool>) -> Bool
+    ? "The first of a list of Bools, false when empty."
+    match bs
+        [b, .._] -> b
+        [] -> false
+
+verify firstOrB
+    firstOrB([]) => false
+    firstOrB([true]) => true
+
+fn fieldSub(m: Module, ta: ValType, mutA: Bool, tb: ValType, mutB: Bool) -> Bool
+    ? "A field matches another when both are constant and its type is a subtype, or both are mutable and the types are the same both ways."
+    match mutA == mutB
+        false -> false
+        true -> fieldSubSame(m, ta, tb, mutA)
+
+fn fieldSubSame(m: Module, ta: ValType, tb: ValType, mutable: Bool) -> Bool
+    ? "fieldSub once mutability agrees."
+    match mutable
+        true -> Bool.and(storageSubM(m, ta, tb), storageSubM(m, tb, ta))
+        false -> storageSubM(m, ta, tb)
+
+fn storageSubM(m: Module, a: ValType, b: ValType) -> Bool
+    ? "Storage subtyping: packed types only match themselves."
+    match Bool.or(Ast.isPacked(a), Ast.isPacked(b))
+        true -> a == b
+        false -> valSub(m, a, b)
+
+verify fieldSub
+    fieldSub(Ast.emptyModule(), ValType.Ref(false, -20), false, ValType.Ref(true, -18), false) => true
+    fieldSub(Ast.emptyModule(), ValType.Ref(false, -20), true, ValType.Ref(true, -18), true) => false
+    fieldSub(Ast.emptyModule(), ValType.I32, true, ValType.I32, false) => false
+
+verify storageSubM
+    storageSubM(Ast.emptyModule(), ValType.I8, ValType.I32) => false
+
+fn importsAndFuncs(cx: Cx, fs: List<Func>) -> Result<Unit, String>
+    ? "Every function's type index names a function type."
+    match fs
+        [] -> Result.Ok(Unit)
+        [f, ..rest] -> importsAndFuncsNext(cx, kindOf(cx.m, fnTypeOf(f)) == 0, rest)
+
+fn importsAndFuncsNext(cx: Cx, ok: Bool, rest: List<Func>) -> Result<Unit, String>
+    ? "One function's type checked."
+    match ok
+        false -> Result.Err("unknown type: function type expected")
+        true -> importsAndFuncs(cx, rest)
+
+fn tablesValid(cx: Cx, ts: List<ValType>, inits: List<Vector<Instr>>) -> Result<Unit, String>
+    ? "Tables hold references of existing types; a table with an initializer expression needs one of its element type, one without needs a nullable element type."
+    match ts
+        [] -> Result.Ok(Unit)
+        [t, ..rest] -> tableOk(cx, t, firstInit(inits), rest, List.drop(inits, 1))
+
+fn importedGlobals(gs: List<Global>, n: Int) -> Int
+    ? "How many globals are imported: they come first, and they are all a table initializer may read, since the global section comes after the table section."
+    match gs
+        [g, ..rest] -> match g.from == ""
+            true -> n
+            false -> importedGlobals(rest, n + 1)
+        [] -> n
+
+verify importedGlobals
+    importedGlobals([Global(ty = ValType.I32, init = Vector.fromList([]), from = "a.b", mut = false), Global(ty = ValType.I32, init = Vector.fromList([]), from = "", mut = false)], 0) => 1
+
+fn firstInit(inits: List<Vector<Instr>>) -> Vector<Instr>
+    ? "The first initializer, empty when none."
+    match inits
+        [e, .._] -> e
+        [] -> Vector.fromList([])
+
+fn tableOk(cx: Cx, t: ValType, init: Vector<Instr>, rest: List<ValType>, inits: List<Vector<Instr>>) -> Result<Unit, String>
+    ? "One table type and its initializer."
+    ok = tableInitOk(cx, t, init)?
+    match t
+        ValType.Ref(_, h) -> tablesValidNext(cx, heapOk(cx.m, h), rest, inits)
+        _ -> Result.Err("malformed reference type")
+
+fn tableInitOk(cx: Cx, t: ValType, init: Vector<Instr>) -> Result<Unit, String>
+    ? "An initializer's type, or a nullable element type when there is none."
+    match Vector.len(init) == 0
+        false -> constType(cx, init, t, importedGlobals(List.fromVector(cx.globals), 0))
+        true -> match t
+            ValType.Ref(false, _) -> Result.Err("type mismatch: table of non-nullable references needs an initializer")
+            _ -> Result.Ok(Unit)
+
+fn tablesValidNext(cx: Cx, ok: Bool, rest: List<ValType>, inits: List<Vector<Instr>>) -> Result<Unit, String>
+    ? "Goes on after one table."
+    match ok
+        false -> Result.Err("unknown type")
+        true -> tablesValid(cx, rest, inits)
+
+verify firstInit
+    firstInit([]) => Vector.fromList([])
+
+fn memValid(m: Module) -> Result<Unit, String>
+    ? "A memory's size limits: minimum at most maximum, both within 65536 pages."
+    match m.hasMemory
+        false -> Result.Ok(Unit)
+        true -> moreMemsValid(m, memLimits(m.memMin, m.memMax, Ast.memIs64(m, 0)), m.moreMems, 1)
+
+fn moreMemsValid(m: Module, r: Result<Unit, String>, ms: List<MemType>, k: Int) -> Result<Unit, String>
+    ? "r, then the limits of each further memory, k being the next one's index."
+    ok = r?
+    match ms
+        [] -> Result.Ok(Unit)
+        [t, ..rest] -> moreMemsValid(m, memLimits(t.min, t.max, Ast.memIs64(m, k)), rest, k + 1)
+
+verify moreMemsValid
+    moreMemsValid(Ast.emptyModule(), Result.Ok(Unit), [MemType(min = 2, max = 1)], 1) => Result.Err("size minimum must not be greater than maximum")
+
+verify memValid
+    memValid(Ast.emptyModule()) => Result.Ok(Unit)
+
+fn memLimits(lo: Int, hi: Int, wide: Bool) -> Result<Unit, String>
+    ? "Checks memory limits: at most 65536 pages, or 2^48 for a 64-bit memory."
+    cap = pickInt(wide, 281474976710656, 65536)
+    msg = memCapMsg(wide)
+    ok1 = check1(lo <= cap, msg)?
+    ok2 = check1(hi <= cap, msg)?
+    check1(lo <= hi, "size minimum must not be greater than maximum")
+
+fn memCapMsg(wide: Bool) -> String
+    ? "What a memory too large is told."
+    match wide
+        true -> "memory size must be at most 2^48 pages"
+        false -> "memory size must be at most 65536 pages (4GiB)"
+
+verify memCapMsg
+    memCapMsg(true) => "memory size must be at most 2^48 pages"
+
+verify memLimits
+    memLimits(2, 1, false) => Result.Err("size minimum must not be greater than maximum")
+    memLimits(1, 70000, false) => Result.Err("memory size must be at most 65536 pages (4GiB)")
+    memLimits(1, 2, false) => Result.Ok(Unit)
+
+fn constType(cx: Cx, code: Vector<Instr>, want: ValType, nGlobals: Int) -> Result<Unit, String>
+    ? "A constant expression: only constant instructions, global.get only of an immutable global defined before, and the value fits want."
+    ok1 = constInstrs(cx, List.fromVector(code), nGlobals)?
+    c2 = Cx.update(cx, ret = [want], locals = Vector.fromList([]), globals = Vector.fromList(List.take(List.fromVector(cx.globals), nGlobals)))
+    validateBody(c2, code)
+
+fn constInstrs(cx: Cx, is: List<Instr>, nGlobals: Int) -> Result<Unit, String>
+    ? "Every instruction of a constant expression is a constant one."
+    match is
+        [] -> Result.Ok(Unit)
+        [i, ..rest] -> constInstrsNext(cx, constOk(cx, i, nGlobals), rest, nGlobals)
+
+fn constInstrsNext(cx: Cx, ok: Bool, rest: List<Instr>, nGlobals: Int) -> Result<Unit, String>
+    ? "Goes on after one constant instruction."
+    match ok
+        false -> Result.Err("constant expression required")
+        true -> constInstrs(cx, rest, nGlobals)
+
+fn constOk(cx: Cx, i: Instr, nGlobals: Int) -> Bool
+    ? "Whether an instruction may appear in a constant expression."
+    match i
+        Instr.I32Const(_) -> true
+        Instr.I64Const(_) -> true
+        Instr.F32Const(_) -> true
+        Instr.F64Const(_) -> true
+        Instr.Simd(o, _, _, _, _) -> o == 12
+        Instr.RefNull(_) -> true
+        Instr.RefFunc(_) -> true
+        Instr.GlobalGet(k) -> constGlobal(cx, k, nGlobals)
+        Instr.StructNew(_) -> true
+        Instr.StructNewDefault(_) -> true
+        Instr.ArrayNew(_) -> true
+        Instr.ArrayNewDefault(_) -> true
+        Instr.ArrayNewFixed(_, _) -> true
+        Instr.RefI31 -> true
+        Instr.AnyConvertExtern -> true
+        Instr.ExternConvertAny -> true
+        Instr.Bin(o) -> List.contains([106, 107, 108, 124, 125, 126], o)
+        Instr.End -> true
+        _ -> false
+
+fn constGlobal(cx: Cx, k: Int, nGlobals: Int) -> Bool
+    ? "Whether global k may be read in a constant expression: defined before and immutable."
+    match Vector.get(cx.globals, k)
+        Option.Some(g) -> Bool.and(k < nGlobals, Bool.not(g.mut))
+        Option.None -> false
+
+fn globalsValid(cx: Cx, gs: List<Global>, k: Int) -> Result<Unit, String>
+    ? "Each global's type exists and its initializer is a constant of that type; an imported one is taken as given."
+    match gs
+        [] -> Result.Ok(Unit)
+        [g, ..rest] -> globalsValidNext(cx, g, rest, k)
+
+fn globalsValidNext(cx: Cx, g: Global, rest: List<Global>, k: Int) -> Result<Unit, String>
+    ? "Checks one global."
+    ok1 = check1(typeOk(cx.m, g.ty), "unknown type")?
+    ok2 = globalInit(cx, g, k)?
+    globalsValid(cx, rest, k + 1)
+
+fn globalInit(cx: Cx, g: Global, k: Int) -> Result<Unit, String>
+    ? "A local global's initializer."
+    match g.from == ""
+        true -> constType(cx, g.init, g.ty, k)
+        false -> Result.Ok(Unit)
+
+fn exportsValid(cx: Cx, es: List<Export>, seen: Map<String, Unit>) -> Result<Unit, String>
+    ? "Export names are unique and name things that exist."
+    match es
+        [] -> Result.Ok(Unit)
+        [e, ..rest] -> exportOne(cx, e, rest, seen)
+
+fn exportOne(cx: Cx, e: Export, rest: List<Export>, seen: Map<String, Unit>) -> Result<Unit, String>
+    ? "Checks one export."
+    ok1 = check1(Bool.not(Map.has(seen, e.name)), "duplicate export name")?
+    ok2 = check1(exportTargetOk(cx, e), "unknown export target")?
+    exportsValid(cx, rest, Map.set(seen, e.name, Unit))
+
+fn exportTargetOk(cx: Cx, e: Export) -> Bool
+    ? "Whether an export's index is in range for its kind."
+    match e.kind
+        0 -> e.index < Vector.len(cx.fnTypes)
+        1 -> e.index < Vector.len(cx.tables)
+        2 -> e.index < Ast.memCount(cx.m)
+        3 -> e.index < Vector.len(cx.globals)
+        4 -> e.index < List.len(cx.m.tags)
+        _ -> false
+
+fn startValid(cx: Cx) -> Result<Unit, String>
+    ? "The start function exists and takes and returns nothing."
+    match cx.m.start < 0
+        true -> Result.Ok(Unit)
+        false -> startSig(fnSig(cx, cx.m.start)?)
+
+fn startSig(sg: Sig) -> Result<Unit, String>
+    ? "A start function's signature must be empty."
+    check1(Bool.and(List.len(sg.params) == 0, List.len(sg.results) == 0), "start function must have type [] -> []")
+
+verify startSig
+    startSig(Sig(params = [ValType.I32], results = [], ty = 0)) => Result.Err("start function must have type [] -> []")
+
+fn elemsValid(cx: Cx, es: List<Elem>) -> Result<Unit, String>
+    ? "Each element segment: items are constants of its type; an active one names a table it fits, at an i32 offset."
+    match es
+        [] -> Result.Ok(Unit)
+        [e, ..rest] -> elemOne(cx, e, rest)
+
+fn elemOne(cx: Cx, e: Elem, rest: List<Elem>) -> Result<Unit, String>
+    ? "Checks one element segment."
+    n = Vector.len(cx.globals)
+    ok1 = check1(typeOk(cx.m, e.ty), "unknown type")?
+    ok2 = itemsValid(cx, e.items, e.ty, n)?
+    ok3 = elemActive(cx, e, n)?
+    elemsValid(cx, rest)
+
+fn itemsValid(cx: Cx, items: List<Vector<Instr>>, t: ValType, n: Int) -> Result<Unit, String>
+    ? "Each item is a constant of type t."
+    match items
+        [] -> Result.Ok(Unit)
+        [c, ..rest] -> itemsValidNext(cx, constType(cx, c, t, n)?, rest, t, n)
+
+fn itemsValidNext(cx: Cx, u: Unit, rest: List<Vector<Instr>>, t: ValType, n: Int) -> Result<Unit, String>
+    ? "Goes on after one item."
+    itemsValid(cx, rest, t, n)
+
+fn elemActive(cx: Cx, e: Elem, n: Int) -> Result<Unit, String>
+    ? "An active segment's table and offset."
+    match e.mode == 0
+        false -> Result.Ok(Unit)
+        true -> elemTable(cx, e, n, Vector.get(cx.tables, e.table))
+
+fn elemTable(cx: Cx, e: Elem, n: Int, tt: Option<ValType>) -> Result<Unit, String>
+    ? "The active segment's table found."
+    match tt
+        Option.None -> Result.Err("unknown table {e.table}")
+        Option.Some(t) -> elemFits(cx, e, n, valSub(cx.m, e.ty, t))
+
+fn elemFits(cx: Cx, e: Elem, n: Int, ok: Bool) -> Result<Unit, String>
+    ? "The segment fits its table; check the offset."
+    match ok
+        false -> Result.Err("type mismatch: element segment does not fit its table")
+        true -> constType(cx, e.offset, tableAt(cx, e.table), n)
+
+fn datasValid(cx: Cx, ds: List<Data>) -> Result<Unit, String>
+    ? "Active data segments need a memory and an i32 offset."
+    match ds
+        [] -> Result.Ok(Unit)
+        [d, ..rest] -> dataOne(cx, d, rest)
+
+fn dataOne(cx: Cx, d: Data, rest: List<Data>) -> Result<Unit, String>
+    ? "Checks one data segment."
+    match d.active
+        false -> datasValid(cx, rest)
+        true -> dataActive(cx, d, rest)
+
+fn dataActive(cx: Cx, d: Data, rest: List<Data>) -> Result<Unit, String>
+    ? "An active data segment."
+    ok1 = check1(d.mem < Ast.memCount(cx.m), "unknown memory {d.mem}")?
+    ok2 = constType(cx, d.offset, memAt(cx, d.mem), Vector.len(cx.globals))?
+    datasValid(cx, rest)
+
+fn dataCountValid(m: Module) -> Result<Unit, String>
+    ? "When there is a data count section, it counts the data segments."
+    match m.dataCount < 0
+        true -> Result.Ok(Unit)
+        false -> check1(m.dataCount == Vector.len(m.datas), "data count and data section have inconsistent lengths")
+
+verify dataCountValid
+    dataCountValid(Ast.emptyModule()) => Result.Ok(Unit)
+    dataCountValid(Module.update(Ast.emptyModule(), dataCount = 1)) => Result.Err("data count and data section have inconsistent lengths")
+
+fn bodiesValid(cx: Cx, fs: List<Func>, acc: List<Shape>) -> Result<Vector<Shape>, String>
+    ? "Every local function's body; the answer is each function's shape, an empty one for an import."
+    match fs
+        [] -> Result.Ok(Vector.fromList(List.reverse(acc)))
+        [f, ..rest] -> bodyOne(cx, f, rest, acc)
+
+fn bodyOne(cx: Cx, f: Func, rest: List<Func>, acc: List<Shape>) -> Result<Vector<Shape>, String>
+    ? "One function's body, with its locals and results."
+    match f
+        Func.Imported(_, _, _) -> bodiesValid(cx, rest, List.prepend(Shape(maxH = 0, heights = Vector.fromList([])), acc))
+        Func.Local(t, ls, code) -> bodyLocal(cx, t, ls, code, rest, acc)
+
+fn bodyLocal(cx: Cx, t: Int, ls: Vector<ValType>, code: Vector<Instr>, rest: List<Func>, acc: List<Shape>) -> Result<Vector<Shape>, String>
+    ? "Checks a local function: its locals' types exist, then its body."
+    ok1 = check1(typesOk(cx.m, List.fromVector(ls)), "unknown type")?
+    np = List.len(Ast.funcParams(cx.m, t))
+    c2 = Cx.update(cx, locals = ls, ret = Ast.funcResults(cx.m, t))
+    h = bodyWithParams(c2, code, np)?
+    bodiesValid(cx, rest, List.prepend(h, acc))
+
+fn bodyWithParams(cx: Cx, code: Vector<Instr>, np: Int) -> Result<Shape, String>
+    ? "A body whose first np locals are parameters, already initialized."
+    v0 = V(stack = [], height = 0, ctrls = [Ctrl(kind = 0, start = [], end = cx.ret, height = 0, unreach = false, inits = {})], inits = paramInits(np, 0, {}), maxH = 0)
+    bodyFrom(cx, code, 0, v0, [])

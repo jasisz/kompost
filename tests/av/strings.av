@@ -1,0 +1,19 @@
+module Main
+    intent = "Strings, interpolation, splitting and joining."
+    effects [Console.print]
+
+fn shout(s: String) -> String
+    ? "Upper case with a bang."
+    "{String.toUpper(s)}!"
+
+verify shout
+    shout("hi") => "HI!"
+
+fn main() -> Unit
+    ! [Console.print]
+    Console.print(shout("kompost"))
+    Console.print(String.join(List.reverse(String.split("a,b,c", ",")), "-"))
+    Console.print("len {String.len("zażółć")} bytes {String.byteLength("zażółć")}")
+    Console.print(String.replace("pestka w kompoście", "pestka", "Pestka"))
+    Console.print("{String.slice("abcdef", 1, 4)} {String.contains("abc", "bc")} {String.startsWith("abc", "ab")}")
+    Console.print(String.trim("   środek   "))

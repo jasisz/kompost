@@ -1,0 +1,1593 @@
+module Decode
+    intent =
+        "Decodes the binary format of a wasm module into Ast.Module. Function"
+        "bodies and constant expressions become Vectors of instructions whose"
+        "blocks and ifs already know where they end, so running them never"
+        "scans for a matching end."
+    exposes [decode, expr, instr, IR, Code]
+    depends [Bin, Ast, Canon, Simd]
+    effects []
+
+record IR
+    i: Instr
+    next: Int
+
+record Code
+    code: Vector<Instr>
+    next: Int
+
+record VT
+    t: ValType
+    next: Int
+
+record VTs
+    ts: List<ValType>
+    next: Int
+
+record BT
+    params: Int
+    results: Int
+    next: Int
+    sig: Sig
+
+record Open
+    at: Int
+    els: Int
+
+record Patch
+    at: Int
+    els: Int
+    end: Int
+
+record St
+    m: Module
+    localTypes: List<Int>
+    group: Int
+
+fn decode(buf: Vector<Int>) -> Result<Module, String>
+    ? "The module the octets encode, or why they do not encode one."
+    match Vector.len(buf) < 8
+        true -> Result.Err("unexpected end")
+        false -> match Bin.fixed(buf, 0, 4) == 1836278016
+            false -> Result.Err("not a wasm module: bad magic")
+            true -> afterMagic(buf)
+
+verify decode
+    decode(Vector.fromList([1, 2, 3, 4, 1, 0, 0, 0])) => Result.Err("not a wasm module: bad magic")
+    decode(Vector.fromList([0, 97, 115, 109, 1])) => Result.Err("unexpected end")
+    decode(Vector.fromList([0, 97, 115, 109, 1, 0, 0, 0])) => Result.Ok(Ast.emptyModule())
+
+fn afterMagic(buf: Vector<Int>) -> Result<Module, String>
+    ? "Checks the version and decodes the sections."
+    match Bin.fixed(buf, 4, 4) == 1
+        false -> Result.Err("unsupported wasm version")
+        true -> finish(sections(buf, 8, 0, St(m = Ast.emptyModule(), localTypes = [], group = 0))?)
+
+verify afterMagic
+    afterMagic(Vector.fromList([0, 97, 115, 109, 2, 0, 0, 0])) => Result.Err("unsupported wasm version")
+
+fn finish(s: St) -> Result<Module, String>
+    ? "The module once every section is read; a function section without its code section is refused."
+    match s.localTypes
+        [] -> Result.Ok(Module.update(s.m, canon = Canon.canonicalize(s.m.types)))
+        _ -> Result.Err("function section without matching code section")
+
+verify finish
+    finish(St(m = Ast.emptyModule(), localTypes = [1], group = 0)) => Result.Err("function section without matching code section")
+
+fn sections(buf: Vector<Int>, p: Int, last: Int, s: St) -> Result<St, String>
+    ? "Reads sections from p to the end of the octets; last is the rank of the last non-custom section read."
+    match p >= Vector.len(buf)
+        true -> Result.Ok(s)
+        false -> sectionAt(buf, p, last, s)
+
+fn rank(id: Int) -> Int
+    ? "Where a section must come: custom sections (0) anywhere, the others in the order type, import, function, table, memory, tag, global, export, start, element, data count, code, data; -1 for an unknown id."
+    match id
+        0 -> 0
+        1 -> 1
+        2 -> 2
+        3 -> 3
+        4 -> 4
+        5 -> 5
+        13 -> 6
+        6 -> 7
+        7 -> 8
+        8 -> 9
+        9 -> 10
+        12 -> 11
+        10 -> 12
+        11 -> 13
+        _ -> -1
+
+verify rank
+    rank(13) => 6
+    rank(14) => -1
+
+verify sections
+    sections(Vector.fromList([]), 0, 0, St(m = Ast.emptyModule(), localTypes = [], group = 0)) => Result.Ok(St(m = Ast.emptyModule(), localTypes = [], group = 0))
+
+fn sectionAt(buf: Vector<Int>, p: Int, last: Int, s: St) -> Result<St, String>
+    ? "Reads the section at p and continues after it, refusing an unknown id, a section out of order or repeated, and one whose content runs past its declared size."
+    id = Bin.byte(buf, p)
+    r = rank(id)
+    size = Bin.uleb(buf, p + 1)
+    stop = size.next + size.v
+    ok1 = sectionOk(r >= 0, "malformed section id")?
+    ok2 = sectionOk(Bool.or(r == 0, r > last), "unexpected content after last section")?
+    ok3 = sectionOk(stop <= Vector.len(buf), "unexpected end of section or function")?
+    sections(buf, stop, Int.max(last, r), section(buf, id, size.next, stop, s)?)
+
+fn sectionOk(ok: Bool, msg: String) -> Result<Unit, String>
+    ? "Unit when ok holds."
+    match ok
+        true -> Result.Ok(Unit)
+        false -> Result.Err(msg)
+
+verify sectionOk
+    sectionOk(false, "x") => Result.Err("x")
+
+verify sectionAt
+    sectionAt(Vector.fromList([14, 0]), 0, 0, St(m = Ast.emptyModule(), localTypes = [], group = 0)) => Result.Err("malformed section id")
+    sectionAt(Vector.fromList([0, 9]), 0, 0, St(m = Ast.emptyModule(), localTypes = [], group = 0)) => Result.Err("unexpected end of section or function")
+
+fn section(buf: Vector<Int>, id: Int, p: Int, stop: Int, s: St) -> Result<St, String>
+    ? "Decodes the content of section id between p and stop."
+    n = Bin.uleb(buf, p)
+    match id
+        1 -> typeSec(buf, n.next, stop, n.v, s, [])
+        2 -> importSec(buf, n.next, stop, n.v, s)
+        0 -> custom(buf, p, stop, s)
+        3 -> sectionEnd(ulebsEnd(buf, n.next, n.v), stop, "function", St.update(s, localTypes = ulebs(buf, n.next, n.v, [])))
+        4 -> tableSec(buf, n.next, stop, n.v, s)
+        5 -> memSec(buf, n.next, stop, n.v, s)
+        6 -> globalSec(buf, n.next, stop, n.v, s, List.reverse(List.fromVector(s.m.globals)))
+        7 -> exportSec(buf, n.next, stop, n.v, s, [])
+        8 -> sectionEnd(n.next, stop, "start", St.update(s, m = Module.update(s.m, start = n.v)))
+        9 -> elemSec(buf, n.next, stop, n.v, s, [])
+        10 -> codeSec(buf, n.next, n.v, s, s.localTypes, [], stop)
+        11 -> dataSec(buf, n.next, stop, n.v, s, [])
+        12 -> sectionEnd(n.next, stop, "data count", St.update(s, m = Module.update(s.m, dataCount = n.v)))
+        13 -> tagSec(buf, n.next, stop, n.v, s)
+        _ -> Result.Ok(s)
+
+verify section
+    section(Vector.fromList([0]), 0, 0, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0)) => Result.Ok(St(m = Ast.emptyModule(), localTypes = [], group = 0))
+    section(Vector.fromList([0]), 99, 0, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0)) => Result.Ok(St(m = Ast.emptyModule(), localTypes = [], group = 0))
+
+fn tagSec(buf: Vector<Int>, p: Int, stop: Int, n: Int, s: St) -> Result<St, String>
+    ? "The tag section: each tag is an attribute octet (0, an exception) and a function type index."
+    match n <= 0
+        true -> sectionEnd(p, stop, "tag", s)
+        false -> match p >= stop
+            true -> Result.Err("unexpected end of section or function")
+            false -> tagNext(buf, Bin.byte(buf, p), Bin.uleb(buf, p + 1), stop, n, s)
+
+fn tagNext(buf: Vector<Int>, attr: Int, t: U, stop: Int, n: Int, s: St) -> Result<St, String>
+    ? "One tag read; the rest follow."
+    match attr == 0
+        false -> Result.Err("unknown tag attribute {attr}")
+        true -> tagSec(buf, t.next, stop, n - 1, St.update(s, m = Module.update(s.m, tags = List.concat(s.m.tags, [t.v]))))
+
+verify tagSec
+    tagSec(Vector.fromList([0, 2]), 0, 2, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0)) => Result.Ok(St(m = Module.update(Ast.emptyModule(), tags = [2]), localTypes = [], group = 0))
+
+verify tagNext
+    tagNext(Vector.fromList([]), 1, Bin.U(v = 0, next = 0), 0, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0)) => Result.Err("unknown tag attribute 1")
+
+fn custom(buf: Vector<Int>, p: Int, stop: Int, s: St) -> Result<St, String>
+    ? "A custom section: only its name is checked to fit; its content is ignored."
+    nm = Bin.uleb(buf, p)
+    match nm.next + nm.v > stop
+        true -> Result.Err("length out of bounds")
+        false -> match Bin.utf8(buf, nm.next, nm.v)
+            Option.Some(_) -> Result.Ok(s)
+            Option.None -> Result.Err("malformed UTF-8 encoding")
+
+verify custom
+    custom(Vector.fromList([5, 97]), 0, 2, St(m = Ast.emptyModule(), localTypes = [], group = 0)) => Result.Err("length out of bounds")
+
+fn ulebs(buf: Vector<Int>, p: Int, n: Int, acc: List<Int>) -> List<Int>
+    ? "n unsigned LEB128 numbers from p, in order."
+    match Bool.or(n <= 0, p >= Vector.len(buf))
+        true -> List.reverse(acc)
+        false -> ulebsNext(buf, Bin.uleb(buf, p), n, acc)
+
+fn ulebsNext(buf: Vector<Int>, u: U, n: Int, acc: List<Int>) -> List<Int>
+    ? "Keeps one number read by ulebs and reads the rest."
+    ulebs(buf, u.next, n - 1, List.prepend(u.v, acc))
+
+verify ulebs
+    ulebs(Vector.fromList([1, 128, 1, 3]), 0, 3, []) => [1, 128, 3]
+
+verify ulebsNext
+    ulebsNext(Vector.fromList([]), Bin.U(v = 4, next = 0), 1, []) => [4]
+
+fn ulebsEnd(buf: Vector<Int>, p: Int, n: Int) -> Int
+    ? "The position after n unsigned LEB128 numbers from p."
+    match Bool.or(n <= 0, p >= Vector.len(buf))
+        true -> p
+        false -> ulebsEnd(buf, Bin.uleb(buf, p).next, n - 1)
+
+verify ulebsEnd
+    ulebsEnd(Vector.fromList([1, 128, 1, 3]), 0, 2) => 3
+
+// ---- types ----
+
+fn heapType(buf: Vector<Int>, p: Int) -> U
+    ? "A heap type: a type index, or a negative abstract type."
+    Bin.sleb33(buf, p)
+
+verify heapType
+    heapType(Vector.fromList([112]), 0) => Bin.U(v = -16, next = 1)
+    heapType(Vector.fromList([3]), 0) => Bin.U(v = 3, next = 1)
+
+fn valType(buf: Vector<Int>, p: Int) -> VT
+    ? "A value or storage type at p."
+    b = Bin.byte(buf, p)
+    match b
+        127 -> VT(t = ValType.I32, next = p + 1)
+        126 -> VT(t = ValType.I64, next = p + 1)
+        125 -> VT(t = ValType.F32, next = p + 1)
+        124 -> VT(t = ValType.F64, next = p + 1)
+        123 -> VT(t = ValType.V128, next = p + 1)
+        120 -> VT(t = ValType.I8, next = p + 1)
+        119 -> VT(t = ValType.I16, next = p + 1)
+        100 -> refType(heapType(buf, p + 1), false)
+        99 -> refType(heapType(buf, p + 1), true)
+        _ -> VT(t = ValType.Ref(true, b - 128), next = p + 1)
+
+fn refType(h: U, nullable: Bool) -> VT
+    ? "A reference type over the heap type just read."
+    VT(t = ValType.Ref(nullable, h.v), next = h.next)
+
+verify valType
+    valType(Vector.fromList([127]), 0) => VT(t = ValType.I32, next = 1)
+    valType(Vector.fromList([112]), 0) => VT(t = ValType.Ref(true, -16), next = 1)
+    valType(Vector.fromList([100, 2]), 0) => VT(t = ValType.Ref(false, 2), next = 2)
+    valType(Vector.fromList([99, 110]), 0) => VT(t = ValType.Ref(true, -18), next = 2)
+
+verify refType
+    refType(Bin.U(v = 1, next = 5), true) => VT(t = ValType.Ref(true, 1), next = 5)
+
+fn valTypes(buf: Vector<Int>, p: Int, n: Int, acc: List<ValType>) -> VTs
+    ? "n value types from p."
+    match Bool.or(n <= 0, p >= Vector.len(buf))
+        true -> VTs(ts = List.reverse(acc), next = p)
+        false -> valTypesNext(buf, valType(buf, p), n, acc)
+
+fn valTypesNext(buf: Vector<Int>, v: VT, n: Int, acc: List<ValType>) -> VTs
+    ? "Keeps one type read by valTypes and reads the rest."
+    valTypes(buf, v.next, n - 1, List.prepend(v.t, acc))
+
+verify valTypes
+    valTypes(Vector.fromList([127, 126]), 0, 2, []) => VTs(ts = [ValType.I32, ValType.I64], next = 2)
+
+verify valTypesNext
+    valTypesNext(Vector.fromList([]), VT(t = ValType.I32, next = 0), 1, []) => VTs(ts = [ValType.I32], next = 0)
+
+fn vecTypes(buf: Vector<Int>, p: Int) -> VTs
+    ? "A length-prefixed vector of value types."
+    n = Bin.uleb(buf, p)
+    valTypes(buf, n.next, n.v, [])
+
+verify vecTypes
+    vecTypes(Vector.fromList([1, 124]), 0) => VTs(ts = [ValType.F64], next = 2)
+
+fn fieldTypes(buf: Vector<Int>, p: Int, n: Int, acc: List<ValType>) -> VTs
+    ? "n struct fields from p: each a storage type and a mutability byte."
+    match Bool.or(n <= 0, p >= Vector.len(buf))
+        true -> VTs(ts = List.reverse(acc), next = p)
+        false -> fieldNext(buf, valType(buf, p), n, acc)
+
+fn fieldNext(buf: Vector<Int>, v: VT, n: Int, acc: List<ValType>) -> VTs
+    ? "Keeps one field read by fieldTypes, skips its mutability and reads the rest."
+    fieldTypes(buf, v.next + 1, n - 1, List.prepend(v.t, acc))
+
+verify fieldTypes
+    fieldTypes(Vector.fromList([127, 1, 120, 0]), 0, 2, []) => VTs(ts = [ValType.I32, ValType.I8], next = 4)
+
+verify fieldNext
+    fieldNext(Vector.fromList([]), VT(t = ValType.I32, next = 0), 1, []) => VTs(ts = [ValType.I32], next = 1)
+
+record CT
+    c: Comp
+    next: Int
+    muts: List<Bool>
+
+fn compType(buf: Vector<Int>, p: Int) -> Result<CT, String>
+    ? "A composite type: func, struct or array."
+    match Bin.byte(buf, p)
+        96 -> Result.Ok(funcComp(vecTypes(buf, p + 1), buf))
+        95 -> Result.Ok(structComp(buf, Bin.uleb(buf, p + 1)))
+        94 -> Result.Ok(arrayComp(valType(buf, p + 1), buf))
+        b -> Result.Err("unknown composite type {b}")
+
+verify compType
+    compType(Vector.fromList([96, 1, 127, 0]), 0) => Result.Ok(CT(c = Comp.FuncT([ValType.I32], []), next = 4, muts = []))
+    compType(Vector.fromList([94, 120, 1]), 0) => Result.Ok(CT(c = Comp.ArrayT(ValType.I8), next = 3, muts = [true]))
+    compType(Vector.fromList([95, 1, 126, 1]), 0) => Result.Ok(CT(c = Comp.StructT(Vector.fromList([ValType.I64])), next = 4, muts = [true]))
+    compType(Vector.fromList([7]), 0) => Result.Err("unknown composite type 7")
+
+fn funcComp(ps: VTs, buf: Vector<Int>) -> CT
+    ? "A function type once its parameters are read."
+    rs = vecTypes(buf, ps.next)
+    CT(c = Comp.FuncT(ps.ts, rs.ts), next = rs.next, muts = [])
+
+verify funcComp
+    funcComp(VTs(ts = [], next = 0), Vector.fromList([1, 127])) => CT(c = Comp.FuncT([], [ValType.I32]), next = 2, muts = [])
+
+fn mutOk(b: Int) -> Result<Unit, String>
+    ? "A mutability octet is 0 or 1."
+    match b <= 1
+        true -> Result.Ok(Unit)
+        false -> Result.Err("malformed mutability")
+
+verify mutOk
+    mutOk(2) => Result.Err("malformed mutability")
+
+fn mutsOk(buf: Vector<Int>, p: Int, n: Int) -> Bool
+    ? "Whether each of n fields from p has a mutability octet of 0 or 1."
+    match Bool.or(n <= 0, p >= Vector.len(buf))
+        true -> true
+        false -> mutsOkNext(buf, valType(buf, p).next, n)
+
+fn mutsOkNext(buf: Vector<Int>, q: Int, n: Int) -> Bool
+    ? "One field's octet at q, then the rest."
+    Bool.and(Bin.byte(buf, q) <= 1, mutsOk(buf, q + 1, n - 1))
+
+fn nextIf(ok: Bool, next: Int, buf: Vector<Int>) -> Int
+    ? "next when ok, else past the end of the octets (malformed)."
+    match ok
+        true -> next
+        false -> Vector.len(buf) + 1
+
+verify mutsOk
+    mutsOk(Vector.fromList([127, 2]), 0, 1) => false
+
+verify mutsOkNext
+    mutsOkNext(Vector.fromList([0]), 0, 1) => true
+
+verify nextIf
+    nextIf(false, 3, Vector.fromList([1])) => 2
+
+fn structComp(buf: Vector<Int>, n: U) -> CT
+    ? "A struct type with n fields."
+    fs = fieldTypes(buf, n.next, n.v, [])
+    CT(c = Comp.StructT(Vector.fromList(fs.ts)), next = nextIf(mutsOk(buf, n.next, n.v), fs.next, buf), muts = fieldMuts(buf, n.next, n.v, []))
+
+verify structComp
+    structComp(Vector.fromList([127, 0]), Bin.U(v = 1, next = 0)) => CT(c = Comp.StructT(Vector.fromList([ValType.I32])), next = 2, muts = [false])
+
+fn arrayComp(v: VT, buf: Vector<Int>) -> CT
+    ? "An array type over the element just read, and whether it is mutable."
+    CT(c = Comp.ArrayT(v.t), next = nextIf(Bin.byte(buf, v.next) <= 1, v.next + 1, buf), muts = [Bin.byte(buf, v.next) == 1])
+
+fn fieldMuts(buf: Vector<Int>, p: Int, n: Int, acc: List<Bool>) -> List<Bool>
+    ? "Whether each of n struct fields from p is mutable."
+    match Bool.or(n <= 0, p >= Vector.len(buf))
+        true -> List.reverse(acc)
+        false -> fieldMutsNext(buf, valType(buf, p).next, n, acc)
+
+fn fieldMutsNext(buf: Vector<Int>, q: Int, n: Int, acc: List<Bool>) -> List<Bool>
+    ? "Keeps one field's mutability byte at q and reads the rest."
+    fieldMuts(buf, q + 1, n - 1, List.prepend(Bin.byte(buf, q) == 1, acc))
+
+verify fieldMuts
+    fieldMuts(Vector.fromList([127, 1, 120, 0]), 0, 2, []) => [true, false]
+
+verify fieldMutsNext
+    fieldMutsNext(Vector.fromList([0, 1]), 1, 1, []) => [true]
+
+verify arrayComp
+    arrayComp(VT(t = ValType.I8, next = 3), Vector.fromList([0, 0, 0, 1])) => CT(c = Comp.ArrayT(ValType.I8), next = 4, muts = [true])
+
+record STs
+    subs: List<SubType>
+    next: Int
+
+fn subType(buf: Vector<Int>, p: Int, g: Int) -> Result<STs, String>
+    ? "One subtype of rec group g, with its declared supertypes."
+    match Bin.byte(buf, p)
+        80 -> subWith(buf, Bin.uleb(buf, p + 1), false, g)
+        79 -> subWith(buf, Bin.uleb(buf, p + 1), true, g)
+        _ -> subPlain(compType(buf, p)?, g)
+
+fn subPlain(c: CT, g: Int) -> Result<STs, String>
+    ? "A subtype written as just its composite type: final, with no supertypes."
+    Result.Ok(STs(subs = [SubType(comp = c.c, supers = [], final = true, group = g, muts = c.muts)], next = c.next))
+
+fn subWith(buf: Vector<Int>, n: U, fin: Bool, g: Int) -> Result<STs, String>
+    ? "A subtype with an explicit list of n supertypes."
+    after = ulebsEnd(buf, n.next, n.v)
+    c = compType(buf, after)?
+    Result.Ok(STs(subs = [SubType(comp = c.c, supers = ulebs(buf, n.next, n.v, []), final = fin, group = g, muts = c.muts)], next = c.next))
+
+verify subType
+    subType(Vector.fromList([94, 120, 1]), 0, 2) => Result.Ok(STs(subs = [SubType(comp = Comp.ArrayT(ValType.I8), supers = [], final = true, group = 2, muts = [true])], next = 3))
+    subType(Vector.fromList([80, 1, 0, 94, 120, 1]), 0, 2) => Result.Ok(STs(subs = [SubType(comp = Comp.ArrayT(ValType.I8), supers = [0], final = false, group = 2, muts = [true])], next = 6))
+
+verify subPlain
+    subPlain(CT(c = Comp.ArrayT(ValType.I8), next = 1, muts = []), 0) => Result.Ok(STs(subs = [SubType(comp = Comp.ArrayT(ValType.I8), supers = [], final = true, group = 0, muts = [])], next = 1))
+
+verify subWith
+    subWith(Vector.fromList([0, 94, 120, 1]), Bin.U(v = 0, next = 1), true, 0) => Result.Ok(STs(subs = [SubType(comp = Comp.ArrayT(ValType.I8), supers = [], final = true, group = 0, muts = [true])], next = 4))
+
+fn subTypes(buf: Vector<Int>, p: Int, n: Int, g: Int, acc: List<SubType>) -> Result<STs, String>
+    ? "n subtypes of one rec group, in order."
+    match Bool.or(n <= 0, p >= Vector.len(buf))
+        true -> Result.Ok(STs(subs = List.reverse(acc), next = p))
+        false -> subTypesNext(buf, subType(buf, p, g)?, n, g, acc)
+
+fn subTypesNext(buf: Vector<Int>, s: STs, n: Int, g: Int, acc: List<SubType>) -> Result<STs, String>
+    ? "Keeps the subtypes read by subTypes and reads the rest."
+    subTypes(buf, s.next, n - 1, g, List.concat(List.reverse(s.subs), acc))
+
+verify subTypes
+    subTypes(Vector.fromList([94, 120, 1]), 0, 1, 0, []) => Result.Ok(STs(subs = [SubType(comp = Comp.ArrayT(ValType.I8), supers = [], final = true, group = 0, muts = [true])], next = 3))
+
+verify subTypesNext
+    subTypesNext(Vector.fromList([]), STs(subs = [], next = 0), 1, 0, []) => Result.Ok(STs(subs = [], next = 0))
+
+fn recGroup(buf: Vector<Int>, p: Int, g: Int) -> Result<STs, String>
+    ? "One entry of the type section: a rec group, or a single subtype forming a group alone."
+    match Bin.byte(buf, p)
+        78 -> recGroupOf(buf, Bin.uleb(buf, p + 1), g)
+        _ -> subType(buf, p, g)
+
+fn recGroupOf(buf: Vector<Int>, n: U, g: Int) -> Result<STs, String>
+    ? "The n subtypes of an explicit rec group."
+    subTypes(buf, n.next, n.v, g, [])
+
+verify recGroup
+    recGroup(Vector.fromList([78, 1, 94, 120, 1]), 0, 0) => Result.Ok(STs(subs = [SubType(comp = Comp.ArrayT(ValType.I8), supers = [], final = true, group = 0, muts = [true])], next = 5))
+
+verify recGroupOf
+    recGroupOf(Vector.fromList([94, 120, 1]), Bin.U(v = 1, next = 0), 4) => Result.Ok(STs(subs = [SubType(comp = Comp.ArrayT(ValType.I8), supers = [], final = true, group = 4, muts = [true])], next = 3))
+
+fn typeSec(buf: Vector<Int>, p: Int, stop: Int, n: Int, s: St, acc: List<SubType>) -> Result<St, String>
+    ? "The type section: n rec groups, flattened into the type index space."
+    match n <= 0
+        true -> sectionEnd(p, stop, "type", St.update(s, m = Module.update(s.m, types = Vector.fromList(List.reverse(acc)))))
+        false -> match p >= stop
+            true -> Result.Err("unexpected end of section or function")
+            false -> typeSecNext(buf, recGroup(buf, p, s.group)?, stop, n, s, acc)
+
+fn typeSecNext(buf: Vector<Int>, r: STs, stop: Int, n: Int, s: St, acc: List<SubType>) -> Result<St, String>
+    ? "Keeps one rec group and reads the rest."
+    typeSec(buf, r.next, stop, n - 1, St.update(s, group = s.group + 1), List.concat(List.reverse(r.subs), acc))
+
+verify typeSec
+    typeSec(Vector.fromList([94, 120, 1]), 0, 3, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0), []) => Result.Ok(St(m = Module.update(Ast.emptyModule(), types = Vector.fromList([SubType(comp = Comp.ArrayT(ValType.I8), supers = [], final = true, group = 0, muts = [true])])), localTypes = [], group = 1))
+
+verify typeSecNext
+    typeSecNext(Vector.fromList([]), STs(subs = [], next = 0), 0, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0), []) => Result.Ok(St(m = Ast.emptyModule(), localTypes = [], group = 1))
+
+fn sectionEnd(p: Int, stop: Int, what: String, s: St) -> Result<St, String>
+    ? "The section's result when its content ended exactly at stop."
+    match p == stop
+        true -> Result.Ok(s)
+        false -> Result.Err("{what} section size mismatch ({p} vs {stop})")
+
+verify sectionEnd
+    sectionEnd(3, 4, "type", St(m = Ast.emptyModule(), localTypes = [], group = 0)) => Result.Err("type section size mismatch (3 vs 4)")
+
+// ---- imports, tables, memory, exports ----
+
+record Str
+    s: String
+    next: Int
+
+fn str(buf: Vector<Int>, p: Int) -> Str
+    ? "A length-prefixed UTF-8 name; one that is not valid UTF-8 is malformed and ends past the octets."
+    n = Bin.uleb(buf, p)
+    match Bin.utf8(buf, n.next, n.v)
+        Option.Some(t) -> Str(s = t, next = n.next + n.v)
+        Option.None -> Str(s = "", next = Vector.len(buf) + 1)
+
+verify str
+    str(Vector.fromList([2, 104, 105]), 0) => Str(s = "hi", next = 3)
+    str(Vector.fromList([1, 255]), 0) => Str(s = "", next = 3)
+
+fn importSec(buf: Vector<Int>, p: Int, stop: Int, n: Int, s: St) -> Result<St, String>
+    ? "The import section; imported functions open the function index space."
+    match n <= 0
+        true -> sectionEnd(p, stop, "import", s)
+        false -> match p >= stop
+            true -> Result.Err("unexpected end of section or function")
+            false -> importOne(buf, str(buf, p), stop, n, s)
+
+verify importSec
+    importSec(Vector.fromList([]), 0, 0, 0, St(m = Ast.emptyModule(), localTypes = [], group = 0)) => Result.Ok(St(m = Ast.emptyModule(), localTypes = [], group = 0))
+
+fn importOne(buf: Vector<Int>, md: Str, stop: Int, n: Int, s: St) -> Result<St, String>
+    ? "One import once its module name is read."
+    nm = str(buf, md.next)
+    kind = Bin.byte(buf, nm.next)
+    match kind
+        0 -> importFunc(buf, md.s, nm.s, Bin.uleb(buf, nm.next + 1), stop, n, s)
+        1 -> importTable(buf, "{md.s}.{nm.s}", valType(buf, nm.next + 1), stop, n, s)
+        2 -> importMemory(buf, provided("{md.s}.{nm.s}", limits(buf, nm.next + 1)), wideAt(buf, nm.next + 1), stop, n, s)
+        3 -> importGlobal(buf, "{md.s}.{nm.s}", valType(buf, nm.next + 1), stop, n, s)
+        4 -> importTag(buf, Bin.uleb(buf, nm.next + 2), stop, n, s)
+        _ -> Result.Err("unsupported import kind {kind} for {md.s}.{nm.s}")
+
+fn importTag(buf: Vector<Int>, t: U, stop: Int, n: Int, s: St) -> Result<St, String>
+    ? "An imported tag: it takes the next tag index; its attribute octet was skipped."
+    importSec(buf, t.next, stop, n - 1, St.update(s, m = Module.update(s.m, tags = List.concat(s.m.tags, [t.v]))))
+
+verify importTag
+    importTag(Vector.fromList([]), Bin.U(v = 3, next = 0), 0, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0)) => Result.Ok(St(m = Module.update(Ast.emptyModule(), tags = [3]), localTypes = [], group = 0))
+
+verify importOne
+    importOne(Vector.fromList([1, 97, 5]), Str(s = "m", next = 0), 9, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0)) => Result.Err("unsupported import kind 5 for m.a")
+
+fn importTable(buf: Vector<Int>, from: String, v: VT, stop: Int, n: Int, s: St) -> Result<St, String>
+    ? "An imported table: it takes the next table index, at its minimum size (spectest's own table has 10 and may grow to 20)."
+    l = limits(buf, v.next)
+    ok = tableLimits(l)?
+    importSec(buf, l.next, stop, n - 1, St.update(s, m = addTable(s.m, v.t, provided(from, l), wideAt(buf, v.next))))
+
+fn provided(from: String, l: Lim) -> Lim
+    ? "The limits an import really gets: spectest's table is 10..20 and its memory 1..2 pages, whatever the import declares; other imports are made fresh at their declared limits."
+    match from
+        "spectest.table" -> Lim(min = 10, max = 20, next = l.next, hasMax = true)
+        "spectest.memory" -> Lim(min = 1, max = 2, next = l.next, hasMax = true)
+        _ -> l
+
+verify provided
+    provided("spectest.memory", Lim(min = 0, max = 65536, next = 4, hasMax = false)) => Lim(min = 1, max = 2, next = 4, hasMax = true)
+    provided("m.t", Lim(min = 0, max = 9, next = 4, hasMax = true)) => Lim(min = 0, max = 9, next = 4, hasMax = true)
+
+fn addTable(m: Module, t: ValType, l: Lim, wide: Bool) -> Module
+    ? "The module with one more table of element type t, marked 64-bit when its limits say so."
+    Module.update(m, tables = List.concat(m.tables, [t]), tableMins = List.concat(m.tableMins, [l.min]), tableMaxs = List.concat(m.tableMaxs, [tableCap(l, wide)]), tableInits = List.concat(m.tableInits, [Vector.fromList([])]), tables64 = markWide(m.tables64, List.len(m.tables), wide))
+
+fn tableCap(l: Lim, wide: Bool) -> Int
+    ? "A table's maximum: as given, else 2^32 (2^64 for table64)."
+    match l.hasMax
+        true -> l.max
+        false -> match wide
+            true -> 18446744073709551616
+            false -> 4294967296
+
+verify tableCap
+    tableCap(Lim(min = 0, max = 65536, next = 0, hasMax = false), false) => 4294967296
+
+fn markWide(ks: List<Int>, k: Int, wide: Bool) -> List<Int>
+    ? "ks with k added when wide."
+    match wide
+        true -> List.prepend(k, ks)
+        false -> ks
+
+fn wideAt(buf: Vector<Int>, p: Int) -> Bool
+    ? "Whether the limits at p have bit 2 of their flag set: a 64-bit memory or table."
+    Bits.and(Bin.byte(buf, p), 4) == 4
+
+verify addTable
+    addTable(Ast.emptyModule(), ValType.Ref(true, -16), Lim(min = 1, max = 2, next = 0, hasMax = true), true).tables64 => [0]
+
+verify markWide
+    markWide([], 3, false) => []
+
+verify wideAt
+    wideAt(Vector.fromList([5]), 0) => true
+    wideAt(Vector.fromList([1]), 0) => false
+
+fn importMemory(buf: Vector<Int>, l: Lim, wide: Bool, stop: Int, n: Int, s: St) -> Result<St, String>
+    ? "An imported memory, provided fresh at its minimum size."
+    importSec(buf, l.next, stop, n - 1, St.update(s, m = addMemory(s.m, l, wide)))
+
+fn addMemory(m: Module, l: Lim, wide: Bool) -> Module
+    ? "The module with one more memory: memory 0 when it has none yet, else the next one. A 64-bit memory without a maximum may grow to 2^48 pages."
+    w = Module.update(m, mems64 = markWide(m.mems64, Ast.memCount(m), wide))
+    hi = memMaxOf(l, wide)
+    match m.hasMemory
+        false -> Module.update(w, memMin = l.min, memMax = hi, hasMemory = true)
+        true -> Module.update(w, moreMems = List.concat(m.moreMems, [MemType(min = l.min, max = hi)]))
+
+fn memMaxOf(l: Lim, wide: Bool) -> Int
+    ? "A memory's maximum in pages: as given, else 65536 (2^48 for a 64-bit memory)."
+    match Bool.and(wide, Bool.not(l.hasMax))
+        true -> 281474976710656
+        false -> l.max
+
+verify memMaxOf
+    memMaxOf(Lim(min = 0, max = 65536, next = 0, hasMax = false), true) => 281474976710656
+    memMaxOf(Lim(min = 0, max = 7, next = 0, hasMax = true), true) => 7
+
+verify addMemory
+    addMemory(Ast.emptyModule(), Lim(min = 1, max = 2, next = 0, hasMax = true), false).memMin => 1
+    addMemory(Module.update(Ast.emptyModule(), hasMemory = true), Lim(min = 1, max = 2, next = 0, hasMax = true), true).mems64 => [1]
+
+fn importGlobal(buf: Vector<Int>, from: String, v: VT, stop: Int, n: Int, s: St) -> Result<St, String>
+    ? "An imported global: it takes the next global index and gets its value from the host."
+    ok = mutOk(Bin.byte(buf, v.next))?
+    g = Global(ty = v.t, init = Vector.fromList([]), from = from, mut = Bin.byte(buf, v.next) == 1)
+    importSec(buf, v.next + 1, stop, n - 1, St.update(s, m = Module.update(s.m, globals = Vector.fromList(List.concat(List.fromVector(s.m.globals), [g])))))
+
+verify importTable
+    importTable(Vector.fromList([0, 10]), "m.t", VT(t = ValType.Ref(true, -16), next = 0), 2, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0)) => Result.Ok(St(m = Module.update(Ast.emptyModule(), tables = [ValType.Ref(true, -16)], tableMins = [10], tableMaxs = [4294967296], tableInits = [Vector.fromList([])]), localTypes = [], group = 0))
+
+verify importMemory
+    importMemory(Vector.fromList([]), Lim(min = 1, max = 2, next = 0, hasMax = true), false, 0, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0)) => Result.Ok(St(m = Module.update(Ast.emptyModule(), memMin = 1, memMax = 2, hasMemory = true), localTypes = [], group = 0))
+
+verify importGlobal
+    importGlobal(Vector.fromList([0]), "spectest.global_i32", VT(t = ValType.I32, next = 0), 1, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0)) => Result.Ok(St(m = Module.update(Ast.emptyModule(), globals = Vector.fromList([Global(ty = ValType.I32, init = Vector.fromList([]), from = "spectest.global_i32", mut = false)])), localTypes = [], group = 0))
+
+fn importFunc(buf: Vector<Int>, md: String, nm: String, t: U, stop: Int, n: Int, s: St) -> Result<St, String>
+    ? "An imported function: it takes the next function index."
+    imp = Import(mod = md, name = nm, kind = 0, index = t.v)
+    fs = Vector.fromList(List.concat(List.fromVector(s.m.funcs), [Func.Imported(md, nm, t.v)]))
+    importSec(buf, t.next, stop, n - 1, St.update(s, m = Module.update(s.m, funcs = fs, imports = List.concat(s.m.imports, [imp]))))
+
+verify importFunc
+    Vector.len(Result.withDefault(importFunc(Vector.fromList([]), "aver", "x", Bin.U(v = 0, next = 0), 0, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0)), St(m = Ast.emptyModule(), localTypes = [], group = 0)).m.funcs) => 1
+
+record Lim
+    min: Int
+    max: Int
+    next: Int
+    hasMax: Bool
+
+fn limits(buf: Vector<Int>, p: Int) -> Lim
+    ? "Limits: a flag (bit 0 a maximum follows, bit 2 the memory or table is 64-bit, so the numbers are u64), a minimum, and a maximum (else 65536). Any other flag is malformed: the limits then end past the octets."
+    flag = Bin.byte(buf, p)
+    lo = limitNum(buf, p + 1, flag)
+    match List.contains([0, 1, 4, 5], flag)
+        false -> Lim(min = 0, max = 0, next = Vector.len(buf) + 1, hasMax = false)
+        true -> match Bits.and(flag, 1) == 1
+            true -> limitsMax(lo, limitNum(buf, lo.next, flag))
+            false -> Lim(min = lo.v, max = 65536, next = lo.next, hasMax = false)
+
+fn limitNum(buf: Vector<Int>, p: Int, flag: Int) -> U
+    ? "A bound of limits, u64 for a 64-bit memory or table."
+    match Bits.and(flag, 4) == 4
+        true -> Bin.uleb64(buf, p)
+        false -> Bin.uleb(buf, p)
+
+verify limitNum
+    limitNum(Vector.fromList([5]), 0, 4) => Bin.U(v = 5, next = 1)
+
+fn limitsMax(lo: U, hi: U) -> Lim
+    ? "Limits with both ends read."
+    Lim(min = lo.v, max = hi.v, next = hi.next, hasMax = true)
+
+verify limits
+    limits(Vector.fromList([0, 1]), 0) => Lim(min = 1, max = 65536, next = 2, hasMax = false)
+    limits(Vector.fromList([1, 1, 128, 16]), 0) => Lim(min = 1, max = 2048, next = 4, hasMax = true)
+    limits(Vector.fromList([8, 1]), 0) => Lim(min = 0, max = 0, next = 3, hasMax = false)
+
+verify limitsMax
+    limitsMax(Bin.U(v = 1, next = 0), Bin.U(v = 2, next = 3)) => Lim(min = 1, max = 2, next = 3, hasMax = true)
+
+fn tableLimits(l: Lim) -> Result<Unit, String>
+    ? "A table's limits: when it has a maximum, the minimum may not pass it."
+    match Bool.and(l.hasMax, l.min > l.max)
+        true -> Result.Err("size minimum must not be greater than maximum")
+        false -> Result.Ok(Unit)
+
+verify tableLimits
+    tableLimits(Lim(min = 1, max = 0, next = 0, hasMax = true)) => Result.Err("size minimum must not be greater than maximum")
+    tableLimits(Lim(min = 9, max = 65536, next = 0, hasMax = false)) => Result.Ok(Unit)
+
+fn memSec(buf: Vector<Int>, p: Int, stop: Int, n: Int, s: St) -> Result<St, String>
+    ? "The memory section: each memory's limits, after any imported ones."
+    match n <= 0
+        true -> sectionEnd(p, stop, "memory", s)
+        false -> match p >= stop
+            true -> Result.Err("unexpected end of section or function")
+            false -> memNext(buf, limits(buf, p), wideAt(buf, p), stop, n, s)
+
+fn memNext(buf: Vector<Int>, l: Lim, wide: Bool, stop: Int, n: Int, s: St) -> Result<St, String>
+    ? "Adds one memory and reads the rest."
+    memSec(buf, l.next, stop, n - 1, St.update(s, m = addMemory(s.m, l, wide)))
+
+verify memNext
+    memNext(Vector.fromList([]), Lim(min = 1, max = 2, next = 0, hasMax = true), false, 0, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0)) => Result.Ok(St(m = Module.update(Ast.emptyModule(), memMin = 1, memMax = 2, hasMemory = true), localTypes = [], group = 0))
+
+verify memSec
+    memSec(Vector.fromList([0, 1]), 0, 2, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0)) => Result.Ok(St(m = Module.update(Ast.emptyModule(), memMin = 1, hasMemory = true), localTypes = [], group = 0))
+    memSec(Vector.fromList([0, 1, 0, 2]), 0, 4, 2, St(m = Ast.emptyModule(), localTypes = [], group = 0)) => Result.Ok(St(m = Module.update(Ast.emptyModule(), memMin = 1, hasMemory = true, moreMems = [MemType(min = 2, max = 65536)]), localTypes = [], group = 0))
+
+fn tableSec(buf: Vector<Int>, p: Int, stop: Int, n: Int, s: St) -> Result<St, String>
+    ? "The table section: element types and minimum sizes. A table with an initializer expression is refused for now."
+    match n <= 0
+        true -> sectionEnd(p, stop, "table", s)
+        false -> match p >= stop
+            true -> Result.Err("unexpected end of section or function")
+            false -> tableAt(buf, p, stop, n, s)
+
+fn tableAt(buf: Vector<Int>, p: Int, stop: Int, n: Int, s: St) -> Result<St, String>
+    ? "A table, plain or (0x40 0x00) with an initializer expression after its limits."
+    match Bin.byte(buf, p) == 64
+        false -> tableOne(buf, valType(buf, p), stop, n, s)
+        true -> match Bin.byte(buf, p + 1) == 0
+            false -> Result.Err("malformed table")
+            true -> tableInit(buf, valType(buf, p + 2), stop, n, s)
+
+fn tableInit(buf: Vector<Int>, v: VT, stop: Int, n: Int, s: St) -> Result<St, String>
+    ? "A table with an initializer: its element type, limits, then the expression every element starts as."
+    l = limits(buf, v.next)
+    ok = tableLimits(l)?
+    e = expr(buf, l.next, s.m)?
+    m1 = addTable(s.m, v.t, l, wideAt(buf, v.next))
+    k = List.len(m1.tableInits) - 1
+    tableSec(buf, e.next, stop, n - 1, St.update(s, m = Module.update(m1, tableInits = List.concat(List.take(m1.tableInits, k), [e.code]))))
+
+verify tableAt
+    tableAt(Vector.fromList([64, 1]), 0, 2, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0)) => Result.Err("malformed table")
+
+verify tableInit
+    tableInit(Vector.fromList([112, 0, 1, 208, 112, 11]), VT(t = ValType.Ref(true, -16), next = 1), 6, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0)) => Result.Ok(St(m = Module.update(Ast.emptyModule(), tables = [ValType.Ref(true, -16)], tableMins = [1], tableMaxs = [4294967296], tableInits = [Vector.fromList([Instr.RefNull(-16), Instr.End])]), localTypes = [], group = 0))
+
+fn tableOne(buf: Vector<Int>, v: VT, stop: Int, n: Int, s: St) -> Result<St, String>
+    ? "One table once its element type is read."
+    l = limits(buf, v.next)
+    ok = tableLimits(l)?
+    tableSec(buf, l.next, stop, n - 1, St.update(s, m = addTable(s.m, v.t, l, wideAt(buf, v.next))))
+
+verify tableSec
+    tableSec(Vector.fromList([112, 0, 3]), 0, 3, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0)) => Result.Ok(St(m = Module.update(Ast.emptyModule(), tables = [ValType.Ref(true, -16)], tableMins = [3], tableMaxs = [4294967296], tableInits = [Vector.fromList([])]), localTypes = [], group = 0))
+
+verify tableOne
+    tableOne(Vector.fromList([0, 3]), VT(t = ValType.I32, next = 0), 2, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0)) => Result.Ok(St(m = Module.update(Ast.emptyModule(), tables = [ValType.I32], tableMins = [3], tableMaxs = [4294967296], tableInits = [Vector.fromList([])]), localTypes = [], group = 0))
+
+fn exportSec(buf: Vector<Int>, p: Int, stop: Int, n: Int, s: St, acc: List<Export>) -> Result<St, String>
+    ? "The export section."
+    match n <= 0
+        true -> sectionEnd(p, stop, "export", St.update(s, m = Module.update(s.m, exports = List.reverse(acc))))
+        false -> match p >= stop
+            true -> Result.Err("unexpected end of section or function")
+            false -> exportOne(buf, str(buf, p), stop, n, s, acc)
+
+fn exportOne(buf: Vector<Int>, nm: Str, stop: Int, n: Int, s: St, acc: List<Export>) -> Result<St, String>
+    ? "One export once its name is read."
+    idx = Bin.uleb(buf, nm.next + 1)
+    exportSec(buf, idx.next, stop, n - 1, s, List.prepend(Export(name = nm.s, kind = Bin.byte(buf, nm.next), index = idx.v), acc))
+
+verify exportSec
+    exportSec(Vector.fromList([1, 102, 0, 2]), 0, 4, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0), []) => Result.Ok(St(m = Module.update(Ast.emptyModule(), exports = [Export(name = "f", kind = 0, index = 2)]), localTypes = [], group = 0))
+
+verify exportOne
+    exportOne(Vector.fromList([0, 2]), Str(s = "f", next = 0), 2, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0), []) => Result.Ok(St(m = Module.update(Ast.emptyModule(), exports = [Export(name = "f", kind = 0, index = 2)]), localTypes = [], group = 0))
+
+// ---- globals, elements, data ----
+
+fn globalSec(buf: Vector<Int>, p: Int, stop: Int, n: Int, s: St, acc: List<Global>) -> Result<St, String>
+    ? "The global section: each global's type and initializer."
+    match n <= 0
+        true -> sectionEnd(p, stop, "global", St.update(s, m = Module.update(s.m, globals = Vector.fromList(List.reverse(acc)))))
+        false -> match p >= stop
+            true -> Result.Err("unexpected end of section or function")
+            false -> globalOne(buf, valType(buf, p), stop, n, s, acc)
+
+fn globalOne(buf: Vector<Int>, v: VT, stop: Int, n: Int, s: St, acc: List<Global>) -> Result<St, String>
+    ? "One global once its type is read, with its mutability."
+    ok = mutOk(Bin.byte(buf, v.next))?
+    e = expr(buf, v.next + 1, s.m)?
+    globalSec(buf, e.next, stop, n - 1, s, List.prepend(Global(ty = v.t, init = e.code, from = "", mut = Bin.byte(buf, v.next) == 1), acc))
+
+verify globalSec
+    globalSec(Vector.fromList([127, 0, 65, 7, 11]), 0, 5, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0), []) => Result.Ok(St(m = Module.update(Ast.emptyModule(), globals = Vector.fromList([Global(ty = ValType.I32, init = Vector.fromList([Instr.I32Const(7), Instr.End]), from = "", mut = false)])), localTypes = [], group = 0))
+
+verify globalOne
+    globalOne(Vector.fromList([0, 11]), VT(t = ValType.I32, next = 0), 2, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0), []) => Result.Ok(St(m = Module.update(Ast.emptyModule(), globals = Vector.fromList([Global(ty = ValType.I32, init = Vector.fromList([Instr.End]), from = "", mut = false)])), localTypes = [], group = 0))
+
+fn dataSec(buf: Vector<Int>, p: Int, stop: Int, n: Int, s: St, acc: List<Data>) -> Result<St, String>
+    ? "The data section: active segments at an offset of memory 0, and passive ones."
+    match n <= 0
+        true -> sectionEnd(p, stop, "data", St.update(s, m = Module.update(s.m, datas = Vector.fromList(List.reverse(acc)))))
+        false -> match p >= stop
+            true -> Result.Err("unexpected end of section or function")
+            false -> dataOne(buf, p, stop, n, s, acc)
+
+fn dataOne(buf: Vector<Int>, p: Int, stop: Int, n: Int, s: St, acc: List<Data>) -> Result<St, String>
+    ? "One data segment, by its flag (a u32 LEB128)."
+    fl = Bin.uleb(buf, p)
+    match fl.v
+        0 -> dataActive(buf, expr(buf, fl.next, s.m)?, 0, stop, n, s, acc)
+        1 -> dataBytes(buf, Bin.uleb(buf, fl.next), Data(bytes = Vector.fromList([]), active = false, offset = Vector.fromList([]), mem = 0), stop, n, s, acc)
+        2 -> dataIn(buf, Bin.uleb(buf, fl.next), stop, n, s, acc)
+        f -> Result.Err("unknown data segment flag {f}")
+
+fn dataIn(buf: Vector<Int>, mem: U, stop: Int, n: Int, s: St, acc: List<Data>) -> Result<St, String>
+    ? "An active data segment for an explicit memory."
+    dataActive(buf, expr(buf, mem.next, s.m)?, mem.v, stop, n, s, acc)
+
+verify dataIn
+    dataIn(Vector.fromList([2, 1, 11, 0]), Bin.U(v = 1, next = 2), 4, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0), []) => Result.Ok(St(m = Module.update(Ast.emptyModule(), datas = Vector.fromList([Data(bytes = Vector.fromList([]), active = true, offset = Vector.fromList([Instr.End]), mem = 1)])), localTypes = [], group = 0))
+
+fn dataActive(buf: Vector<Int>, e: Code, mem: Int, stop: Int, n: Int, s: St, acc: List<Data>) -> Result<St, String>
+    ? "An active data segment once its offset expression is read."
+    dataBytes(buf, Bin.uleb(buf, e.next), Data(bytes = Vector.fromList([]), active = true, offset = e.code, mem = mem), stop, n, s, acc)
+
+fn dataBytes(buf: Vector<Int>, len: U, d: Data, stop: Int, n: Int, s: St, acc: List<Data>) -> Result<St, String>
+    ? "The octets of a data segment."
+    bs = Vector.fromList(Bin.octetsAt(buf, len.next, len.v))
+    dataSec(buf, len.next + len.v, stop, n - 1, s, List.prepend(Data.update(d, bytes = bs), acc))
+
+verify dataSec
+    dataSec(Vector.fromList([1, 2, 5, 6]), 0, 4, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0), []) => Result.Ok(St(m = Module.update(Ast.emptyModule(), datas = Vector.fromList([Data(bytes = Vector.fromList([5, 6]), active = false, offset = Vector.fromList([]), mem = 0)])), localTypes = [], group = 0))
+
+verify dataOne
+    dataOne(Vector.fromList([9]), 0, 1, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0), []) => Result.Err("unknown data segment flag 9")
+
+verify dataActive
+    dataActive(Vector.fromList([0]), Code(code = Vector.fromList([Instr.End]), next = 0), 0, 1, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0), []) => Result.Ok(St(m = Module.update(Ast.emptyModule(), datas = Vector.fromList([Data(bytes = Vector.fromList([]), active = true, offset = Vector.fromList([Instr.End]), mem = 0)])), localTypes = [], group = 0))
+
+verify dataBytes
+    dataBytes(Vector.fromList([1, 7]), Bin.U(v = 1, next = 1), Data(bytes = Vector.fromList([]), active = false, offset = Vector.fromList([]), mem = 0), 2, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0), []) => Result.Ok(St(m = Module.update(Ast.emptyModule(), datas = Vector.fromList([Data(bytes = Vector.fromList([7]), active = false, offset = Vector.fromList([]), mem = 0)])), localTypes = [], group = 0))
+
+record Items
+    items: List<Vector<Instr>>
+    next: Int
+
+fn elemSec(buf: Vector<Int>, p: Int, stop: Int, n: Int, s: St, acc: List<Elem>) -> Result<St, String>
+    ? "The element section, in all eight encodings. Mode 0 is active, 1 passive, 2 declarative."
+    match n <= 0
+        true -> sectionEnd(p, stop, "element", St.update(s, m = Module.update(s.m, elems = Vector.fromList(List.reverse(acc)))))
+        false -> match p >= stop
+            true -> Result.Err("unexpected end of section or function")
+            false -> elemOne(buf, p, stop, n, s, acc)
+
+fn elemOne(buf: Vector<Int>, p: Int, stop: Int, n: Int, s: St, acc: List<Elem>) -> Result<St, String>
+    ? "One element segment, by its flag. A segment given as function indices has type (ref func): its items are never null."
+    flag = Bin.uleb(buf, p)
+    q = flag.next
+    funcref = ValType.Ref(true, -16)
+    none: Vector<Instr> = Vector.fromList([])
+    match flag.v
+        0 -> elemActiveFuncs(buf, 0, expr(buf, q, s.m)?, stop, n, s, acc)
+        1 -> elemPush(buf, funcIdxItems(buf, Bin.uleb(buf, q + 1)), Elem(ty = ValType.Ref(false, -16), items = [], mode = 1, table = 0, offset = none), stop, n, s, acc)
+        2 -> elemActiveTable(buf, Bin.uleb(buf, q), stop, n, s, acc, false)
+        3 -> elemPush(buf, funcIdxItems(buf, Bin.uleb(buf, q + 1)), Elem(ty = ValType.Ref(false, -16), items = [], mode = 2, table = 0, offset = none), stop, n, s, acc)
+        4 -> elemActiveExprs(buf, 0, expr(buf, q, s.m)?, funcref, stop, n, s, acc)
+        5 -> elemTyped(buf, valType(buf, q), 1, stop, n, s, acc)
+        6 -> elemActiveTable(buf, Bin.uleb(buf, q), stop, n, s, acc, true)
+        7 -> elemTyped(buf, valType(buf, q), 2, stop, n, s, acc)
+        f -> Result.Err("unknown element segment flag {f}")
+
+fn elemActiveTable(buf: Vector<Int>, t: U, stop: Int, n: Int, s: St, acc: List<Elem>, exprs: Bool) -> Result<St, String>
+    ? "An active segment with an explicit table index (flags 2 and 6)."
+    e = expr(buf, t.next, s.m)?
+    match exprs
+        false -> elemPush(buf, funcIdxItems(buf, Bin.uleb(buf, e.next + 1)), Elem(ty = ValType.Ref(false, -16), items = [], mode = 0, table = t.v, offset = e.code), stop, n, s, acc)
+        true -> elemActiveExprsTyped(buf, t.v, e, valType(buf, e.next), stop, n, s, acc)
+
+fn elemActiveExprsTyped(buf: Vector<Int>, t: Int, e: Code, v: VT, stop: Int, n: Int, s: St, acc: List<Elem>) -> Result<St, String>
+    ? "Flag 6: an active segment of expressions with an explicit type."
+    elemPush(buf, exprItems(buf, Bin.uleb(buf, v.next), s.m)?, Elem(ty = v.t, items = [], mode = 0, table = t, offset = e.code), stop, n, s, acc)
+
+fn elemActiveFuncs(buf: Vector<Int>, t: Int, e: Code, stop: Int, n: Int, s: St, acc: List<Elem>) -> Result<St, String>
+    ? "Flag 0: an active segment of function indices for table 0."
+    elemPush(buf, funcIdxItems(buf, Bin.uleb(buf, e.next)), Elem(ty = ValType.Ref(false, -16), items = [], mode = 0, table = t, offset = e.code), stop, n, s, acc)
+
+fn elemActiveExprs(buf: Vector<Int>, t: Int, e: Code, ty: ValType, stop: Int, n: Int, s: St, acc: List<Elem>) -> Result<St, String>
+    ? "Flag 4: an active segment of expressions for table 0."
+    elemPush(buf, exprItems(buf, Bin.uleb(buf, e.next), s.m)?, Elem(ty = ty, items = [], mode = 0, table = t, offset = e.code), stop, n, s, acc)
+
+fn elemTyped(buf: Vector<Int>, v: VT, mode: Int, stop: Int, n: Int, s: St, acc: List<Elem>) -> Result<St, String>
+    ? "Flags 5 and 7: a passive or declarative segment of expressions."
+    elemPush(buf, exprItems(buf, Bin.uleb(buf, v.next), s.m)?, Elem(ty = v.t, items = [], mode = mode, table = 0, offset = Vector.fromList([])), stop, n, s, acc)
+
+fn elemPush(buf: Vector<Int>, it: Items, e: Elem, stop: Int, n: Int, s: St, acc: List<Elem>) -> Result<St, String>
+    ? "Keeps one segment with its items and reads the rest."
+    elemSec(buf, it.next, stop, n - 1, s, List.prepend(Elem.update(e, items = it.items), acc))
+
+fn funcIdxItems(buf: Vector<Int>, n: U) -> Items
+    ? "n function indices, each as the constant expression ref.func."
+    Items(items = funcIdxList(ulebs(buf, n.next, n.v, []), []), next = ulebsEnd(buf, n.next, n.v))
+
+fn funcIdxList(xs: List<Int>, acc: List<Vector<Instr>>) -> List<Vector<Instr>>
+    ? "Each index as a ref.func expression."
+    match xs
+        [] -> List.reverse(acc)
+        [x, ..rest] -> funcIdxList(rest, List.prepend(Vector.fromList([Instr.RefFunc(x), Instr.End]), acc))
+
+fn exprItems(buf: Vector<Int>, n: U, m: Module) -> Result<Items, String>
+    ? "n constant expressions."
+    exprList(buf, n.next, n.v, m, [])
+
+fn exprList(buf: Vector<Int>, p: Int, n: Int, m: Module, acc: List<Vector<Instr>>) -> Result<Items, String>
+    ? "n constant expressions from p."
+    match Bool.or(n <= 0, p >= Vector.len(buf))
+        true -> Result.Ok(Items(items = List.reverse(acc), next = p))
+        false -> exprListNext(buf, expr(buf, p, m)?, n, m, acc)
+
+fn exprListNext(buf: Vector<Int>, e: Code, n: Int, m: Module, acc: List<Vector<Instr>>) -> Result<Items, String>
+    ? "Keeps one expression and reads the rest."
+    exprList(buf, e.next, n - 1, m, List.prepend(e.code, acc))
+
+verify elemSec
+    elemSec(Vector.fromList([1, 0, 1, 3]), 0, 4, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0), []) => Result.Ok(St(m = Module.update(Ast.emptyModule(), elems = Vector.fromList([Elem(ty = ValType.Ref(false, -16), items = [Vector.fromList([Instr.RefFunc(3), Instr.End])], mode = 1, table = 0, offset = Vector.fromList([]))])), localTypes = [], group = 0))
+
+verify elemOne
+    elemOne(Vector.fromList([9]), 0, 1, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0), []) => Result.Err("unknown element segment flag 9")
+    elemOne(Vector.fromList([0, 65, 0, 11, 1, 2]), 0, 6, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0), []) => Result.Ok(St(m = Module.update(Ast.emptyModule(), elems = Vector.fromList([Elem(ty = ValType.Ref(false, -16), items = [Vector.fromList([Instr.RefFunc(2), Instr.End])], mode = 0, table = 0, offset = Vector.fromList([Instr.I32Const(0), Instr.End]))])), localTypes = [], group = 0))
+
+verify elemActiveTable
+    elemActiveTable(Vector.fromList([11, 0, 0]), Bin.U(v = 1, next = 0), 3, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0), [], false) => Result.Ok(St(m = Module.update(Ast.emptyModule(), elems = Vector.fromList([Elem(ty = ValType.Ref(false, -16), items = [], mode = 0, table = 1, offset = Vector.fromList([Instr.End]))])), localTypes = [], group = 0))
+
+verify elemActiveExprsTyped
+    elemActiveExprsTyped(Vector.fromList([0]), 0, Code(code = Vector.fromList([]), next = 0), VT(t = ValType.I32, next = 0), 1, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0), []) => Result.Ok(St(m = Module.update(Ast.emptyModule(), elems = Vector.fromList([Elem(ty = ValType.I32, items = [], mode = 0, table = 0, offset = Vector.fromList([]))])), localTypes = [], group = 0))
+
+verify elemActiveFuncs
+    elemActiveFuncs(Vector.fromList([0]), 0, Code(code = Vector.fromList([]), next = 0), 1, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0), []) => Result.Ok(St(m = Module.update(Ast.emptyModule(), elems = Vector.fromList([Elem(ty = ValType.Ref(false, -16), items = [], mode = 0, table = 0, offset = Vector.fromList([]))])), localTypes = [], group = 0))
+
+verify elemActiveExprs
+    elemActiveExprs(Vector.fromList([0]), 0, Code(code = Vector.fromList([]), next = 0), ValType.I32, 1, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0), []) => Result.Ok(St(m = Module.update(Ast.emptyModule(), elems = Vector.fromList([Elem(ty = ValType.I32, items = [], mode = 0, table = 0, offset = Vector.fromList([]))])), localTypes = [], group = 0))
+
+verify elemTyped
+    elemTyped(Vector.fromList([0]), VT(t = ValType.I32, next = 0), 1, 1, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0), []) => Result.Ok(St(m = Module.update(Ast.emptyModule(), elems = Vector.fromList([Elem(ty = ValType.I32, items = [], mode = 1, table = 0, offset = Vector.fromList([]))])), localTypes = [], group = 0))
+
+verify elemPush
+    elemPush(Vector.fromList([]), Items(items = [], next = 0), Elem(ty = ValType.I32, items = [], mode = 1, table = 0, offset = Vector.fromList([])), 0, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0), []) => Result.Ok(St(m = Module.update(Ast.emptyModule(), elems = Vector.fromList([Elem(ty = ValType.I32, items = [], mode = 1, table = 0, offset = Vector.fromList([]))])), localTypes = [], group = 0))
+
+verify funcIdxItems
+    funcIdxItems(Vector.fromList([4]), Bin.U(v = 1, next = 0)) => Items(items = [Vector.fromList([Instr.RefFunc(4), Instr.End])], next = 1)
+
+verify funcIdxList
+    funcIdxList([1], []) => [Vector.fromList([Instr.RefFunc(1), Instr.End])]
+
+verify exprItems
+    exprItems(Vector.fromList([11]), Bin.U(v = 1, next = 0), Ast.emptyModule()) => Result.Ok(Items(items = [Vector.fromList([Instr.End])], next = 1))
+
+verify exprList
+    exprList(Vector.fromList([]), 0, 0, Ast.emptyModule(), []) => Result.Ok(Items(items = [], next = 0))
+
+verify exprListNext
+    exprListNext(Vector.fromList([]), Code(code = Vector.fromList([Instr.End]), next = 0), 1, Ast.emptyModule(), []) => Result.Ok(Items(items = [Vector.fromList([Instr.End])], next = 0))
+
+// ---- code ----
+
+fn codeSec(buf: Vector<Int>, p: Int, n: Int, s: St, types: List<Int>, acc: List<Func>, end: Int) -> Result<St, String>
+    ? "The code section: one body per entry of the function section, in order."
+    match types
+        [] -> codeEnd(p, end, codeDone(n, s, acc))
+        [t, ..rest] -> codeOne(buf, Bin.uleb(buf, p), n, s, t, rest, acc, end)
+
+fn codeEnd(p: Int, end: Int, r: Result<St, String>) -> Result<St, String>
+    ? "r, when the last body ended at the section's end."
+    st = r?
+    sectionEnd(p, end, "code", st)
+
+verify codeEnd
+    codeEnd(1, 2, Result.Ok(St(m = Ast.emptyModule(), localTypes = [], group = 0))) => Result.Err("code section size mismatch (1 vs 2)")
+
+fn codeDone(n: Int, s: St, acc: List<Func>) -> Result<St, String>
+    ? "The module with its local functions once every body is read."
+    match n == 0
+        false -> Result.Err("code section has more bodies than the function section")
+        true -> Result.Ok(St.update(s, localTypes = [], m = Module.update(s.m, funcs = Vector.fromList(List.concat(List.fromVector(s.m.funcs), List.reverse(acc))))))
+
+fn codeOne(buf: Vector<Int>, size: U, n: Int, s: St, t: Int, rest: List<Int>, acc: List<Func>, end: Int) -> Result<St, String>
+    ? "One function body: its locals, then its code, which must end exactly at the body's size."
+    match n <= 0
+        true -> Result.Err("code section has fewer bodies than the function section")
+        false -> codeBody(buf, size.next + size.v, localDecls(buf, Bin.uleb(buf, size.next), Ast.funcParams(s.m, t)), n, s, t, rest, acc, end)
+
+fn codeBody(buf: Vector<Int>, stop: Int, ls: VTs, n: Int, s: St, t: Int, rest: List<Int>, acc: List<Func>, end: Int) -> Result<St, String>
+    ? "A body once its locals are read: decode its code."
+    ok = tooManyLocals(ls.next)?
+    c = body(buf, ls.next, s.m)?
+    match c.next == stop
+        false -> Result.Err("function body size mismatch")
+        true -> codeSec(buf, stop, n - 1, s, rest, List.prepend(Func.Local(t, Vector.fromList(ls.ts), c.code), acc), end)
+
+fn localDecls(buf: Vector<Int>, n: U, params: List<ValType>) -> VTs
+    ? "The locals of a function, its parameters first, then n runs of declared locals."
+    localRuns(buf, n.next, n.v, List.reverse(params))
+
+fn localRuns(buf: Vector<Int>, p: Int, n: Int, acc: List<ValType>) -> VTs
+    ? "n runs of locals, each a count and a type."
+    match Bool.or(n <= 0, p >= Vector.len(buf))
+        true -> VTs(ts = List.reverse(acc), next = p)
+        false -> localRun(buf, Bin.uleb(buf, p), n, acc)
+
+fn localRun(buf: Vector<Int>, k: U, n: Int, acc: List<ValType>) -> VTs
+    ? "One run: k locals of one type. More than a million locals in all is refused (next is -1): a count from a malformed module could ask for billions."
+    v = valType(buf, k.next)
+    match k.v + List.len(acc) > 1000000
+        true -> VTs(ts = [], next = -1)
+        false -> localRuns(buf, v.next, n - 1, repeat(v.t, k.v, acc))
+
+verify localRun
+    localRun(Vector.fromList([127]), Bin.U(v = 4294967295, next = 0), 1, []).next => -1
+
+fn tooManyLocals(next: Int) -> Result<Unit, String>
+    ? "The error localRun signals with a next of -1."
+    match next < 0
+        true -> Result.Err("too many locals")
+        false -> Result.Ok(Unit)
+
+verify tooManyLocals
+    tooManyLocals(-1) => Result.Err("too many locals")
+
+fn repeat(t: ValType, k: Int, acc: List<ValType>) -> List<ValType>
+    ? "acc with k copies of t in front."
+    match k <= 0
+        true -> acc
+        false -> repeat(t, k - 1, List.prepend(t, acc))
+
+verify codeSec
+    codeSec(Vector.fromList([]), 0, 1, St(m = Ast.emptyModule(), localTypes = [], group = 0), [], [], 0) => Result.Err("code section has more bodies than the function section")
+
+verify codeDone
+    codeDone(0, St(m = Ast.emptyModule(), localTypes = [], group = 0), []) => Result.Ok(St(m = Ast.emptyModule(), localTypes = [], group = 0))
+
+verify codeOne
+    codeOne(Vector.fromList([]), Bin.U(v = 0, next = 0), 0, St(m = Ast.emptyModule(), localTypes = [], group = 0), 0, [], [], 0) => Result.Err("code section has fewer bodies than the function section")
+    codeOne(Vector.fromList([2, 0, 11]), Bin.U(v = 2, next = 1), 1, St(m = Ast.emptyModule(), localTypes = [], group = 0), 0, [], [], 3) => Result.Ok(St(m = Module.update(Ast.emptyModule(), funcs = Vector.fromList([Func.Local(0, Vector.fromList([]), Vector.fromList([Instr.End]))])), localTypes = [], group = 0))
+
+verify codeBody
+    codeBody(Vector.fromList([11]), 2, VTs(ts = [], next = 0), 1, St(m = Ast.emptyModule(), localTypes = [], group = 0), 0, [], [], 2) => Result.Err("function body size mismatch")
+
+verify localDecls
+    localDecls(Vector.fromList([1, 2, 126]), Bin.U(v = 1, next = 1), [ValType.I32]) => VTs(ts = [ValType.I32, ValType.I64, ValType.I64], next = 3)
+
+verify localRuns
+    localRuns(Vector.fromList([]), 0, 0, [ValType.I32]) => VTs(ts = [ValType.I32], next = 0)
+
+verify localRun
+    localRun(Vector.fromList([0, 127]), Bin.U(v = 1, next = 1), 1, []) => VTs(ts = [ValType.I32], next = 2)
+
+verify repeat
+    repeat(ValType.I32, 2, []) => [ValType.I32, ValType.I32]
+
+fn expr(buf: Vector<Int>, p: Int, m: Module) -> Result<Code, String>
+    ? "A constant expression: decoded like a function body, through its final end."
+    body(buf, p, m)
+
+verify expr
+    expr(Vector.fromList([65, 7, 11]), 0, Ast.emptyModule()) => Result.Ok(Code(code = Vector.fromList([Instr.I32Const(7), Instr.End]), next = 3))
+
+fn body(buf: Vector<Int>, p: Int, m: Module) -> Result<Code, String>
+    ? "Instructions from p through the end that closes the body, with every block's end and every if's else resolved."
+    bodyFrom(buf, p, m, 0, [], [], [])
+
+verify body
+    body(Vector.fromList([2, 64, 1, 11, 11]), 0, Ast.emptyModule()) => Result.Ok(Code(code = Vector.fromList([Instr.Block(0, 0, 2, Sig(params = [], results = [], ty = -1)), Instr.Nop, Instr.End, Instr.End]), next = 5))
+    body(Vector.fromList([4, 127, 65, 1, 5, 65, 2, 11, 11]), 0, Ast.emptyModule()) => Result.Ok(Code(code = Vector.fromList([Instr.If(1, 0, 2, 4, Sig(params = [], results = [ValType.I32], ty = -1)), Instr.I32Const(1), Instr.Else, Instr.I32Const(2), Instr.End, Instr.End]), next = 9))
+    body(Vector.fromList([4, 64, 11, 11]), 0, Ast.emptyModule()) => Result.Ok(Code(code = Vector.fromList([Instr.If(0, 0, 1, 1, Sig(params = [], results = [], ty = -1)), Instr.End, Instr.End]), next = 4))
+    body(Vector.fromList([255, 11]), 0, Ast.emptyModule()) => Result.Err("unknown opcode 255 at 0")
+
+fn bodyFrom(buf: Vector<Int>, p: Int, m: Module, idx: Int, acc: List<Instr>, open: List<Open>, patches: List<Patch>) -> Result<Code, String>
+    ? "Decodes on from p; idx is the index the next instruction gets, open the blocks not yet ended. Running off the end of the octets is an error."
+    match p >= Vector.len(buf)
+        true -> Result.Err("unexpected end of section or function")
+        false -> bodyAt(buf, p, m, idx, acc, open, patches)
+
+fn bodyAt(buf: Vector<Int>, p: Int, m: Module, idx: Int, acc: List<Instr>, open: List<Open>, patches: List<Patch>) -> Result<Code, String>
+    ? "Decodes the instruction at p and goes on."
+    r = instr(buf, p, m)
+    match r.i
+        Instr.Bad(op) -> Result.Err("unknown opcode {op} at {p}")
+        Instr.Block(_, _, _, _) -> bodyFrom(buf, r.next, m, idx + 1, List.prepend(r.i, acc), List.prepend(Open(at = idx, els = -1), open), patches)
+        Instr.If(_, _, _, _, _) -> bodyFrom(buf, r.next, m, idx + 1, List.prepend(r.i, acc), List.prepend(Open(at = idx, els = -1), open), patches)
+        Instr.Loop(_, _) -> bodyFrom(buf, r.next, m, idx + 1, List.prepend(r.i, acc), List.prepend(Open(at = -1, els = -1), open), patches)
+        Instr.TryTable(_, _, _, _, _) -> bodyFrom(buf, r.next, m, idx + 1, List.prepend(r.i, acc), List.prepend(Open(at = idx, els = -1), open), patches)
+        Instr.Else -> bodyFrom(buf, r.next, m, idx + 1, List.prepend(r.i, acc), markElse(open, idx), patches)
+        Instr.End -> bodyEnd(buf, r.next, m, idx, List.prepend(r.i, acc), open, patches)
+        _ -> bodyFrom(buf, r.next, m, idx + 1, List.prepend(r.i, acc), open, patches)
+
+fn markElse(open: List<Open>, idx: Int) -> List<Open>
+    ? "The open blocks with the innermost one's else at idx."
+    match open
+        [] -> []
+        [o, ..rest] -> List.prepend(Open.update(o, els = idx), rest)
+
+fn bodyEnd(buf: Vector<Int>, p: Int, m: Module, idx: Int, acc: List<Instr>, open: List<Open>, patches: List<Patch>) -> Result<Code, String>
+    ? "An end at idx: it closes the innermost open block, or the body itself when none is open."
+    match open
+        [] -> Result.Ok(Code(code = applyPatches(Vector.fromList(List.reverse(acc)), patches), next = p))
+        [o, ..rest] -> bodyFrom(buf, p, m, idx + 1, acc, rest, closeBlock(o, idx, patches))
+
+fn closeBlock(o: Open, idx: Int, patches: List<Patch>) -> List<Patch>
+    ? "The patch for a block or if ended at idx; a loop needs none."
+    match o.at < 0
+        true -> patches
+        false -> List.prepend(Patch(at = o.at, els = o.els, end = idx), patches)
+
+fn applyPatches(code: Vector<Instr>, patches: List<Patch>) -> Vector<Instr>
+    ? "Writes each block's end, and each if's else and end, into the code."
+    match patches
+        [] -> code
+        [pt, ..rest] -> applyPatches(patchAt(code, pt), rest)
+
+fn patchAt(code: Vector<Instr>, pt: Patch) -> Vector<Instr>
+    ? "The code with one block or if patched."
+    match Vector.get(code, pt.at)
+        Option.Some(Instr.Block(a, k, _, sg)) -> Option.withDefault(Vector.set(code, pt.at, Instr.Block(a, k, pt.end, sg)), code)
+        Option.Some(Instr.If(a, k, _, _, sg)) -> Option.withDefault(Vector.set(code, pt.at, Instr.If(a, k, elseOf(pt), pt.end, sg)), code)
+        Option.Some(Instr.TryTable(a, k, _, sg, cs)) -> Option.withDefault(Vector.set(code, pt.at, Instr.TryTable(a, k, pt.end, sg, cs)), code)
+        _ -> code
+
+fn elseOf(pt: Patch) -> Int
+    ? "Where an if's false arm starts: at its else, or at its end when it has none."
+    match pt.els < 0
+        true -> pt.end
+        false -> pt.els
+
+verify bodyFrom
+    bodyFrom(Vector.fromList([11]), 0, Ast.emptyModule(), 0, [], [], []) => Result.Ok(Code(code = Vector.fromList([Instr.End]), next = 1))
+
+verify markElse
+    markElse([Open(at = 1, els = -1)], 4) => [Open(at = 1, els = 4)]
+    markElse([], 4) => []
+
+verify bodyEnd
+    bodyEnd(Vector.fromList([]), 1, Ast.emptyModule(), 0, [Instr.End], [], []) => Result.Ok(Code(code = Vector.fromList([Instr.End]), next = 1))
+
+verify closeBlock
+    closeBlock(Open(at = -1, els = -1), 3, []) => []
+    closeBlock(Open(at = 1, els = 2), 3, []) => [Patch(at = 1, els = 2, end = 3)]
+
+verify applyPatches
+    applyPatches(Vector.fromList([Instr.Block(0, 0, 0, Sig(params = [], results = [], ty = -1)), Instr.End]), [Patch(at = 0, els = -1, end = 1)]) => Vector.fromList([Instr.Block(0, 0, 1, Sig(params = [], results = [], ty = -1)), Instr.End])
+
+verify patchAt
+    patchAt(Vector.fromList([Instr.Nop]), Patch(at = 0, els = -1, end = 1)) => Vector.fromList([Instr.Nop])
+    patchAt(Vector.fromList([Instr.If(0, 0, 0, 0, Sig(params = [], results = [], ty = -1))]), Patch(at = 0, els = -1, end = 1)) => Vector.fromList([Instr.If(0, 0, 1, 1, Sig(params = [], results = [], ty = -1))])
+
+verify elseOf
+    elseOf(Patch(at = 0, els = -1, end = 5)) => 5
+    elseOf(Patch(at = 0, els = 2, end = 5)) => 2
+
+// ---- instructions ----
+
+fn blockType(buf: Vector<Int>, p: Int, m: Module) -> BT
+    ? "A block type: empty, one result type, or the index of a function type."
+    b = Bin.byte(buf, p)
+    match b
+        64 -> BT(params = 0, results = 0, next = p + 1, sig = Sig(params = [], results = [], ty = -1))
+        _ -> blockTypeOf(buf, p, b, m)
+
+fn blockTypeOf(buf: Vector<Int>, p: Int, b: Int, m: Module) -> BT
+    ? "A block type that is not empty: a value type when its first byte reads as a negative s33, a type index otherwise."
+    s = Bin.sleb33(buf, p)
+    v = valType(buf, p)
+    match s.v < 0
+        true -> BT(params = 0, results = 1, next = v.next, sig = Sig(params = [], results = [v.t], ty = -1))
+        false -> blockTypeIdx(m, s)
+
+fn blockTypeIdx(m: Module, s: U) -> BT
+    ? "A block type given as a function type index."
+    ps = Ast.funcParams(m, s.v)
+    rs = Ast.funcResults(m, s.v)
+    BT(params = List.len(ps), results = List.len(rs), next = s.next, sig = Sig(params = ps, results = rs, ty = s.v))
+
+verify blockTypeIdx
+    blockTypeIdx(Ast.emptyModule(), Bin.U(v = 0, next = 1)) => BT(params = 0, results = 0, next = 1, sig = Sig(params = [], results = [], ty = 0))
+
+verify blockType
+    blockType(Vector.fromList([64]), 0, Ast.emptyModule()) => BT(params = 0, results = 0, next = 1, sig = Sig(params = [], results = [], ty = -1))
+    blockType(Vector.fromList([127]), 0, Ast.emptyModule()) => BT(params = 0, results = 1, next = 1, sig = Sig(params = [], results = [ValType.I32], ty = -1))
+    blockType(Vector.fromList([99, 0]), 0, Ast.emptyModule()) => BT(params = 0, results = 1, next = 2, sig = Sig(params = [], results = [ValType.Ref(true, 0)], ty = -1))
+
+verify blockTypeOf
+    blockTypeOf(Vector.fromList([0]), 0, 0, Ast.emptyModule()) => BT(params = 0, results = 0, next = 1, sig = Sig(params = [], results = [], ty = 0))
+
+fn ir(i: Instr, next: Int) -> IR
+    ? "An instruction and the position after it."
+    IR(i = i, next = next)
+
+verify ir
+    ir(Instr.Nop, 1) => IR(i = Instr.Nop, next = 1)
+
+fn instr(buf: Vector<Int>, p: Int, m: Module) -> IR
+    ? "The instruction at p. An opcode this decoder does not know reads as Bad."
+    op = Bin.byte(buf, p)
+    q = p + 1
+    match op < 69
+        true -> instrLow(buf, op, q, m)
+        false -> instrHigh(buf, op, q, m)
+
+verify instr
+    instr(Vector.fromList([106]), 0, Ast.emptyModule()) => IR(i = Instr.Bin(106), next = 1)
+    instr(Vector.fromList([69]), 0, Ast.emptyModule()) => IR(i = Instr.Un(69), next = 1)
+    instr(Vector.fromList([65, 127]), 0, Ast.emptyModule()) => IR(i = Instr.I32Const(-1), next = 2)
+
+fn instrLow(buf: Vector<Int>, op: Int, q: Int, m: Module) -> IR
+    ? "Opcodes below the numeric range: control, variables, memory and constants."
+    a = Bin.uleb(buf, q)
+    match op
+        0 -> ir(Instr.Unreachable, q)
+        1 -> ir(Instr.Nop, q)
+        2 -> blockInstr(blockType(buf, q, m), 0)
+        3 -> blockInstr(blockType(buf, q, m), 1)
+        4 -> blockInstr(blockType(buf, q, m), 2)
+        5 -> ir(Instr.Else, q)
+        8 -> ir(Instr.Throw(a.v), a.next)
+        10 -> ir(Instr.ThrowRef, q)
+        31 -> tryTable(buf, blockType(buf, q, m))
+        11 -> ir(Instr.End, q)
+        12 -> ir(Instr.Br(a.v), a.next)
+        13 -> ir(Instr.BrIf(a.v), a.next)
+        14 -> brTable(buf, a)
+        15 -> ir(Instr.Return, q)
+        16 -> ir(Instr.Call(a.v), a.next)
+        17 -> twoIdx(buf, a, 0)
+        18 -> ir(Instr.ReturnCall(a.v), a.next)
+        19 -> twoIdx(buf, a, 1)
+        20 -> ir(Instr.CallRef(a.v), a.next)
+        21 -> ir(Instr.ReturnCallRef(a.v), a.next)
+        26 -> ir(Instr.Drop, q)
+        27 -> ir(Instr.Select, q)
+        28 -> selectT(vecTypes(buf, q))
+        32 -> ir(Instr.LocalGet(a.v), a.next)
+        33 -> ir(Instr.LocalSet(a.v), a.next)
+        34 -> ir(Instr.LocalTee(a.v), a.next)
+        35 -> ir(Instr.GlobalGet(a.v), a.next)
+        36 -> ir(Instr.GlobalSet(a.v), a.next)
+        37 -> ir(Instr.TableGet(a.v), a.next)
+        38 -> ir(Instr.TableSet(a.v), a.next)
+        63 -> ir(Instr.MemorySize(a.v), a.next)
+        64 -> ir(Instr.MemoryGrow(a.v), a.next)
+        65 -> constI32(Bin.sleb32(buf, q))
+        66 -> constI64(Bin.sleb64(buf, q))
+        67 -> ir(Instr.F32Const(Bin.fixed(buf, q, 4)), q + 4)
+        68 -> ir(Instr.F64Const(Bin.fixed(buf, q, 8)), q + 8)
+        _ -> memInstr(buf, op, q)
+
+verify instrLow
+    instrLow(Vector.fromList([0, 7]), 12, 1, Ast.emptyModule()) => IR(i = Instr.Br(7), next = 2)
+    instrLow(Vector.fromList([0, 1, 2]), 63, 1, Ast.emptyModule()) => IR(i = Instr.MemorySize(1), next = 2)
+
+fn selectT(ts: VTs) -> IR
+    ? "A select with explicit result types."
+    ir(Instr.SelectT(ts.ts), ts.next)
+
+verify selectT
+    selectT(VTs(ts = [ValType.I32], next = 3)) => IR(i = Instr.SelectT([ValType.I32]), next = 3)
+
+fn constI32(u: U) -> IR
+    ? "i32.const with its immediate."
+    ir(Instr.I32Const(u.v), u.next)
+
+verify constI32
+    constI32(Bin.U(v = -1, next = 2)) => IR(i = Instr.I32Const(-1), next = 2)
+
+fn constI64(u: U) -> IR
+    ? "i64.const with its immediate."
+    ir(Instr.I64Const(u.v), u.next)
+
+verify constI64
+    constI64(Bin.U(v = 5, next = 2)) => IR(i = Instr.I64Const(5), next = 2)
+
+fn blockInstr(bt: BT, kind: Int) -> IR
+    ? "block (0), loop (1) or if (2), with its end still to be patched."
+    match kind
+        0 -> ir(Instr.Block(bt.results, bt.params, 0, bt.sig), bt.next)
+        1 -> ir(Instr.Loop(bt.params, bt.sig), bt.next)
+        _ -> ir(Instr.If(bt.results, bt.params, 0, 0, bt.sig), bt.next)
+
+verify blockInstr
+    blockInstr(BT(params = 1, results = 2, next = 3, sig = Sig(params = [], results = [], ty = -1)), 0) => IR(i = Instr.Block(2, 1, 0, Sig(params = [], results = [], ty = -1)), next = 3)
+    blockInstr(BT(params = 1, results = 2, next = 3, sig = Sig(params = [], results = [], ty = -1)), 1) => IR(i = Instr.Loop(1, Sig(params = [], results = [], ty = -1)), next = 3)
+    blockInstr(BT(params = 1, results = 2, next = 3, sig = Sig(params = [], results = [], ty = -1)), 2) => IR(i = Instr.If(2, 1, 0, 0, Sig(params = [], results = [], ty = -1)), next = 3)
+
+fn tryTable(buf: Vector<Int>, bt: BT) -> IR
+    ? "try_table: its block type, then its catch clauses as triples of kind, tag (-1 for catch_all) and label; the end is patched later."
+    n = Bin.uleb(buf, bt.next)
+    cs = catches(buf, n.next, n.v, [])
+    match cs.ok
+        true -> ir(Instr.TryTable(bt.results, bt.params, 0, bt.sig, Vector.fromList(cs.v)), cs.next)
+        false -> ir(Instr.Bad(31), cs.next)
+
+record Cs
+    v: List<Int>
+    next: Int
+    ok: Bool
+
+fn catches(buf: Vector<Int>, p: Int, n: Int, acc: List<Int>) -> Cs
+    ? "n catch clauses from p, flattened in order."
+    match Bool.or(n <= 0, p >= Vector.len(buf))
+        true -> Cs(v = List.reverse(acc), next = p, ok = true)
+        false -> catchOne(buf, Bin.byte(buf, p), p + 1, n, acc)
+
+fn catchOne(buf: Vector<Int>, kind: Int, p: Int, n: Int, acc: List<Int>) -> Cs
+    ? "One clause by its kind: catch (0) and catch_ref (1) name a tag, catch_all (2) and catch_all_ref (3) do not."
+    match kind < 2
+        true -> catchTagged(buf, kind, Bin.uleb(buf, p), n, acc)
+        false -> catchAll(buf, kind, Bin.uleb(buf, p), n, acc)
+
+fn catchTagged(buf: Vector<Int>, kind: Int, t: U, n: Int, acc: List<Int>) -> Cs
+    ? "A clause with a tag, then its label."
+    l = Bin.uleb(buf, t.next)
+    catches(buf, l.next, n - 1, List.prepend(l.v, List.prepend(t.v, List.prepend(kind, acc))))
+
+fn catchAll(buf: Vector<Int>, kind: Int, l: U, n: Int, acc: List<Int>) -> Cs
+    ? "A clause without a tag; a kind past 3 is malformed."
+    match kind > 3
+        true -> Cs(v = [], next = l.next, ok = false)
+        false -> catches(buf, l.next, n - 1, List.prepend(l.v, List.prepend(-1, List.prepend(kind, acc))))
+
+verify tryTable
+    tryTable(Vector.fromList([1, 2, 0]), BT(params = 0, results = 0, next = 0, sig = Sig(params = [], results = [], ty = -1))) => IR(i = Instr.TryTable(0, 0, 0, Sig(params = [], results = [], ty = -1), Vector.fromList([2, -1, 0])), next = 3)
+
+verify catches
+    catches(Vector.fromList([0, 4, 1]), 0, 1, []) => Cs(v = [0, 4, 1], next = 3, ok = true)
+
+verify catchOne
+    catchOne(Vector.fromList([3, 2]), 3, 1, 1, []) => Cs(v = [3, -1, 2], next = 2, ok = true)
+
+verify catchTagged
+    catchTagged(Vector.fromList([5, 0]), 1, Bin.U(v = 5, next = 1), 1, []) => Cs(v = [1, 5, 0], next = 2, ok = true)
+
+verify catchAll
+    catchAll(Vector.fromList([]), 7, Bin.U(v = 0, next = 1), 1, []).ok => false
+
+fn brTable(buf: Vector<Int>, n: U) -> IR
+    ? "br_table: n labels, then the default."
+    ls = ulebs(buf, n.next, n.v, [])
+    d = Bin.uleb(buf, ulebsEnd(buf, n.next, n.v))
+    ir(Instr.BrTable(Vector.fromList(ls), d.v), d.next)
+
+verify brTable
+    brTable(Vector.fromList([2, 0, 1, 2]), Bin.U(v = 2, next = 1)) => IR(i = Instr.BrTable(Vector.fromList([0, 1]), 2), next = 4)
+
+fn twoIdx(buf: Vector<Int>, a: U, kind: Int) -> IR
+    ? "call_indirect (0) or return_call_indirect (1): a type index, then a table index."
+    b = Bin.uleb(buf, a.next)
+    match kind
+        0 -> ir(Instr.CallIndirect(a.v, b.v), b.next)
+        _ -> ir(Instr.ReturnCallIndirect(a.v, b.v), b.next)
+
+verify twoIdx
+    twoIdx(Vector.fromList([3, 0]), Bin.U(v = 3, next = 1), 0) => IR(i = Instr.CallIndirect(3, 0), next = 2)
+    twoIdx(Vector.fromList([3, 0]), Bin.U(v = 3, next = 1), 1) => IR(i = Instr.ReturnCallIndirect(3, 0), next = 2)
+
+fn memInstr(buf: Vector<Int>, op: Int, q: Int) -> IR
+    ? "A load (40-53) or store (54-62) with its memarg: the alignment exponent, the offset and the memory index, which is there when bit 6 of the alignment is set."
+    al = Bin.uleb(buf, q)
+    afterIdx = memIdxEnd(buf, al)
+    mem = memIdx(buf, al)
+    off = Bin.uleb64(buf, afterIdx)
+    a = Bits.and(al.v, Bits.not(64))
+    match Bool.and(op >= 40, op <= 53)
+        true -> ir(Instr.Load(op, off.v, a, mem), off.next)
+        false -> memStore(op, off, a, mem)
+
+fn memIdx(buf: Vector<Int>, al: U) -> Int
+    ? "The memory index of a memarg: zero unless bit 6 of the alignment says one follows."
+    match Bits.and(al.v, 64) == 0
+        true -> 0
+        false -> Bin.uleb(buf, al.next).v
+
+verify memIdx
+    memIdx(Vector.fromList([66, 1]), Bin.U(v = 66, next = 1)) => 1
+    memIdx(Vector.fromList([2]), Bin.U(v = 2, next = 1)) => 0
+
+fn memIdxEnd(buf: Vector<Int>, al: U) -> Int
+    ? "Where the offset of a memarg starts."
+    match Bits.and(al.v, 64) == 0
+        true -> al.next
+        false -> Bin.uleb(buf, al.next).next
+
+fn memStore(op: Int, off: U, a: Int, mem: Int) -> IR
+    ? "A store, or Bad for an opcode in no known range."
+    match Bool.and(op >= 54, op <= 62)
+        true -> ir(Instr.Store(op, off.v, a, mem), off.next)
+        false -> ir(Instr.Bad(op), off.next)
+
+verify memInstr
+    memInstr(Vector.fromList([40, 2, 8]), 40, 1) => IR(i = Instr.Load(40, 8, 2, 0), next = 3)
+    memInstr(Vector.fromList([58, 0, 0]), 58, 1) => IR(i = Instr.Store(58, 0, 0, 0), next = 3)
+
+verify memIdxEnd
+    memIdxEnd(Vector.fromList([66, 0]), Bin.U(v = 66, next = 1)) => 2
+
+verify memStore
+    memStore(22, Bin.U(v = 0, next = 1), 0, 0) => IR(i = Instr.Bad(22), next = 1)
+
+fn instrHigh(buf: Vector<Int>, op: Int, q: Int, m: Module) -> IR
+    ? "Numeric opcodes, references and the prefixed families."
+    match op <= 196
+        true -> ir(numeric(op), q)
+        false -> instrRef(buf, op, q)
+
+verify instrHigh
+    instrHigh(Vector.fromList([209]), 209, 1, Ast.emptyModule()) => IR(i = Instr.RefIsNull, next = 1)
+
+fn numeric(op: Int) -> Instr
+    ? "A numeric opcode, as a unary or a binary operation by how many operands it pops."
+    match isUnary(op)
+        true -> Instr.Un(op)
+        false -> Instr.Bin(op)
+
+verify numeric
+    numeric(106) => Instr.Bin(106)
+    numeric(167) => Instr.Un(167)
+
+fn isUnary(op: Int) -> Bool
+    ? "Whether a numeric opcode pops one operand: eqz, clz, ctz, popcnt, the float unaries, every conversion and the sign extensions."
+    match op
+        69 -> true
+        80 -> true
+        103 -> true
+        104 -> true
+        105 -> true
+        121 -> true
+        122 -> true
+        123 -> true
+        _ -> isUnaryRange(op)
+
+fn isUnaryRange(op: Int) -> Bool
+    ? "The ranges of unary numeric opcodes."
+    Bool.or(Bool.or(Bool.and(op >= 139, op <= 145), Bool.and(op >= 153, op <= 159)), op >= 167)
+
+verify isUnary
+    isUnary(69) => true
+    isUnary(106) => false
+    isUnary(140) => true
+    isUnary(196) => true
+
+verify isUnaryRange
+    isUnaryRange(160) => false
+    isUnaryRange(153) => true
+
+fn instrRef(buf: Vector<Int>, op: Int, q: Int) -> IR
+    ? "Reference instructions and the 0xFB and 0xFC prefixes."
+    a = Bin.uleb(buf, q)
+    match op
+        208 -> refNull(Bin.sleb33(buf, q))
+        209 -> ir(Instr.RefIsNull, q)
+        210 -> ir(Instr.RefFunc(a.v), a.next)
+        211 -> ir(Instr.RefEq, q)
+        212 -> ir(Instr.RefAsNonNull, q)
+        213 -> ir(Instr.BrOnNull(a.v), a.next)
+        214 -> ir(Instr.BrOnNonNull(a.v), a.next)
+        251 -> gcInstr(buf, a)
+        252 -> miscInstr(buf, a)
+        253 -> simdInstr(buf, a)
+        _ -> ir(Instr.Bad(op), q)
+
+verify instrRef
+    instrRef(Vector.fromList([213, 1]), 213, 1) => IR(i = Instr.BrOnNull(1), next = 2)
+    instrRef(Vector.fromList([200]), 200, 1) => IR(i = Instr.Bad(200), next = 1)
+
+fn refNull(h: U) -> IR
+    ? "ref.null of a heap type."
+    ir(Instr.RefNull(h.v), h.next)
+
+verify refNull
+    refNull(Bin.U(v = -16, next = 2)) => IR(i = Instr.RefNull(-16), next = 2)
+
+fn gcInstr(buf: Vector<Int>, sub: U) -> IR
+    ? "The GC instructions under the 0xFB prefix."
+    a = Bin.uleb(buf, sub.next)
+    b = Bin.uleb(buf, a.next)
+    h = Bin.sleb33(buf, sub.next)
+    match sub.v
+        0 -> ir(Instr.StructNew(a.v), a.next)
+        1 -> ir(Instr.StructNewDefault(a.v), a.next)
+        2 -> ir(Instr.StructGet(a.v, b.v, 0), b.next)
+        3 -> ir(Instr.StructGet(a.v, b.v, 1), b.next)
+        4 -> ir(Instr.StructGet(a.v, b.v, 2), b.next)
+        5 -> ir(Instr.StructSet(a.v, b.v), b.next)
+        6 -> ir(Instr.ArrayNew(a.v), a.next)
+        7 -> ir(Instr.ArrayNewDefault(a.v), a.next)
+        8 -> ir(Instr.ArrayNewFixed(a.v, b.v), b.next)
+        9 -> ir(Instr.ArrayNewData(a.v, b.v), b.next)
+        10 -> ir(Instr.ArrayNewElem(a.v, b.v), b.next)
+        11 -> ir(Instr.ArrayGet(a.v, 0), a.next)
+        12 -> ir(Instr.ArrayGet(a.v, 1), a.next)
+        13 -> ir(Instr.ArrayGet(a.v, 2), a.next)
+        14 -> ir(Instr.ArraySet(a.v), a.next)
+        15 -> ir(Instr.ArrayLen, sub.next)
+        16 -> ir(Instr.ArrayFill(a.v), a.next)
+        17 -> ir(Instr.ArrayCopy(a.v, b.v), b.next)
+        18 -> ir(Instr.ArrayInitData(a.v, b.v), b.next)
+        19 -> ir(Instr.ArrayInitElem(a.v, b.v), b.next)
+        20 -> ir(Instr.RefTest(false, h.v), h.next)
+        21 -> ir(Instr.RefTest(true, h.v), h.next)
+        22 -> ir(Instr.RefCast(false, h.v), h.next)
+        23 -> ir(Instr.RefCast(true, h.v), h.next)
+        24 -> brOnCast(buf, sub.next, false)
+        25 -> brOnCast(buf, sub.next, true)
+        26 -> ir(Instr.AnyConvertExtern, sub.next)
+        27 -> ir(Instr.ExternConvertAny, sub.next)
+        28 -> ir(Instr.RefI31, sub.next)
+        29 -> ir(Instr.I31Get(true), sub.next)
+        30 -> ir(Instr.I31Get(false), sub.next)
+        s -> ir(Instr.Bad(64256 + s), sub.next)
+
+verify gcInstr
+    gcInstr(Vector.fromList([251, 2, 3, 1]), Bin.U(v = 2, next = 2)) => IR(i = Instr.StructGet(3, 1, 0), next = 4)
+    gcInstr(Vector.fromList([251, 23, 108]), Bin.U(v = 23, next = 2)) => IR(i = Instr.RefCast(true, -20), next = 3)
+    gcInstr(Vector.fromList([251, 15]), Bin.U(v = 15, next = 2)) => IR(i = Instr.ArrayLen, next = 2)
+
+fn brOnCast(buf: Vector<Int>, p: Int, fail: Bool) -> IR
+    ? "br_on_cast and br_on_cast_fail: flags, a label, the source and the target heap types. Bit 0 of the flags makes the source nullable, bit 1 the target."
+    flags = Bin.byte(buf, p)
+    l = Bin.uleb(buf, p + 1)
+    h1 = Bin.sleb33(buf, l.next)
+    h2 = Bin.sleb33(buf, h1.next)
+    match fail
+        false -> ir(Instr.BrOnCast(l.v, flags, h1.v, h2.v), h2.next)
+        true -> ir(Instr.BrOnCastFail(l.v, flags, h1.v, h2.v), h2.next)
+
+verify brOnCast
+    brOnCast(Vector.fromList([3, 0, 110, 1]), 0, false) => IR(i = Instr.BrOnCast(0, 3, -18, 1), next = 4)
+    brOnCast(Vector.fromList([1, 2, 110, 1]), 0, true) => IR(i = Instr.BrOnCastFail(2, 1, -18, 1), next = 4)
+
+fn simdInstr(buf: Vector<Int>, sub: U) -> IR
+    ? "The instructions under the 0xFD prefix: SIMD and relaxed SIMD."
+    match Simd.known(sub.v)
+        false -> ir(Instr.Bad(64768 + sub.v), sub.next)
+        true -> simdKnown(buf, sub.v, sub.next)
+
+fn simdKnown(buf: Vector<Int>, op: Int, p: Int) -> IR
+    ? "A known SIMD instruction and its immediates."
+    match Simd.isMem(op)
+        true -> simdMem(buf, op, Bin.uleb(buf, p))
+        false -> simdOther(buf, op, p)
+
+fn simdMem(buf: Vector<Int>, op: Int, al: U) -> IR
+    ? "A SIMD load or store: its memarg, then a lane for the lane loads and stores."
+    off = Bin.uleb64(buf, memIdxEnd(buf, al))
+    a = Bits.and(al.v, Bits.not(64))
+    match Bool.and(op >= 84, op <= 91)
+        true -> ir(Instr.Simd(op, Bin.byte(buf, off.next), memIdx(buf, al), off.v, a), off.next + 1)
+        false -> ir(Instr.Simd(op, 0, memIdx(buf, al), off.v, a), off.next)
+
+fn simdOther(buf: Vector<Int>, op: Int, p: Int) -> IR
+    ? "v128.const and i8x16.shuffle carry 16 octets, extract and replace_lane a lane octet, the rest nothing."
+    match Bool.or(op == 12, op == 13)
+        true -> ir(Instr.Simd(op, leNum(Bin.octetsAt(buf, p, 16), 1, 0), 0, 0, 0), p + 16)
+        false -> match Simd.laneLimit(op) > 0
+            true -> ir(Instr.Simd(op, Bin.byte(buf, p), 0, 0, 0), p + 1)
+            false -> ir(Instr.Simd(op, 0, 0, 0, 0), p)
+
+fn leNum(bs: List<Int>, scale: Int, acc: Int) -> Int
+    ? "Octets read as a little-endian number."
+    match bs
+        [] -> acc
+        [b, ..rest] -> leNum(rest, scale * 256, acc + b * scale)
+
+verify simdInstr
+    simdInstr(Vector.fromList([253, 154, 1]), Bin.U(v = 154, next = 3)) => IR(i = Instr.Bad(64922), next = 3)
+
+verify simdKnown
+    simdKnown(Vector.fromList([110]), 110, 1) => IR(i = Instr.Simd(110, 0, 0, 0, 0), next = 1)
+
+verify simdMem
+    simdMem(Vector.fromList([4, 16, 3]), 84, Bin.U(v = 0, next = 1)) => IR(i = Instr.Simd(84, 3, 0, 16, 0), next = 3)
+
+verify simdOther
+    simdOther(Vector.fromList([2]), 21, 0) => IR(i = Instr.Simd(21, 2, 0, 0, 0), next = 1)
+
+verify leNum
+    leNum([1, 2], 1, 0) => 513
+
+fn miscInstr(buf: Vector<Int>, sub: U) -> IR
+    ? "The instructions under the 0xFC prefix: saturating truncations, bulk memory and tables."
+    a = Bin.uleb(buf, sub.next)
+    b = Bin.uleb(buf, a.next)
+    match sub.v < 8
+        true -> ir(Instr.Un(64512 + sub.v), sub.next)
+        false -> miscBulk(sub, a, b)
+
+fn miscBulk(sub: U, a: U, b: U) -> IR
+    ? "Bulk memory and table instructions."
+    match sub.v
+        8 -> ir(Instr.MemoryInit(a.v, b.v), b.next)
+        9 -> ir(Instr.DataDrop(a.v), a.next)
+        10 -> ir(Instr.MemoryCopy(a.v, b.v), b.next)
+        11 -> ir(Instr.MemoryFill(a.v), a.next)
+        12 -> ir(Instr.TableInit(a.v, b.v), b.next)
+        13 -> ir(Instr.ElemDrop(a.v), a.next)
+        14 -> ir(Instr.TableCopy(a.v, b.v), b.next)
+        15 -> ir(Instr.TableGrow(a.v), a.next)
+        16 -> ir(Instr.TableSize(a.v), a.next)
+        17 -> ir(Instr.TableFill(a.v), a.next)
+        s -> ir(Instr.Bad(64512 + s), sub.next)
+
+verify miscInstr
+    miscInstr(Vector.fromList([252, 2]), Bin.U(v = 2, next = 2)) => IR(i = Instr.Un(64514), next = 2)
+    miscInstr(Vector.fromList([252, 10, 0, 0]), Bin.U(v = 10, next = 2)) => IR(i = Instr.MemoryCopy(0, 0), next = 4)
+
+verify miscBulk
+    miscBulk(Bin.U(v = 11, next = 2), Bin.U(v = 0, next = 3), Bin.U(v = 0, next = 4)) => IR(i = Instr.MemoryFill(0), next = 3)
+    miscBulk(Bin.U(v = 99, next = 2), Bin.U(v = 0, next = 3), Bin.U(v = 0, next = 4)) => IR(i = Instr.Bad(64611), next = 2)

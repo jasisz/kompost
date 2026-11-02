@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""Runs a command and kills its whole process tree when the tree's resident
+memory passes a limit (GUARD_GB, default 6) or its time passes GUARD_SECS
+(default none). Prints why it killed, exits 137 then.
+
+usage: bin/guard CMD [ARGS...]
+"""
+import os, signal, subprocess, sys, time
+
+LIMIT_KB = int(float(os.environ.get("GUARD_GB", "6")) * 1024 * 1024)
+SECS = float(os.environ.get("GUARD_SECS", "0"))
+
+
+def tree_rss(root):
+    out = subprocess.run(["ps", "-axo", "pid=,ppid=,rss="], capture_output=True, text=True).stdout
+    kids, rss = {}, {}
+    for line in out.splitlines():
+        p, pp, r = (int(x) for x in line.split())
+        kids.setdefault(pp, []).append(p)
+        rss[p] = r
+    total, stack, seen = 0, [root], []
+    while stack:
+        p = stack.pop()
+        seen.append(p)
+        total += rss.get(p, 0)
+        stack.extend(kids.get(p, []))
+    return total, seen
+
+
+def main():
+    pr = subprocess.Popen(sys.argv[1:], start_new_session=True)
+    start = time.time()
+    while pr.poll() is None:
+        time.sleep(0.5)
+        total, _ = tree_rss(pr.pid)
+        why = None
+        if total > LIMIT_KB:
+            why = f"guard: killed at {total // 1024} MB (limit {LIMIT_KB // 1024} MB)"
+        elif SECS and time.time() - start > SECS:
+            why = f"guard: killed after {int(time.time() - start)} s"
+        if why:
+            os.killpg(pr.pid, signal.SIGKILL)
+            pr.wait()
+            print(why, file=sys.stderr)
+            sys.exit(137)
+    sys.exit(pr.returncode)
+
+
+if __name__ == "__main__":
+    main()

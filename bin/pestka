@@ -1,0 +1,21 @@
+#!/bin/sh
+# Pestka (wasm-gc build) in Kompost against Pestka's native build: every
+# .ndjson under ../pestka/tests/export must get the same verdict line.
+root=$(cd "$(dirname "$0")/.." && pwd)
+[ -x "$root/.aver-tool/bin/aver" ] && PATH="$root/.aver-tool/bin:$PATH"
+pestka="${PESTKA:-$root/../pestka}"
+kompost="${KOMPOST:-$root/.build/target/release/kompost}"
+wasm="$pestka/.build-wasm/main.wasm"
+native="$pestka/.build/target/release/main"
+pass=0; fail=0
+for f in $(find "$pestka/tests/export" -name '*.ndjson' | sort); do
+  want=$("$native" "$f" 1 2>&1 | tail -n 1)
+  start=$(date +%s)
+  got=$("$kompost" "$wasm" "$f" 1 2>&1 | tail -n 1)
+  secs=$(( $(date +%s) - start ))
+  name=${f#$pestka/tests/export/}
+  if [ "$want" = "$got" ]; then pass=$((pass+1)); echo "ok   $name (${secs}s): $got"
+  else fail=$((fail+1)); echo "FAIL $name: want '$want', got '$got'"; fi
+done
+echo "$pass passed, $fail failed"
+[ "$fail" = 0 ]

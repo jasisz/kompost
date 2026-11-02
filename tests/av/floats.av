@@ -1,0 +1,10 @@
+module Main
+    intent = "Floats: arithmetic, rounding and printing."
+    effects [Console.print]
+
+fn main() -> Unit
+    ! [Console.print]
+    Console.print("{1.5 + 2.25} {10.0 / 4.0} {Float.sqrt(2.0)}")
+    Console.print("{Float.floor(2.7)} {Float.ceil(2.1)} {Float.round(-2.5)} {Float.fromInt(7)}")
+    Console.print("{Float.abs(-3.5)} {Float.max(1.0, 2.0)} {0.1 + 0.2}")
+    Console.print("{Int.fromFloat(1234.9)} {Float.pi()}")

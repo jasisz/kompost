@@ -1,0 +1,354 @@
+module Arr
+    intent =
+        "The elements of a wasm array. Aver's Vector.new stops at 16777216"
+        "elements, so a larger array is a map from chunk number to a chunk of 65536 elements. Writing"
+        "takes the chunk out of the map first (Map.remove before Map.set), so the"
+        "chunk has one owner and the write happens in place, the same idiom as"
+        "Mem's pages. An array of i8 or i16 is packed: 32 bits of elements"
+        "to an Int (four octets, or two i16), in chunks of 65536 words, which"
+        "keeps every word an inline machine Int."
+    exposes [Arr, make, fromList, len, get, set, toList, slice, writeList]
+    depends [Value]
+    effects []
+
+type Arr
+    Flat(Vector<Val>)
+    Chunks(Map<Int, Vector<Val>>, Int)
+    Packed(Map<Int, Vector<Int>>, Int, Int)
+
+fn make(n: Int, v: Val, bits: Int) -> Result<Arr, String>
+    ? "n copies of v; packed when bits is 8 or 16, else flat up to Vector's ceiling and in chunks above it, up to 2^28 elements."
+    match bits == 0
+        true -> makeVals(n, v)
+        false -> makePacked(n, Value.i32(v), bits)
+
+fn makeVals(n: Int, v: Val) -> Result<Arr, String>
+    ? "n copies of v, unpacked."
+    match n <= 16777216
+        true -> makeFlat(Vector.new(n, v))
+        false -> makeChunks(n, v)
+
+fn per(bits: Int) -> Int
+    ? "How many packed elements one word holds."
+    match bits
+        8 -> 4
+        _ -> 2
+
+verify per
+    per(8) => 4
+    per(16) => 2
+
+fn divPer(k: Int, bits: Int) -> Int
+    ? "The word element k is in."
+    match bits
+        8 -> Int.div(k, 4)
+        _ -> Int.div(k, 2)
+
+fn modPer(k: Int, bits: Int) -> Int
+    ? "Element k's place in its word."
+    match bits
+        8 -> Int.mod(k, 4)
+        _ -> Int.mod(k, 2)
+
+verify divPer
+    divPer(9, 8) => 2
+    divPer(9, 16) => 4
+
+verify modPer
+    modPer(9, 8) => 1
+    modPer(9, 16) => 1
+
+fn wordOf(raw: Int, bits: Int, k: Int, acc: Int) -> Int
+    ? "A word holding k more copies of raw on top of acc."
+    match k <= 0
+        true -> acc
+        false -> wordOf(raw, bits, k - 1, acc * Result.withDefault(Bits.shiftLeft(1, bits), 1) + raw)
+
+verify wordOf
+    wordOf(1, 8, 4, 0) => 16843009
+    wordOf(5, 16, 2, 0) => 327685
+
+fn makePacked(n: Int, raw: Int, bits: Int) -> Result<Arr, String>
+    ? "n packed copies of raw."
+    words = divPer(n + per(bits) - 1, bits)
+    match Bool.or(n < 0, n > 268435456)
+        true -> Result.Err("array of {n} elements is too large")
+        false -> Result.Ok(Arr.Packed(indexedW(wordChunks(words, wordOf(raw, bits, per(bits), 0), []), 0, {}), n, bits))
+
+fn wordChunks(n: Int, w: Int, acc: List<Vector<Int>>) -> List<Vector<Int>>
+    ? "Chunks holding n copies of the word w."
+    match n <= 0
+        true -> List.reverse(acc)
+        false -> wordChunks(n - 65536, w, List.prepend(Result.withDefault(Vector.new(Int.min(n, 65536), w), Vector.fromList([])), acc))
+
+verify makePacked
+    len(Result.withDefault(makePacked(9, 7, 8), Arr.Flat(Vector.fromList([])))) => 9
+    makePacked(-1, 0, 8) => Result.Err("array of -1 elements is too large")
+
+verify wordChunks
+    wordChunks(0, 1, []) => []
+
+verify makeVals
+    len(Result.withDefault(makeVals(2, Val.Null), Arr.Flat(Vector.fromList([])))) => 2
+
+fn makeFlat(r: Result<Vector<Val>, String>) -> Result<Arr, String>
+    ? "A flat array once its vector is made."
+    match r
+        Result.Ok(vs) -> Result.Ok(Arr.Flat(vs))
+        Result.Err(e) -> Result.Err(e)
+
+fn makeChunks(n: Int, v: Val) -> Result<Arr, String>
+    ? "An array of n > 2^20 elements in chunks of 2^16."
+    match n > 268435456
+        true -> Result.Err("array of {n} elements is too large")
+        false -> Result.Ok(Arr.Chunks(indexed(chunksOf(n, v, []), 0, {}), n))
+
+fn indexed(cs: List<Vector<Val>>, k: Int, acc: Map<Int, Vector<Val>>) -> Map<Int, Vector<Val>>
+    ? "The chunks keyed by their number."
+    match cs
+        [] -> acc
+        [c, ..rest] -> indexed(rest, k + 1, Map.set(acc, k, c))
+
+fn indexedW(cs: List<Vector<Int>>, k: Int, acc: Map<Int, Vector<Int>>) -> Map<Int, Vector<Int>>
+    ? "The word chunks keyed by their number."
+    match cs
+        [] -> acc
+        [c, ..rest] -> indexedW(rest, k + 1, Map.set(acc, k, c))
+
+verify indexed
+    Map.len(indexed([Vector.fromList([Val.Null])], 0, {})) => 1
+
+verify indexedW
+    Map.len(indexedW([Vector.fromList([1])], 0, {})) => 1
+
+fn chunksOf(n: Int, v: Val, acc: List<Vector<Val>>) -> List<Vector<Val>>
+    ? "Chunks holding n copies of v, the last one shorter."
+    match n <= 0
+        true -> List.reverse(acc)
+        false -> chunksOf(n - 65536, v, List.prepend(Result.withDefault(Vector.new(Int.min(n, 65536), v), Vector.fromList([])), acc))
+
+verify make
+    len(Result.withDefault(make(3, Val.Null, 0), Arr.Flat(Vector.fromList([])))) => 3
+    len(Result.withDefault(make(1048577, Val.Null, 0), Arr.Flat(Vector.fromList([])))) => 1048577
+    get(Result.withDefault(make(5, Val.I32(200), 8), Arr.Flat(Vector.fromList([]))), 4) => Option.Some(Val.I32(200))
+    make(-1, Val.Null, 0) => Result.Err("Vector.new: size must be between 0 and 16777216")
+
+verify makeFlat
+    makeFlat(Result.Err("x")) => Result.Err("x")
+
+verify makeChunks
+    len(Result.withDefault(makeChunks(70000, Val.Null), Arr.Flat(Vector.fromList([])))) => 70000
+    makeChunks(268435457, Val.Null) => Result.Err("array of 268435457 elements is too large")
+
+verify chunksOf
+    chunksOf(0, Val.Null, []) => []
+
+fn fromList(vs: List<Val>, bits: Int) -> Arr
+    ? "An array of the given elements, packed when bits is 8 or 16."
+    match bits == 0
+        true -> fromVals(vs)
+        false -> writeList(Result.withDefault(makePacked(List.len(vs), 0, bits), Arr.Flat(Vector.fromList([]))), 0, vs)
+
+fn fromVals(vs: List<Val>) -> Arr
+    ? "An unpacked array of the given elements."
+    n = List.len(vs)
+    match n <= 16777216
+        true -> Arr.Flat(Vector.fromList(vs))
+        false -> Arr.Chunks(indexed(listChunks(vs, []), 0, {}), n)
+
+fn listChunks(vs: List<Val>, acc: List<Vector<Val>>) -> List<Vector<Val>>
+    ? "vs cut into chunks of 2^16."
+    match vs
+        [] -> List.reverse(acc)
+        _ -> listChunks(List.drop(vs, 65536), List.prepend(Vector.fromList(List.take(vs, 65536)), acc))
+
+verify fromList
+    fromList([Val.Null], 0) => Arr.Flat(Vector.fromList([Val.Null]))
+    toList(fromList([Val.I32(1), Val.I32(255), Val.I32(3)], 8)) => [Val.I32(1), Val.I32(255), Val.I32(3)]
+    toList(fromList([Val.I32(65535), Val.I32(2)], 16)) => [Val.I32(65535), Val.I32(2)]
+
+verify fromVals
+    fromVals([]) => Arr.Flat(Vector.fromList([]))
+
+verify listChunks
+    listChunks([Val.Null], []) => [Vector.fromList([Val.Null])]
+
+fn len(a: Arr) -> Int
+    ? "How many elements the array has."
+    match a
+        Arr.Flat(vs) -> Vector.len(vs)
+        Arr.Chunks(_, n) -> n
+        Arr.Packed(_, n, _) -> n
+
+verify len
+    len(Arr.Flat(Vector.fromList([Val.Null, Val.Null]))) => 2
+
+fn get(a: Arr, k: Int) -> Option<Val>
+    ? "Element k, or None out of bounds."
+    match a
+        Arr.Flat(vs) -> Vector.get(vs, k)
+        Arr.Chunks(cs, n) -> chunkGet(cs, k, n)
+        Arr.Packed(ws, n, bits) -> packedGet(ws, n, bits, k)
+
+fn packedGet(ws: Map<Int, Vector<Int>>, n: Int, bits: Int, k: Int) -> Option<Val>
+    ? "Element k of a packed array, as the unsigned i32 it stores."
+    match Bool.and(k >= 0, k < n)
+        false -> Option.None
+        true -> Option.Some(Val.I32(field(wordAt(ws, divPer(k, bits)), bits, modPer(k, bits))))
+
+fn wordAt(ws: Map<Int, Vector<Int>>, w: Int) -> Int
+    ? "Word w of a packed array."
+    match Map.get(ws, Int.div(w, 65536))
+        Option.Some(c) -> Option.withDefault(Vector.get(c, Int.mod(w, 65536)), 0)
+        Option.None -> 0
+
+fn field(word: Int, bits: Int, i: Int) -> Int
+    ? "Element i of a word, the lowest first."
+    Result.withDefault(Bits.low(Result.withDefault(Bits.shiftRight(word, i * bits), 0), bits), 0)
+
+verify packedGet
+    packedGet({0 => Vector.fromList([513])}, 2, 8, 1) => Option.Some(Val.I32(2))
+    packedGet({}, 0, 8, 0) => Option.None
+
+verify wordAt
+    wordAt({}, 3) => 0
+
+verify field
+    field(513, 8, 0) => 1
+    field(513, 8, 1) => 2
+
+fn chunkGet(cs: Map<Int, Vector<Val>>, k: Int, n: Int) -> Option<Val>
+    ? "Element k of a chunked array."
+    match Bool.and(k >= 0, k < n)
+        false -> Option.None
+        true -> innerGet(Map.get(cs, Int.div(k, 65536)), Int.mod(k, 65536))
+
+fn innerGet(c: Option<Vector<Val>>, off: Int) -> Option<Val>
+    ? "Element off of a chunk."
+    match c
+        Option.Some(vs) -> Vector.get(vs, off)
+        Option.None -> Option.None
+
+verify get
+    get(Arr.Flat(Vector.fromList([Val.I32(4)])), 0) => Option.Some(Val.I32(4))
+    get(Arr.Chunks({0 => Vector.fromList([Val.I32(1)])}, 1), 0) => Option.Some(Val.I32(1))
+    get(Arr.Chunks({0 => Vector.fromList([Val.I32(1)])}, 1), 1) => Option.None
+
+verify chunkGet
+    chunkGet({}, -1, 0) => Option.None
+
+verify innerGet
+    innerGet(Option.None, 0) => Option.None
+
+fn set(a: Arr, k: Int, v: Val) -> Option<Arr>
+    ? "The array with element k replaced, written in place when the array has one owner; None out of bounds."
+    match a
+        Arr.Flat(vs) -> flatSet(Vector.set(vs, k, v))
+        Arr.Chunks(cs, n) -> chunkSet(cs, n, k, v)
+        Arr.Packed(ws, n, bits) -> packedSet(ws, n, bits, k, Value.i32(v))
+
+fn packedSet(ws: Map<Int, Vector<Int>>, n: Int, bits: Int, k: Int, raw: Int) -> Option<Arr>
+    ? "A packed array with element k replaced: its word gets the element's bits, in place."
+    match Bool.and(k >= 0, k < n)
+        false -> Option.None
+        true -> Option.Some(Arr.Packed(packedPut(ws, bits, divPer(k, bits), modPer(k, bits) * bits, raw), n, bits))
+
+fn packedPut(ws: Map<Int, Vector<Int>>, bits: Int, w: Int, sh: Int, raw: Int) -> Map<Int, Vector<Int>>
+    ? "The chunk of word w is taken out of the map, so it has one owner, written in place and put back."
+    ci = Int.div(w, 65536)
+    c = Option.withDefault(Map.get(ws, ci), Vector.fromList([]))
+    Map.set(Map.remove(ws, ci), ci, setField(c, Int.mod(w, 65536), bits, sh, raw))
+
+fn setField(c: Vector<Int>, off: Int, bits: Int, sh: Int, raw: Int) -> Vector<Int>
+    ? "The chunk with the element at bit sh of word off replaced by raw."
+    mask = Result.withDefault(Bits.shiftLeft(Result.withDefault(Bits.shiftLeft(1, bits), 1) - 1, sh), 0)
+    old = Option.withDefault(Vector.get(c, off), 0)
+    word = Bits.or(Bits.and(old, Bits.not(mask)), Result.withDefault(Bits.shiftLeft(Result.withDefault(Bits.low(raw, bits), 0), sh), 0))
+    Option.withDefault(Vector.set(c, off, word), c)
+
+verify packedSet
+    packedSet({0 => Vector.fromList([0])}, 4, 8, 2, 255) => Option.Some(Arr.Packed({0 => Vector.fromList([16711680])}, 4, 8))
+    packedSet({0 => Vector.fromList([0])}, 4, 8, 4, 1) => Option.None
+
+verify packedPut
+    packedPut({0 => Vector.fromList([0])}, 8, 0, 0, 9) => {0 => Vector.fromList([9])}
+
+verify setField
+    setField(Vector.fromList([65535]), 0, 8, 8, 0) => Vector.fromList([255])
+
+fn flatSet(r: Option<Vector<Val>>) -> Option<Arr>
+    ? "A flat array after a write."
+    match r
+        Option.Some(vs) -> Option.Some(Arr.Flat(vs))
+        Option.None -> Option.None
+
+fn chunkSet(cs: Map<Int, Vector<Val>>, n: Int, k: Int, v: Val) -> Option<Arr>
+    ? "A chunked array after a write: the chunk is taken out of the map, written in place and put back."
+    match Bool.and(k >= 0, k < n)
+        false -> Option.None
+        true -> Option.Some(Arr.Chunks(chunkPut(cs, Int.div(k, 65536), Int.mod(k, 65536), v), n))
+
+fn chunkPut(cs: Map<Int, Vector<Val>>, ci: Int, off: Int, v: Val) -> Map<Int, Vector<Val>>
+    ? "Writes element off of chunk ci."
+    c = Option.withDefault(Map.get(cs, ci), Vector.fromList([]))
+    Map.set(Map.remove(cs, ci), ci, Option.withDefault(Vector.set(c, off, v), c))
+
+verify chunkSet
+    chunkSet({}, 0, 0, Val.Null) => Option.None
+    chunkSet({0 => Vector.fromList([Val.Null])}, 1, 0, Val.I32(2)) => Option.Some(Arr.Chunks({0 => Vector.fromList([Val.I32(2)])}, 1))
+
+verify chunkPut
+    chunkPut({0 => Vector.fromList([Val.Null, Val.Null])}, 0, 1, Val.I32(3)) => {0 => Vector.fromList([Val.Null, Val.I32(3)])}
+
+fn toList(a: Arr) -> List<Val>
+    ? "All elements in order."
+    match a
+        Arr.Flat(vs) -> List.fromVector(vs)
+        Arr.Chunks(cs, _) -> chunksToList(List.reverse(Map.values(cs)), [])
+        Arr.Packed(_, n, _) -> slice(a, 0, n)
+
+fn chunksToList(rev: List<Vector<Val>>, acc: List<Val>) -> List<Val>
+    ? "The chunks, last first, joined in order in front of acc."
+    match rev
+        [] -> acc
+        [c, ..rest] -> chunksToList(rest, List.concat(List.fromVector(c), acc))
+
+verify toList
+    toList(Arr.Chunks({0 => Vector.fromList([Val.I32(1)]), 1 => Vector.fromList([Val.I32(2)])}, 2)) => [Val.I32(1), Val.I32(2)]
+
+verify chunksToList
+    chunksToList([], []) => []
+
+fn slice(a: Arr, p: Int, n: Int) -> List<Val>
+    ? "n elements from p."
+    sliceFrom(a, p + n - 1, n, [])
+
+fn sliceFrom(a: Arr, k: Int, n: Int, acc: List<Val>) -> List<Val>
+    ? "The n elements ending at k, in order."
+    match n <= 0
+        true -> acc
+        false -> sliceFrom(a, k - 1, n - 1, List.prepend(Option.withDefault(get(a, k), Val.Null), acc))
+
+verify slice
+    slice(Arr.Flat(Vector.fromList([Val.I32(1), Val.I32(2), Val.I32(3)])), 1, 2) => [Val.I32(2), Val.I32(3)]
+
+verify sliceFrom
+    sliceFrom(Arr.Flat(Vector.fromList([])), 0, 0, []) => []
+
+fn writeList(a: Arr, k: Int, vs: List<Val>) -> Arr
+    ? "The array with vs written from element k on."
+    match vs
+        [] -> a
+        [v, ..rest] -> writeListNext(set(a, k, v), k, rest)
+
+fn writeListNext(r: Option<Arr>, k: Int, rest: List<Val>) -> Arr
+    ? "Goes on after one write; callers check the bounds first."
+    match r
+        Option.Some(a) -> writeList(a, k + 1, rest)
+        Option.None -> Arr.Flat(Vector.fromList([]))
+
+verify writeListNext
+    writeListNext(Option.None, 0, []) => Arr.Flat(Vector.fromList([]))
+
+verify writeList
+    writeList(Arr.Flat(Vector.fromList([Val.Null, Val.Null])), 1, [Val.I32(5)]) => Arr.Flat(Vector.fromList([Val.Null, Val.I32(5)]))

@@ -1,0 +1,340 @@
+module Ast
+    intent =
+        "The decoded shape of a wasm module. A heap type is an Int as in the"
+        "binary format: a type index when it is zero or more, an abstract type"
+        "(func -16, extern -17, any -18, eq -19, i31 -20, struct -21, array -22,"
+        "none -15, noextern -14, nofunc -13) when negative. Structured control"
+        "is decoded with its jumps already resolved: a block and an if know"
+        "where their end is, and an if where its else is. Everything the"
+        "validator needs is kept: block signatures, typed selects, alignment,"
+        "the source type of br_on_cast, and the mutability of fields and globals."
+        "The last twenty-four instructions never come from a module: after validation"
+        "Kompost resolves structured control into plain jumps (Jump, IfNot,"
+        "and branches that index a table of targets, see Exec.resolve) and fuses"
+        "a frequent pair into one instruction (see Exec.fuse); Handler is a catch"
+        "clause of a try_table, kept after the last end (see Exec.resolve). A"
+        "try_table keeps its catch clauses as triples of kind, tag and label. Simd holds a"
+        "SIMD opcode, its immediate (a lane, a shuffle's lanes or a constant, both as"
+        "16 octets read little-endian), and for memory a memory index, offset and"
+        "alignment. A Shape is what"
+        "validation learns of a body: its highest operand stack and the stack"
+        "height before each instruction."
+    exposes [MemType, memCount, tagType, tableMax, memIs64, tableIs64, addrType, ValType, Comp, SubType, Sig, Instr, Shape, Func, Import, Export, Global, Data, Elem, Module, emptyModule, funcType, funcParams, funcResults, structFields, arrayElem, isPacked]
+    effects []
+
+type ValType
+    I32
+    I64
+    F32
+    F64
+    V128
+    I8
+    I16
+    Ref(Bool, Int)
+
+type Comp
+    FuncT(List<ValType>, List<ValType>)
+    StructT(Vector<ValType>)
+    ArrayT(ValType)
+
+record SubType
+    comp: Comp
+    supers: List<Int>
+    final: Bool
+    group: Int
+    muts: List<Bool>
+
+record Sig
+    params: List<ValType>
+    results: List<ValType>
+    ty: Int
+
+type Instr
+    Unreachable
+    Nop
+    Block(Int, Int, Int, Sig)
+    Loop(Int, Sig)
+    If(Int, Int, Int, Int, Sig)
+    Else
+    End
+    Br(Int)
+    BrIf(Int)
+    BrTable(Vector<Int>, Int)
+    Return
+    Call(Int)
+    ReturnCall(Int)
+    CallRef(Int)
+    ReturnCallRef(Int)
+    CallIndirect(Int, Int)
+    ReturnCallIndirect(Int, Int)
+    Drop
+    Select
+    SelectT(List<ValType>)
+    LocalGet(Int)
+    LocalSet(Int)
+    LocalTee(Int)
+    GlobalGet(Int)
+    GlobalSet(Int)
+    TableGet(Int)
+    TableSet(Int)
+    TableSize(Int)
+    TableGrow(Int)
+    TableFill(Int)
+    TableCopy(Int, Int)
+    TableInit(Int, Int)
+    ElemDrop(Int)
+    Load(Int, Int, Int, Int)
+    Store(Int, Int, Int, Int)
+    MemorySize(Int)
+    MemoryGrow(Int)
+    MemoryCopy(Int, Int)
+    MemoryFill(Int)
+    MemoryInit(Int, Int)
+    DataDrop(Int)
+    I32Const(Int)
+    I64Const(Int)
+    F32Const(Int)
+    F64Const(Int)
+    Un(Int)
+    Bin(Int)
+    RefNull(Int)
+    RefIsNull
+    RefFunc(Int)
+    RefEq
+    RefAsNonNull
+    BrOnNull(Int)
+    BrOnNonNull(Int)
+    RefTest(Bool, Int)
+    RefCast(Bool, Int)
+    BrOnCast(Int, Int, Int, Int)
+    BrOnCastFail(Int, Int, Int, Int)
+    StructNew(Int)
+    StructNewDefault(Int)
+    StructGet(Int, Int, Int)
+    StructSet(Int, Int)
+    ArrayNew(Int)
+    ArrayNewDefault(Int)
+    ArrayNewFixed(Int, Int)
+    ArrayNewData(Int, Int)
+    ArrayNewElem(Int, Int)
+    ArrayGet(Int, Int)
+    ArraySet(Int)
+    ArrayLen
+    ArrayFill(Int)
+    ArrayCopy(Int, Int)
+    ArrayInitData(Int, Int)
+    ArrayInitElem(Int, Int)
+    RefI31
+    I31Get(Bool)
+    AnyConvertExtern
+    ExternConvertAny
+    TryTable(Int, Int, Int, Sig, Vector<Int>)
+    Throw(Int)
+    ThrowRef
+    Simd(Int, Int, Int, Int, Int)
+    Bad(Int)
+    GetGet(Int, Int)
+    SetGet(Int, Int)
+    GetConst(Int, Int)
+    GetField(Int, Int, Int, Int)
+    GetIsNull(Int)
+    IsNullIfNot(Int)
+    Jump(Int)
+    IfNot(Int)
+    FieldTo(Int, Int, Int, Int, Int)
+    Copy(Int, Int)
+    NullTo(Int)
+    CastField(Int, Bool, Int, Int, Int, Int)
+    GetTestIfNot(Int, Bool, Int, Int)
+    GetIsNullIfNot(Int, Int)
+    TestIfNot(Bool, Int, Int)
+    Op2(Int, Int, Int, Int, Int, Int, Int)
+    JumpIf(Int)
+    ArrayGetLL(Int, Int, Int, Int)
+    NullTo2(Int, Int)
+    ConstTo(Int, Int, Bool)
+    GetBrOnNull(Int, Int)
+    Handler(Int, Int, Int, Int, Int)
+
+record Shape
+    maxH: Int
+    heights: Vector<Int>
+
+type Func
+    Imported(String, String, Int)
+    Local(Int, Vector<ValType>, Vector<Instr>)
+
+record Import
+    mod: String
+    name: String
+    kind: Int
+    index: Int
+
+record Export
+    name: String
+    kind: Int
+    index: Int
+
+record Global
+    ty: ValType
+    init: Vector<Instr>
+    from: String
+    mut: Bool
+
+record Data
+    bytes: Vector<Int>
+    active: Bool
+    offset: Vector<Instr>
+    mem: Int
+
+record MemType
+    min: Int
+    max: Int
+
+record Elem
+    ty: ValType
+    items: List<Vector<Instr>>
+    mode: Int
+    table: Int
+    offset: Vector<Instr>
+
+record Module
+    types: Vector<SubType>
+    funcs: Vector<Func>
+    imports: List<Import>
+    globals: Vector<Global>
+    exports: List<Export>
+    memMin: Int
+    memMax: Int
+    hasMemory: Bool
+    moreMems: List<MemType>
+    tags: List<Int>
+    mems64: List<Int>
+    tables64: List<Int>
+    tables: List<ValType>
+    tableMins: List<Int>
+    tableMaxs: List<Int>
+    tableInits: List<Vector<Instr>>
+    datas: Vector<Data>
+    elems: Vector<Elem>
+    start: Int
+    canon: Vector<Int>
+    dataCount: Int
+
+fn emptyModule() -> Module
+    ? "A module with nothing in it; start is -1 when there is no start function."
+    Module(types = Vector.fromList([]), funcs = Vector.fromList([]), imports = [], globals = Vector.fromList([]), exports = [], memMin = 0, memMax = 65536, hasMemory = false, moreMems = [], tags = [], mems64 = [], tables64 = [], tables = [], tableMins = [], tableMaxs = [], tableInits = [], datas = Vector.fromList([]), elems = Vector.fromList([]), start = -1, canon = Vector.fromList([]), dataCount = -1)
+
+verify emptyModule
+    emptyModule().start => -1
+
+fn memCount(m: Module) -> Int
+    ? "How many memories the module has: memory 0 (memMin, memMax) and the ones after it."
+    match m.hasMemory
+        true -> 1 + List.len(m.moreMems)
+        false -> 0
+
+verify memCount
+    memCount(emptyModule()) => 0
+    memCount(Module.update(emptyModule(), hasMemory = true, moreMems = [MemType(min = 0, max = 1)])) => 2
+
+fn memIs64(m: Module, k: Int) -> Bool
+    ? "Whether memory k is addressed with i64 (memory64)."
+    List.contains(m.mems64, k)
+
+fn tableIs64(m: Module, t: Int) -> Bool
+    ? "Whether table t is indexed with i64 (table64)."
+    List.contains(m.tables64, t)
+
+fn addrType(wide: Bool) -> ValType
+    ? "The type of an address or index: i64 for a 64-bit memory or table, else i32."
+    match wide
+        true -> ValType.I64
+        false -> ValType.I32
+
+verify memIs64
+    memIs64(Module.update(emptyModule(), mems64 = [1]), 1) => true
+    memIs64(emptyModule(), 0) => false
+
+verify tableIs64
+    tableIs64(Module.update(emptyModule(), tables64 = [0]), 0) => true
+
+verify addrType
+    addrType(true) => ValType.I64
+    addrType(false) => ValType.I32
+
+fn tableMax(m: Module, t: Int) -> Int
+    ? "The most elements table t may grow to: its maximum, else 2^32 (2^64 for table64)."
+    match List.drop(m.tableMaxs, t)
+        [x, .._] -> x
+        [] -> 4294967296
+
+verify tableMax
+    tableMax(Module.update(emptyModule(), tableMaxs = [3]), 0) => 3
+    tableMax(emptyModule(), 0) => 4294967296
+
+fn tagType(m: Module, t: Int) -> Int
+    ? "The function type index of tag t, -1 when there is no such tag."
+    match List.drop(m.tags, t)
+        [ty, .._] -> ty
+        [] -> -1
+
+verify tagType
+    tagType(Module.update(emptyModule(), tags = [4]), 0) => 4
+    tagType(emptyModule(), 0) => -1
+
+fn funcType(m: Module, t: Int) -> Comp
+    ? "The composite type at index t; an index out of range reads as a function of nothing."
+    match Vector.get(m.types, t)
+        Option.Some(s) -> s.comp
+        Option.None -> Comp.FuncT([], [])
+
+verify funcType
+    funcType(emptyModule(), 3) => Comp.FuncT([], [])
+
+fn funcParams(m: Module, t: Int) -> List<ValType>
+    ? "The parameters of function type t."
+    match funcType(m, t)
+        Comp.FuncT(ps, _) -> ps
+        _ -> []
+
+verify funcParams
+    funcParams(emptyModule(), 0) => []
+
+fn funcResults(m: Module, t: Int) -> List<ValType>
+    ? "The results of function type t."
+    match funcType(m, t)
+        Comp.FuncT(_, rs) -> rs
+        _ -> []
+
+verify funcResults
+    funcResults(emptyModule(), 0) => []
+
+fn structFields(m: Module, t: Int) -> Vector<ValType>
+    ? "The field types of struct type t."
+    match funcType(m, t)
+        Comp.StructT(fs) -> fs
+        _ -> Vector.fromList([])
+
+verify structFields
+    Vector.len(structFields(emptyModule(), 0)) => 0
+
+fn arrayElem(m: Module, t: Int) -> ValType
+    ? "The element type of array type t."
+    match funcType(m, t)
+        Comp.ArrayT(e) -> e
+        _ -> ValType.I32
+
+verify arrayElem
+    arrayElem(emptyModule(), 0) => ValType.I32
+
+fn isPacked(t: ValType) -> Bool
+    ? "Whether a storage type is packed into fewer bits than an i32."
+    match t
+        ValType.I8 -> true
+        ValType.I16 -> true
+        _ -> false
+
+verify isPacked
+    isPacked(ValType.I8) => true
+    isPacked(ValType.I32) => false

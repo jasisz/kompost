@@ -1,0 +1,16 @@
+module Main
+    intent = "fib"
+    effects [Console.print]
+
+fn fib(n: Int) -> Int
+    ? "fib"
+    match n < 2
+        true -> n
+        false -> fib(n - 1) + fib(n - 2)
+
+verify fib
+    fib(10) => 55
+
+fn main() -> Unit
+    ! [Console.print]
+    Console.print("fib {fib(25)}")

@@ -1,0 +1,186 @@
+module Mem
+    intent =
+        "Linear memory as pages of 65536 octets, each a Vector of 16384 words"
+        "holding four octets apiece (the lowest address in the lowest bits), kept in a map"
+        "from page number to page. A page is made on its first write, so memory"
+        "never written reads as zero and costs nothing. A write takes its page"
+        "out of the map first, so the page has one owner and is written in"
+        "place; a run of octets is written page by page. Multi-byte values are"
+        "little-endian."
+    exposes [read, write, writeList, readList, writeBytes]
+    depends [Bytes]
+    effects []
+
+fn byteAt(mem: Map<Int, Vector<Int>>, a: Int) -> Int
+    ? "The octet at address a."
+    match Map.get(mem, Int.div(a, 65536))
+        Option.Some(p) -> octetIn(Option.withDefault(Vector.get(p, Int.div(Int.mod(a, 65536), 4)), 0), Int.mod(a, 4))
+        Option.None -> 0
+
+fn octetIn(word: Int, i: Int) -> Int
+    ? "Octet i of a word, the lowest first."
+    Bits.low(Result.withDefault(Bits.shiftRight(word, 8 * i), 0), 8)
+
+verify byteAt
+    byteAt({}, 70000) => 0
+    byteAt({1 => Vector.fromList([2304])}, 65537) => 9
+
+verify octetIn
+    octetIn(513, 1) => 2
+
+fn read(mem: Map<Int, Vector<Int>>, ea: Int, n: Int) -> Int
+    ? "n octets at ea as an unsigned little-endian number."
+    readFrom(mem, ea + n - 1, n, 0)
+
+fn readFrom(mem: Map<Int, Vector<Int>>, a: Int, n: Int, acc: Int) -> Int
+    ? "Folds n octets from the most significant one at a downwards."
+    match n <= 0
+        true -> acc
+        false -> readFrom(mem, a - 1, n - 1, acc * 256 + byteAt(mem, a))
+
+verify read
+    read(writeList({}, 0, [1, 2]), 0, 2) => 513
+    read({}, 5, 4) => 0
+
+verify readFrom
+    readFrom({}, 3, 1, 7) => 1792
+
+fn write(mem: Map<Int, Vector<Int>>, ea: Int, n: Int, v: Int) -> Map<Int, Vector<Int>>
+    ? "mem with the low n octets of v written at ea, little-endian."
+    writeList(mem, ea, octetsOf(v, n, []))
+
+fn octetsOf(v: Int, n: Int, acc: List<Int>) -> List<Int>
+    ? "The low n octets of v, the lowest first."
+    match n <= 0
+        true -> List.reverse(acc)
+        false -> octetsOf(Bits.shiftRight(v, 8), n - 1, List.prepend(Bits.low(v, 8), acc))
+
+verify write
+    read(write({}, 0, 2, 513), 0, 2) => 513
+    read(write({}, 65535, 2, 513), 65535, 2) => 513
+    read(write({}, 0, 1, -1), 0, 1) => 255
+
+verify octetsOf
+    octetsOf(513, 2, []) => [1, 2]
+
+fn writeList(mem: Map<Int, Vector<Int>>, ea: Int, bs: List<Int>) -> Map<Int, Vector<Int>>
+    ? "mem with the octets bs written from ea on, a page at a time."
+    match bs
+        [] -> mem
+        _ -> writePage(mem, Int.div(ea, 65536), Int.mod(ea, 65536), bs)
+
+fn writePage(mem: Map<Int, Vector<Int>>, pn: Int, off: Int, bs: List<Int>) -> Map<Int, Vector<Int>>
+    ? "Writes what fits of bs into page pn from off, then goes on with the next page."
+    page = pageOf(Map.get(mem, pn))
+    k = Int.min(List.len(bs), 65536 - off)
+    written = Map.set(Map.remove(mem, pn), pn, fill(page, off, List.take(bs, k)))
+    writeList(written, (pn + 1) * 65536, List.drop(bs, k))
+
+fn pageOf(p: Option<Vector<Int>>) -> Vector<Int>
+    ? "A page, or a fresh page of zeros."
+    match p
+        Option.Some(v) -> v
+        Option.None -> Vector.new(16384, 0)
+
+fn fill(page: Vector<Int>, off: Int, bs: List<Int>) -> Vector<Int>
+    ? "The page with bs written from octet off: each octet's word is read, the octet swapped in, and the word written back in place."
+    match bs
+        [] -> page
+        [b, ..rest] -> fill(setOctet(page, Int.div(off, 4), 8 * Int.mod(off, 4), b), off + 1, rest)
+
+fn setOctet(page: Vector<Int>, w: Int, sh: Int, b: Int) -> Vector<Int>
+    ? "The page with the octet at bit sh of word w replaced by b."
+    old = Option.withDefault(Vector.get(page, w), 0)
+    word = Bits.or(Bits.and(old, Bits.not(Result.withDefault(Bits.shiftLeft(255, sh), 0))), Result.withDefault(Bits.shiftLeft(b, sh), 0))
+    Option.withDefault(Vector.set(page, w, word), page)
+
+verify setOctet
+    setOctet(Vector.fromList([0]), 0, 8, 7) => Vector.fromList([1792])
+
+verify writeList
+    byteAt(writeList({}, 65535, [7, 8]), 65536) => 8
+    writeList({}, 0, []) => {}
+
+verify writePage
+    byteAt(writePage({}, 0, 3, [5]), 3) => 5
+
+verify pageOf
+    Vector.len(pageOf(Option.None)) => 16384
+
+verify fill
+    fill(Vector.fromList([0, 0]), 1, [4]) => Vector.fromList([1024, 0])
+
+fn readList(mem: Map<Int, Vector<Int>>, ea: Int, n: Int) -> List<Int>
+    ? "The n octets from ea, in order."
+    readListFrom(mem, ea + n - 1, n, [])
+
+fn readListFrom(mem: Map<Int, Vector<Int>>, a: Int, n: Int, acc: List<Int>) -> List<Int>
+    ? "The n octets ending at a, in order."
+    match n <= 0
+        true -> acc
+        false -> readListFrom(mem, a - 1, n - 1, List.prepend(byteAt(mem, a), acc))
+
+verify readList
+    readList(writeList({}, 1, [5]), 0, 2) => [0, 5]
+
+verify readListFrom
+    readListFrom({}, 0, 1, []) => [0]
+
+fn writeBytes(mem: Map<Int, Vector<Int>>, ea: Int, b: Bytes) -> Map<Int, Vector<Int>>
+    ? "mem with the octets of b written from ea on, read straight out of b a page at a time, a word at a time where aligned."
+    writeBytesFrom(mem, ea, b, 0, Bytes.len(b))
+
+fn writeBytesFrom(mem: Map<Int, Vector<Int>>, ea: Int, b: Bytes, i: Int, n: Int) -> Map<Int, Vector<Int>>
+    ? "Writes octets i..n of b from address ea on."
+    match i >= n
+        true -> mem
+        false -> writeBytesPage(mem, Int.div(ea, 65536), Int.mod(ea, 65536), b, i, n)
+
+fn writeBytesPage(mem: Map<Int, Vector<Int>>, pn: Int, off: Int, b: Bytes, i: Int, n: Int) -> Map<Int, Vector<Int>>
+    ? "Writes what fits into page pn, then the rest."
+    k = Int.min(n - i, 65536 - off)
+    page = pageOf(Map.get(mem, pn))
+    written = Map.set(Map.remove(mem, pn), pn, fillBytes(page, off, b, i, k))
+    writeBytesFrom(written, pn * 65536 + off + k, b, i + k, n)
+
+fn fillBytes(page: Vector<Int>, off: Int, b: Bytes, i: Int, k: Int) -> Vector<Int>
+    ? "The page with k octets of b from i written from octet off."
+    match k <= 0
+        true -> page
+        false -> fillBytesStep(page, off, b, i, k, Bool.and(k >= 4, Int.mod(off, 4) == 0))
+
+fn fillBytesStep(page: Vector<Int>, off: Int, b: Bytes, i: Int, k: Int, whole: Bool) -> Vector<Int>
+    ? "Writes a whole word when four aligned octets are left, else one octet."
+    match whole
+        true -> fillBytes(Option.withDefault(Vector.set(page, Int.div(off, 4), wordAt(b, i)), page), off + 4, b, i + 4, k - 4)
+        false -> fillBytes(setOctet(page, Int.div(off, 4), 8 * Int.mod(off, 4), octet(b, i)), off + 1, b, i + 1, k - 1)
+
+fn octet(b: Bytes, i: Int) -> Int
+    ? "Octet i of b, zero past its end."
+    Option.withDefault(Bytes.get(b, i), 0)
+
+fn wordAt(b: Bytes, i: Int) -> Int
+    ? "Four octets of b from i as one little-endian word."
+    octet(b, i) + 256 * octet(b, i + 1) + 65536 * octet(b, i + 2) + 16777216 * octet(b, i + 3)
+
+verify writeBytes
+    read(writeBytes({}, 65534, Bytes.fromList([1, 2, 3, 4, 5, 6])), 65534, 4) => 67305985
+    readList(writeBytes({}, 3, Bytes.fromList([9, 8, 7, 6, 5])), 3, 5) => [9, 8, 7, 6, 5]
+
+verify writeBytesFrom
+    writeBytesFrom({}, 0, Bytes.fromList([]), 0, 0) => {}
+
+verify writeBytesPage
+    byteAt(writeBytesPage({}, 0, 1, Bytes.fromList([4]), 0, 1), 1) => 4
+
+verify fillBytes
+    fillBytes(Vector.fromList([0, 0]), 0, Bytes.fromList([1, 2, 3, 4, 5]), 0, 5) => Vector.fromList([67305985, 5])
+
+verify fillBytesStep
+    fillBytesStep(Vector.fromList([0]), 1, Bytes.fromList([7]), 0, 1, false) => Vector.fromList([1792])
+
+verify octet
+    octet(Bytes.fromList([3]), 1) => 0
+
+verify wordAt
+    wordAt(Bytes.fromList([1, 0, 0, 1]), 0) => 16777217

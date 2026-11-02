@@ -1,0 +1,9 @@
+// args: pestka "w kompoście" 3
+module Main
+    intent = "Reads its command-line arguments."
+    effects [Args.get, Console.print]
+
+fn main() -> Unit
+    ! [Args.get, Console.print]
+    args = Args.get()
+    Console.print("{List.len(args)} args: {String.join(args, "|")}")

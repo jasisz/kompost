@@ -1,0 +1,5 @@
+[rust]
+# Every push onto an operand stack is a list cell; mimalloc makes that
+# allocation cheap.
+allocator = "mimalloc"
+panic = "abort"

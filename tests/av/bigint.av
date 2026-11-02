@@ -1,0 +1,23 @@
+module Main
+    intent = "Arbitrary-precision integers, division and bits."
+    effects [Console.print]
+
+fn fact(n: Int, acc: Int) -> Int
+    ? "n! times acc."
+    match n <= 1
+        true -> acc
+        false -> fact(n - 1, acc * n)
+
+verify fact
+    fact(5, 1) => 120
+
+fn main() -> Unit
+    ! [Console.print]
+    Console.print("30! = {fact(30, 1)}")
+    Console.print("2^100 = {Bits.shiftLeft(1, 100)}")
+    big = fact(25, 1)
+    Console.print("div {Int.div(big, 7)} mod {Int.mod(big, 1000007)}")
+    Console.print("neg {0 - big} abs {Int.abs(0 - 12345678901234567890)}")
+    Console.print("bits {Bits.and(255, 60)} {Bits.xor(-1, 5)} {Bits.low(-1, 16)}")
+    Console.print("cmp {big > fact(24, 1)} {9223372036854775807 + 1}")
+    Console.print("min {Int.min(-3, 4)} {Result.withDefault(Int.fromString("12345678901234567890123"), 0)}")

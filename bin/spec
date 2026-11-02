@@ -1,0 +1,36 @@
+#!/bin/sh
+# Replays the official spec testsuite (from ../miscast/spec/wast, or SPEC_DIR) against
+# Kompost with miscast, Wasmtime as the oracle. Arguments are file names
+# without .wast (default: every file except SIMD); the log lands in
+# .build/spec/replay.log and a per-file tally is printed.
+root=$(cd "$(dirname "$0")/.." && pwd)
+[ -x "$root/.aver-tool/bin/aver" ] && PATH="$root/.aver-tool/bin:$PATH"
+miscast="${MISCAST:-$root/../miscast}"
+kompost="${KOMPOST:-$root/.build/target/release/kompost}"
+wast="${SPEC_DIR:-$miscast/spec/wast}"
+seeds="$root/.build/spec/seeds"; log="$root/.build/spec/replay.log"
+rm -rf "$seeds"; mkdir -p "$seeds"
+if [ $# -gt 0 ]; then
+  for f in "$@"; do ln -s "$wast/$f.wast" "$seeds/"; done
+else
+  for f in "$wast"/*.wast; do
+    case "$(basename "$f")" in simd*|relaxed*) ;; *) ln -s "$f" "$seeds/";; esac
+  done
+fi
+cd "$miscast" && CUSTOM_CMD="$kompost --invoke {export} {wasm}" CUSTOM_VALIDATE_CMD="$kompost --validate {wasm}" \
+  python3 -m miscast --mode replay --seeds "$seeds" --sut custom --oracles wasmtime --overtrap -j "${JOBS:-6}" >"$log" 2>&1
+python3 - "$log" <<'PY'
+import re, sys, collections
+t = collections.defaultdict(collections.Counter)
+for line in open(sys.argv[1]):
+    m = re.match(r'^(\S+?)(?:#\d+)?:(\S*)\s.*\s(\S+)(?:\s+<<<)?\s*$', line)
+    if not m: continue
+    f, verdict = m.group(1), line.split()[-1] if not line.rstrip().endswith('<<<') else line.split()[-2]
+    t[f][verdict] += 1
+tot = collections.Counter()
+for f in sorted(t):
+    c = t[f]; tot.update(c)
+    print(f"{f:28s} " + "  ".join(f"{k}={v}" for k, v in sorted(c.items())))
+print("TOTAL " + "  ".join(f"{k}={v}" for k, v in sorted(tot.items())))
+PY
+grep -E '^FINDINGS|by class' "$log"
