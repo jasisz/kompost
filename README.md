@@ -77,7 +77,7 @@ it gains depends on what a program spends its time on:
 |---|---|---|
 | fib(32) from Aver's wasm-gc output | 5.6 s | 0.27 s |
 | a loop of 200 000 i32 loads and stores, 20 passes | 1.04 s | 0.30 s |
-| Pestka on a small Lean export (GC data, hashing) | 5.3 s | 3.2 s |
+| Pestka on a small Lean export (GC data, hashing) | 5.1 s | 2.7 s |
 
 A program dominated by dispatch gains most; one dominated by GC data gains
 least, since compiled code keeps Kompost's heap and values. Building is

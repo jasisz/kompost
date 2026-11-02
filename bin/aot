@@ -21,8 +21,6 @@ else
   aver run "$root/src/main.av" --module-root "$root/src" -- --compile "$@" > "$work/src/native.av"
 fi
 aver compile "$work/src/main.av" --module-root "$work/src" -o "$work/out" --name kompost >/dev/null
-# The binary declares every module itself; src/lib.rs would compile them all a second time.
-rm -f "$work/out/src/lib.rs"
 # Aver forces inlining of every thin function; the compiled module has thousands,
 # each called from many branches, and forcing them all in makes rustc run out
 # of memory. Without it LLVM inlines what pays.

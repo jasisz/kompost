@@ -8,7 +8,7 @@ module Rt
         "holds just their operands, so their meaning is written once. The"
         "roots a compiled function hands on (rs) are the references its callers"
         "still hold; a collection also keeps what the store pins."
-    exposes [R, Mk, noRoots, via, viaRooted, results, b, field, fieldPacked, setField, structNew, arrayNewDefault, arrayNew, arrayGet, arraySet, arrayLen, global, setGlobal, keep, keepAll, nth, st, callRef, callIndirect, tailRef, tailIndirect, resolve, interp, deep, refTest, refCast, nonNull, load, store, pickV, binV, unV, boxResult, from32, w32, zero32, of32, val32, res32, eqz32, and32, or32, xor32, eq32, ne32, lt32, gt32, le32, ge32, ltu32, gtu32, leu32, geu32, pick32, add32, sub32, mul32, from64, w64, zero64, of64, val64, res64, eqz64, and64, or64, xor64, eq64, ne64, lt64, gt64, le64, ge64, ltu64, gtu64, leu64, geu64, pick64, add64, sub64, mul64, nz32, i32v, pack8, pack16, u32of]
+    exposes [R, Mk, noRoots, via, viaRooted, results, b, field, fieldPacked, setField, structNew, arrayNewDefault, arrayNew, arrayGet, arraySet, arrayLen, global, setGlobal, keep, keepAll, nth, callRef, callIndirect, tailRef, tailIndirect, resolve, interp, deep, refTest, refCast, nonNull, load, store, pickV, binV, unV, boxResult, from32, w32, zero32, of32, val32, res32, eqz32, and32, or32, xor32, eq32, ne32, lt32, gt32, le32, ge32, ltu32, gtu32, leu32, geu32, pick32, add32, sub32, mul32, from64, w64, zero64, of64, val64, res64, eqz64, and64, or64, xor64, eq64, ne64, lt64, gt64, le64, ge64, ltu64, gtu64, leu64, geu64, pick64, add64, sub64, mul64, nz32, i32v, pack8, pack16, u32of]
     exposes opaque [W32, W64]
     depends [Ast, Value, Num, Kompost, Arr, Exec, Mem]
     effects []
@@ -554,13 +554,6 @@ fn nth(vs: List<Val>, k: Int) -> Val
 verify nth
     nth([Val.I32(1), Val.I32(2)], 1) => Val.I32(2)
     nth([], 0) => Val.Null
-
-fn st(s: Store) -> Store
-    ? "The store as it is. Compiled code passes the store through this at every branch: a store every function of a mutually tail-calling group hands on unchanged would otherwise become a borrowed loop invariant, and the group would clone it, sharing the heap, wherever it allocates."
-    s
-
-verify st
-    st(Exec.blankStore()) => Exec.blankStore()
 
 verify keep
     keep(Val.Null, []) => []

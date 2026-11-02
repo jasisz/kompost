@@ -1046,7 +1046,7 @@ verify maxIndent
     maxIndent() => 120
 
 verify cut
-    cut(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.End]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, St(ls = [], stk = [], s = "s", top = false, ind = 200), [Lab(kind = 3, name = "", tys = [], below = [], keep = [])], Gl(n = 0, fns = [], alias = []), "w0_9").t => "w0_9(x, Rt.st(s), d, rs)"
+    cut(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.End]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, St(ls = [], stk = [], s = "s", top = false, ind = 200), [Lab(kind = 3, name = "", tys = [], below = [], keep = [])], Gl(n = 0, fns = [], alias = []), "w0_9").t => "w0_9(x, s, d, rs)"
 
 verify seq
     seq(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.I32Const(2), Instr.End]), ltys = [], res = [ValType.I32], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, St(ls = [], stk = [], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [ValType.I32], below = [], keep = [])], Gl(n = 0, fns = [], alias = [])).t => "R.V1(Rt.val32(Rt.w32(2)), s)"
@@ -1809,7 +1809,7 @@ fn jumpTo(st: St, l: Lab) -> String
     ? "The call that continues at a label."
     carried = topN(st, List.len(l.tys))
     under = List.reverse(List.take(List.reverse(st.stk), List.len(l.below)))
-    "{l.name}(x, Rt.st({st.s}), d, rs{commaList(codesOf(kept(st.ls, l.keep, 0, [])))}{commaList(codesOf(List.reverse(under)))}{commaList(codesOf(carried))})"
+    "{l.name}(x, {st.s}, d, rs{commaList(codesOf(kept(st.ls, l.keep, 0, [])))}{commaList(codesOf(List.reverse(under)))}{commaList(codesOf(carried))})"
 
 fn fallOut(cx: Cx, st: St, labs: List<Lab>) -> String
     ? "Falling off the end of the innermost construct that has a function."
@@ -1867,7 +1867,7 @@ verify branchTo
     branchTo(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), St(ls = [], stk = [], s = "s", top = true, ind = 4), [], 0) => "R.V0(s)"
 
 verify jumpTo
-    jumpTo(St(ls = [E(c = "l0", t = ValType.I32)], stk = [E(c = "c", t = ValType.I32), E(c = "m", t = ValType.I32), E(c = "u", t = ValType.I32)], s = "s", top = true, ind = 4), Lab(kind = 1, name = "w0_1", tys = [ValType.I32], below = [ValType.I32], keep = [0])) => "w0_1(x, Rt.st(s), d, rs, l0, u, c)"
+    jumpTo(St(ls = [E(c = "l0", t = ValType.I32)], stk = [E(c = "c", t = ValType.I32), E(c = "m", t = ValType.I32), E(c = "u", t = ValType.I32)], s = "s", top = true, ind = 4), Lab(kind = 1, name = "w0_1", tys = [ValType.I32], below = [ValType.I32], keep = [0])) => "w0_1(x, s, d, rs, l0, u, c)"
 
 verify fallOut
     fallOut(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), St(ls = [], stk = [], s = "s", top = true, ind = 4), []) => "R.V0(s)"
@@ -2208,7 +2208,7 @@ fn joinFn(cx: Cx, from: Int, l: Lab, labs: List<Lab>, g: Gl) -> Gl
 
 fn forwardTo(t: String, pn: List<String>, name: String) -> Option<String>
     ? "The function a body only calls with its own parameters as they are: such a function is left out and its callers call that one."
-    tail = "(x, Rt.st(s), d, rs{commaList(pn)})"
+    tail = "(x, s, d, rs{commaList(pn)})"
     match String.endsWith(t, tail)
         false -> Option.None
         true -> forwardName(String.slice(t, 0, String.len(t) - String.len(tail)), name)
@@ -2254,9 +2254,9 @@ fn aliasOf(all: List<Alias>, n: String) -> Option<String>
             false -> aliasOf(rest, n)
 
 verify forwardTo
-    forwardTo("w0_3(x, Rt.st(s), d, rs, q0)", ["q0"], "w0_5") => Option.Some("w0_3")
-    forwardTo("w0_3(x, Rt.st(s), d, rs, q1)", ["q0"], "w0_5") => Option.None
-    forwardTo("w0_5(x, Rt.st(s), d, rs, q0)", ["q0"], "w0_5") => Option.None
+    forwardTo("w0_3(x, s, d, rs, q0)", ["q0"], "w0_5") => Option.Some("w0_3")
+    forwardTo("w0_3(x, s, d, rs, q1)", ["q0"], "w0_5") => Option.None
+    forwardTo("w0_5(x, s, d, rs, q0)", ["q0"], "w0_5") => Option.None
 
 verify forwardName
     forwardName("match c\n    true -> f", "g") => Option.None
@@ -2347,7 +2347,7 @@ verify joined
     joined(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.Block(0, 0, 2, Sig(params = [], results = [], ty = -1)), Instr.Br(0), Instr.End, Instr.End]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, 2, Sig(params = [], results = [], ty = -1), St(ls = [], stk = [], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [], below = [], keep = [])], Gl(n = 0, fns = [], alias = []), "w0_0", 1).t => "R.V0(s)"
 
 verify joinedFn
-    joinedFn(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.Block(0, 0, 2, Sig(params = [], results = [], ty = -1)), Instr.Br(0), Instr.End, Instr.Nop, Instr.End]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, 2, Sig(params = [], results = [], ty = -1), St(ls = [], stk = [], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [], below = [], keep = [])], Gl(n = 0, fns = [], alias = []), "w0_0", 1).t => "w0_0(x, Rt.st(s), d, rs)"
+    joinedFn(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.Block(0, 0, 2, Sig(params = [], results = [], ty = -1)), Instr.Br(0), Instr.End, Instr.Nop, Instr.End]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, 2, Sig(params = [], results = [], ty = -1), St(ls = [], stk = [], s = "s", top = true, ind = 4), [Lab(kind = 3, name = "", tys = [], below = [], keep = [])], Gl(n = 0, fns = [], alias = []), "w0_0", 1).t => "w0_0(x, s, d, rs)"
 
 verify returnsAt
     returnsAt(Cx(m = Ast.emptyModule(), pre = "", fi = 0, code = Vector.fromList([Instr.End, Instr.End]), ltys = [], res = [], natives = {}, allocs = {}, tails = {}, live = Vector.fromList([])), 0, [Lab(kind = 0, name = "", tys = [], below = [], keep = []), Lab(kind = 3, name = "", tys = [], below = [], keep = [])]) => true
