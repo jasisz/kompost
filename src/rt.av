@@ -545,16 +545,6 @@ verify keepAll
 verify keptAll
     keptAll([Val.Null], []) => []
 
-fn nth(vs: List<Val>, k: Int) -> Val
-    ? "Result k of a call with three or more."
-    match List.drop(vs, k)
-        [v, .._] -> v
-        [] -> Val.Null
-
-verify nth
-    nth([Val.I32(1), Val.I32(2)], 1) => Val.I32(2)
-    nth([], 0) => Val.Null
-
 verify keep
     keep(Val.Null, []) => []
     keep(Val.Ref(3), []) => [Val.Ref(3)]

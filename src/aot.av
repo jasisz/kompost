@@ -1325,38 +1325,9 @@ fn newStore(cx: Cx, pc: Int, st: St, labs: List<Lab>, g: Gl, e: String) -> Out
 fn rOf(cx: Cx, pc: Int, st: St, labs: List<Lab>, g: Gl, call: String, outs: List<ValType>) -> Out
     ? "A call that returns an R: the code goes on with its results and store, a trap is handed on."
     k = g.n
-    vs = resultNames(k, List.len(outs))
+    vs = names("v{k}x", List.len(outs), 0, [])
     okSt = St.update(pushAll(st, exprs(unboxedAll(vs, outs, []), outs, [])), s = "s{k}")
-    split(cx, pc, st, labs, fresh(g), call, bindPattern(k, vs), okSt, "t{k}", "t{k}")
-
-fn resultNames(k: Int, n: Int) -> List<String>
-    ? "How the results of call k are read: by name up to two; from three on, from the list R.VN carries, since a list pattern inside it makes Aver match by reference and copy the store."
-    match n >= 3
-        true -> nths("v{k}l", n, 0, [])
-        false -> names("v{k}x", n, 0, [])
-
-fn nths(l: String, n: Int, j: Int, acc: List<String>) -> List<String>
-    ? "Rt.nth of each position."
-    match j >= n
-        true -> List.reverse(acc)
-        false -> nths(l, n, j + 1, List.prepend("Rt.nth({l}, {j})", acc))
-
-fn bindPattern(k: Int, vs: List<String>) -> String
-    ? "The pattern that binds call k's results and store."
-    match List.len(vs) >= 3
-        true -> "R.VN(v{k}l, s{k})"
-        false -> rPattern(vs, "s{k}")
-
-verify resultNames
-    resultNames(4, 1) => ["v4x0"]
-    resultNames(4, 3) => ["Rt.nth(v4l, 0)", "Rt.nth(v4l, 1)", "Rt.nth(v4l, 2)"]
-
-verify nths
-    nths("l", 1, 0, []) => ["Rt.nth(l, 0)"]
-
-verify bindPattern
-    bindPattern(4, ["a", "b", "c"]) => "R.VN(v4l, s4)"
-    bindPattern(4, ["a"]) => "R.V1(a, s4)"
+    split(cx, pc, st, labs, fresh(g), call, rPattern(vs, "s{k}"), okSt, "t{k}", "t{k}")
 
 fn rPattern(vs: List<String>, s: String) -> String
     ? "The pattern for an R with these results."

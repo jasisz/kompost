@@ -21,10 +21,6 @@ else
   aver run "$root/src/main.av" --module-root "$root/src" -- --compile "$@" > "$work/src/native.av"
 fi
 aver compile "$work/src/main.av" --module-root "$work/src" -o "$work/out" --name kompost >/dev/null
-# Aver forces inlining of every thin function; the compiled module has thousands,
-# each called from many branches, and forcing them all in makes rustc run out
-# of memory. Without it LLVM inlines what pays.
-perl -i -ne 'print unless /^#\[inline\(always\)\]$/' "$work/out/src/aver_generated/native/mod.rs"
 # Compiled calls nest on the thread's stack, several Rust frames per wasm call;
 # Kompost allows 200 000 calls, as the interpreter does, so the thread gets
 # room for them (reserved, not used until a program goes that deep).
