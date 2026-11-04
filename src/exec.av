@@ -1425,11 +1425,18 @@ fn matches(x: Inst, s: Store, r: Val, nullable: Bool, h: Int) -> Bool
         _ -> false
 
 fn objMatches(x: Inst, s: Store, o: Obj, h: Int) -> Bool
-    ? "Whether a heap object is of heap type h. Its type is an identity: the allocating instance's base plus its type index."
+    ? "Whether a heap object is of heap type h. Its type is an identity: the allocating instance's base plus its type index; an exception (type -100 less its tag) is an exn and nothing else."
     match o
         Obj.Free -> false
         Obj.Array(t, _) -> Bool.or(Bool.or(h == -18, h == -19), Bool.or(h == -22, Bool.and(h >= 0, typeSub(x, s, t, h))))
-        _ -> Bool.or(Bool.or(h == -18, h == -19), Bool.or(h == -21, Bool.and(h >= 0, typeSub(x, s, Kompost.typeOf(o), h))))
+        _ -> match Kompost.typeOf(o) <= -100
+            true -> h == -23
+            false -> Bool.or(Bool.or(h == -18, h == -19), Bool.or(h == -21, Bool.and(h >= 0, typeSub(x, s, Kompost.typeOf(o), h))))
+
+verify objMatches
+    objMatches(emptyInst(), blankStore(), Obj.S0(-100), -23) => true
+    objMatches(emptyInst(), blankStore(), Obj.S0(-100), -18) => false
+    objMatches(emptyInst(), blankStore(), Obj.S0(0), -23) => false
 
 fn typeSub(x: Inst, s: Store, tid: Int, h: Int) -> Bool
     ? "Whether the type with identity tid is a subtype of x's type h: within x by x's own rules, across instances by Types.subX on the two modules."
