@@ -3,3 +3,7 @@
 # allocation cheap.
 allocator = "mimalloc"
 panic = "abort"
+# Kompost runs Aver code on main's thread only; "auto" picks many because
+# verify cases share module-level bindings (Num.two63), which cargo test
+# never runs here. One thread changes reference counts without atomics.
+threads = "one"
